@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use webkit6::prelude::*;
 
 pub struct ReaderPane {
+    pub loading: adw::StatusPage,
     pub toolbar: adw::ToolbarView,
     pub header: adw::HeaderBar,
     pub title: adw::WindowTitle,
@@ -20,8 +21,9 @@ pub struct ReaderPane {
 }
 
 impl ReaderPane {
-    pub fn new(session: &webkit6::NetworkSession) -> Self {
-        let webview = webkit6::WebView::builder().network_session(session).build();
+    pub fn new() -> Self {
+        let session = webkit6::NetworkSession::new_ephemeral();
+        let webview = webkit6::WebView::builder().network_session(&session).build();
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
             settings.set_enable_back_forward_navigation_gestures(false);
         }
@@ -29,6 +31,11 @@ impl ReaderPane {
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
             .css_classes(vec!["lf-pane-bg".to_string()])
+            .build();
+        let loading = adw::StatusPage::builder()
+            .icon_name("content-loading-symbolic")
+            .title("Artikel wird geladen …")
+            .vexpand(true)
             .build();
         let empty = adw::StatusPage::builder()
             .icon_name("applications-library-symbolic")
@@ -49,6 +56,7 @@ impl ReaderPane {
             .build();
         error.set_child(Some(&retry));
 
+        stack.add_named(&loading, Some("loading"));
         stack.add_named(&empty, Some("empty"));
         stack.add_named(&webview, Some("web"));
         stack.add_named(&error, Some("error"));
@@ -141,6 +149,7 @@ impl ReaderPane {
             title,
             stack,
             webview,
+            loading,
             empty,
             search_bar,
             search_entry,
@@ -152,9 +161,17 @@ impl ReaderPane {
         }
     }
 
+    pub fn show_loading(&self) {
+        self.stack.set_visible_child_name("loading");
+    }
+
     pub fn load_html_doc(&self, html: &str) {
         self.stack.set_visible_child_name("web");
         self.webview.load_html(html, None);
+    }
+
+    pub fn show_error(&self) {
+        self.stack.set_visible_child_name("error");
     }
 
     pub fn show_empty(&self, title: &str, description: &str) {

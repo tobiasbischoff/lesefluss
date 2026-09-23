@@ -1,17 +1,21 @@
-use crate::fixtures::Library;
+use crate::dbworker::{DbWorker, JobOut};
 use crate::list;
+use crate::model::{ListRow, UiState};
+use crate::net::{Net, NetEvent};
 use crate::reader::{find_in_view, find_next, ReaderPane};
 use crate::sidebar;
 use crate::state::*;
 use crate::style::{gtk_css_for, tokens_for, ReaderStyleState};
-use domain::ArticleId;
 use adw::prelude::*;
 use webkit6::prelude::*;
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
+use storage::{ArticleRow, Counts, FeedRow, GroupRow, Source};
+#[allow(unused_imports)]
+use storage::Source as SourceFilter;
 
 pub fn dbg_log(msg: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -21,7 +25,7 @@ pub fn dbg_log(msg: &str) {
 }
 
 pub fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    storage::now_ms()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,48 +35,55 @@ pub enum SelectionCause {
     Keyboard,
 }
 
+type UndoBatch = Vec<(i64, String, bool, bool)>;
+type PendingCb = Box<dyn FnOnce(&Rc<App>, JobOut)>;
+
+const ACCENTS: &[&str] = &["#B94A2E", "#2E5FA3", "#3F8F5F", "#AC3A50", "#7A5CA8", "#B08A2E", "#2E8B8B"];
+
 pub struct App {
     pub window: adw::ApplicationWindow,
     pub toast: adw::ToastOverlay,
     pub outer: adw::NavigationSplitView,
     pub inner: adw::NavigationSplitView,
     pub sidebar_list: gtk::ListBox,
-    pub sidebar_filters: RefCell<Vec<Option<SourceFilter>>>,
-    pub collapsed_groups: RefCell<HashSet<String>>,
+    pub sidebar_filters: RefCell<Vec<Option<Source>>>,
     pub last_sync_label: gtk::Label,
     pub list_title: adw::WindowTitle,
     pub list_stack: gtk::Stack,
     pub list_store: gio::ListStore,
     pub list_selection: gtk::SingleSelection,
     pub list_view: gtk::ListView,
+    pub list_scroll: gtk::ScrolledWindow,
     pub list_empty: adw::StatusPage,
+    pub search_bar: gtk::SearchBar,
+    pub search_entry: gtk::SearchEntry,
     pub reader: Rc<ReaderPane>,
-    pub lib: Rc<RefCell<Library>>,
-    pub source: RefCell<SourceFilter>,
-    pub selected: RefCell<Option<ArticleId>>,
-    pub keep_visible: RefCell<Option<ArticleId>>,
-    pub unread_guard: RefCell<HashSet<ArticleId>>,
-    pub last_opened: RefCell<HashMap<SourceFilter, ArticleId>>,
-    pub undo_stack: RefCell<Vec<UndoBatch>>,
+    pub state: RefCell<UiState>,
+    pub worker: DbWorker,
+    pub net: Rc<Net>,
+    pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
+    pub drain_active: Cell<bool>,
     pub preview_timer: RefCell<Option<glib::SourceId>>,
+    pub search_timer: RefCell<Option<glib::SourceId>>,
     pub read_gen: Cell<u64>,
     pub suppress: Cell<bool>,
     pub selection_cause: Cell<SelectionCause>,
-    pub list_dirty: RefCell<Vec<ArticleId>>,
+    pub list_dirty: RefCell<Vec<String>>,
+    pub undo_stack: RefCell<Vec<UndoBatch>>,
     pub tokens: RefCell<reader::tokens::Tokens>,
     pub css: gtk::CssProvider,
     pub panes: RefCell<Vec<gtk::Widget>>,
-    pub custom_feed_counter: Cell<u32>,
     me: RefCell<Option<Weak<App>>>,
 }
 
-type UndoBatch = Vec<(ArticleId, bool, bool)>;
-
 impl App {
-    pub fn new(application: &adw::Application) -> Rc<Self> {
-        let lib = Rc::new(RefCell::new(crate::fixtures::build()));
-        let session = webkit6::NetworkSession::new_ephemeral();
-        let reader = Rc::new(ReaderPane::new(&session));
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        application: &adw::Application,
+        worker: DbWorker,
+        net: Rc<Net>,
+    ) -> Rc<Self> {
+        let reader = Rc::new(ReaderPane::new());
 
         let sidebar_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -127,10 +138,7 @@ impl App {
         let sources_page = adw::NavigationPage::new(&sidebar_toolbar, "Quellen");
 
         let list_store = gio::ListStore::new::<glib::BoxedAnyObject>();
-        let list_selection = gtk::SingleSelection::builder()
-            .model(&list_store)
-            .autoselect(false)
-            .build();
+        let list_selection = gtk::SingleSelection::builder().model(&list_store).autoselect(false).build();
         let factory = gtk::SignalListItemFactory::new();
         let list_view = gtk::ListView::builder()
             .model(&list_selection)
@@ -155,6 +163,9 @@ impl App {
         list_stack.add_named(&list_empty, Some("empty"));
         list_stack.set_visible_child_name("list");
 
+        let search_entry = gtk::SearchEntry::builder().placeholder_text("Artikel durchsuchen (Strg+L)").build();
+        let search_bar = gtk::SearchBar::builder().child(&search_entry).show_close_button(true).build();
+
         let list_title = adw::WindowTitle::new("Ungelesen", "");
         let list_header = adw::HeaderBar::builder().title_widget(&list_title).build();
         let list_menu = gio::Menu::new();
@@ -167,6 +178,7 @@ impl App {
         list_header.pack_end(&list_more);
         let list_toolbar = adw::ToolbarView::builder().content(&list_stack).build();
         list_toolbar.add_top_bar(&list_header);
+        list_toolbar.add_top_bar(&search_bar);
         let list_page = adw::NavigationPage::new(&list_toolbar, "Artikel");
 
         let btn_back = gtk::Button::builder()
@@ -206,11 +218,7 @@ impl App {
 
         let css = gtk::CssProvider::new();
         let display = gtk::prelude::WidgetExt::display(&window);
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
         let app = Rc::new(Self {
             window,
@@ -219,31 +227,32 @@ impl App {
             inner,
             sidebar_list,
             sidebar_filters: RefCell::new(Vec::new()),
-            collapsed_groups: RefCell::new(HashSet::new()),
             last_sync_label,
             list_title,
             list_stack,
             list_store,
             list_selection,
             list_view,
+            list_scroll,
             list_empty,
+            search_bar,
+            search_entry,
             reader,
-            lib,
-            source: RefCell::new(SourceFilter::Unread),
-            selected: RefCell::new(None),
-            keep_visible: RefCell::new(None),
-            unread_guard: RefCell::new(HashSet::new()),
-            last_opened: RefCell::new(HashMap::new()),
-            undo_stack: RefCell::new(Vec::new()),
+            state: RefCell::new(UiState::default()),
+            worker,
+            net,
+            pending_db: RefCell::new(Vec::new()),
+            drain_active: Cell::new(false),
             preview_timer: RefCell::new(None),
+            search_timer: RefCell::new(None),
             read_gen: Cell::new(0),
             suppress: Cell::new(false),
             selection_cause: Cell::new(SelectionCause::Unknown),
             list_dirty: RefCell::new(Vec::new()),
+            undo_stack: RefCell::new(Vec::new()),
             tokens: RefCell::new(tokens_for(true)),
             css,
             panes: RefCell::new(Vec::new()),
-            custom_feed_counter: Cell::new(0),
             me: RefCell::new(None),
         });
 
@@ -257,12 +266,10 @@ impl App {
         app.apply_theme_now();
         app.wire(factory);
         app.register_actions(application);
-        app.install_breakpoints();
-        app.refresh_sidebar();
-        app.refresh_list();
-        app.update_reader_empty();
+        app.install_width_watcher();
+        app.start_drain_loop();
         app.window.present();
-
+        app.bootstrap();
         app
     }
 
@@ -270,10 +277,1061 @@ impl App {
         self.me.borrow().clone().expect("App-Selbstreferenz gesetzt")
     }
 
-    // ── Verdrahtung ──
+    // ── DB- und Net-Drain ──
+
+    pub fn db_query<F, R, C>(&self, f: F, on: C)
+    where
+        F: FnOnce(&storage::Database) -> R + Send + 'static,
+        R: Send + 'static,
+        C: FnOnce(&Rc<App>, R) + 'static,
+    {
+        let rx = self.worker.send(f);
+        self.pending_db.borrow_mut().push((
+            rx,
+            Box::new(move |app: &Rc<App>, out: JobOut| {
+                if let Ok(v) = out.downcast::<R>() {
+                    on(app, *v);
+                }
+            }),
+        ));
+    }
+
+    fn start_drain_loop(&self) {
+        let w = self.weak();
+        glib::timeout_add_local(Duration::from_millis(120), move || {
+            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
+            app.drain_once();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn drain_once(&self) {
+        loop {
+            let net_event = self.net.events.try_recv().ok();
+            if let Some(ev) = net_event {
+                self.handle_net_event(ev);
+                continue;
+            }
+            break;
+        }
+        let mut ready: Vec<(PendingCb, JobOut)> = Vec::new();
+        {
+            let mut pending = self.pending_db.borrow_mut();
+            let mut i = 0;
+            while i < pending.len() {
+                match pending[i].0.try_recv() {
+                    Ok(out) => {
+                        let (_, cb) = pending.remove(i);
+                        ready.push((cb, out));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let (_, _cb) = pending.remove(i);
+                    }
+                }
+            }
+        }
+        for (cb, out) in ready {
+            let self_rc = self
+                .me
+                .borrow()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .expect("App lebendig während Drain");
+            cb(&self_rc, out);
+        }
+    }
+
+    fn handle_net_event(&self, ev: NetEvent) {
+        match ev {
+            NetEvent::FetchStarted(_) => {}
+            NetEvent::FetchNotModified(_) => self.touch_last_sync(),
+            NetEvent::FetchDone { feed_id, added, title, .. } => {
+                self.touch_last_sync();
+                let label = title.unwrap_or_else(|| format!("Feed {feed_id}"));
+                if added > 0 {
+                    self.show_toast(&format!("{label}: {added} neue Artikel"));
+                    let at_top = self.list_scroll.vadjustment().value() < 80.0;
+                    self.reload_counts();
+                    if at_top {
+                        self.load_page(false);
+                    }
+                } else {
+                    self.reload_counts();
+                }
+            }
+            NetEvent::FetchFailed { message, .. } => {
+                self.touch_last_sync();
+                self.show_toast(&format!("Abruf fehlgeschlagen: {message}"));
+            }
+            NetEvent::DiscoveryDone { candidates, .. } => self.show_discovery_dialog(candidates),
+            NetEvent::DiscoveryFailed { message, .. } => {
+                self.show_toast(&format!("Kein Feed gefunden: {message}"));
+            }
+        }
+    }
+
+    fn touch_last_sync(&self) {
+        let now = now_ms();
+        self.state.borrow_mut().last_sync = Some(now);
+        self.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(now)));
+        self.worker.send(move |db| db.set_last_sync("local", now));
+    }
+
+    // ── Start ──
+
+    fn bootstrap(&self) {
+        let seed = std::env::var("LF_SEED").is_ok();
+        let w = self.weak();
+        self.db_query(
+            move |db| {
+                db.ensure_local_account()?;
+                if seed {
+                    let n = db.list_feeds()?;
+                    if n.is_empty() {
+                        crate::seed::seed_fixtures(db)?;
+                    }
+                }
+                let feeds = db.list_feeds()?;
+                let groups = db.list_groups()?;
+                let counts = db.counts()?;
+                let last = db.last_sync("local")?;
+                Ok::<_, storage::StorageError>((feeds, groups, counts, last))
+            },
+            move |app, res: storage::Result<(Vec<FeedRow>, Vec<GroupRow>, Counts, Option<i64>)>| {
+                let Ok((feeds, groups, counts, last)) = res else { return };
+                {
+                    let mut st = app.state.borrow_mut();
+                    st.feeds = feeds;
+                    st.groups = groups;
+                    st.counts = counts;
+                    st.last_sync = last;
+                }
+                if let Some(ms) = last {
+                    app.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(ms)));
+                }
+                app.refresh_sidebar();
+                app.load_page(false);
+                if let Ok(list) = std::env::var("LF_SUBSCRIBE") {
+                    for url in list.split(',').filter(|u| !u.trim().is_empty()) {
+                        let url = url.trim().to_string();
+                        let title = url::Url::parse(&url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(str::to_string))
+                            .unwrap_or_else(|| url.clone());
+                        app.subscribe(&url, &title);
+                    }
+                }
+                let _ = w;
+            },
+        );
+    }
+
+    fn load_page(&self, append: bool) {
+        let (src, cursor) = {
+            let st = self.state.borrow();
+            if append {
+                (st.effective_source(), st.cursor.clone())
+            } else {
+                (st.effective_source(), None)
+            }
+        };
+        if append && cursor.is_none() {
+            return;
+        }
+        let cur = cursor.clone();
+        self.db_query(
+            move |db| db.query_articles(&src, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200),
+            move |app, res: storage::Result<Vec<ArticleRow>>| {
+                let Ok(rows) = res else { return };
+                let had_full_page = rows.len() >= 200;
+                let keep_sel = app.state.borrow().selected.clone();
+                {
+                    let mut st = app.state.borrow_mut();
+                    if append {
+                        st.append_rows(rows);
+                    } else {
+                        st.build_rows(rows);
+                    }
+                    if !had_full_page {
+                        st.cursor = st.last_item().map(|a| (a.published_ms, a.id.clone()));
+                    }
+                    if let Some(sel) = keep_sel {
+                        st.selected = Some(sel);
+                    }
+                }
+                app.sync_store(append);
+                app.update_list_empty_state();
+            },
+        );
+    }
+
+    fn reload_counts(&self) {
+        let w = self.weak();
+        self.db_query(
+            |db| db.counts(),
+            move |app, res: storage::Result<Counts>| {
+                let Ok(counts) = res else { return };
+                app.state.borrow_mut().counts = counts;
+                app.refresh_sidebar();
+                app.update_reader_empty();
+                let _ = w;
+            },
+        );
+    }
+
+    // ── Store-Sync ──
+
+    fn sync_store(&self, append: bool) {
+        let rows = self.state.borrow().rows.clone();
+        self.suppress.set(true);
+        if append {
+            let existing = self.list_store.n_items() as usize;
+            for r in rows.iter().skip(existing) {
+                self.list_store.append(&glib::BoxedAnyObject::new(r.clone()));
+            }
+        } else {
+            self.list_store.remove_all();
+            for r in &rows {
+                self.list_store.append(&glib::BoxedAnyObject::new(r.clone()));
+            }
+            if let Some(sel) = self.state.borrow().selected.clone() {
+                if let Some(pos) = self.state.borrow().row_pos(&sel.1) {
+                    self.list_selection.set_selected(pos as u32);
+                }
+            }
+        }
+        let has_items = rows.iter().any(|r| matches!(r, ListRow::Item(_)));
+        self.list_stack.set_visible_child_name(if has_items { "list" } else { "empty" });
+        self.suppress.set(false);
+    }
+
+    fn update_list_empty_state(&self) {
+        let has = self.state.borrow().rows.iter().any(|r| matches!(r, ListRow::Item(_)));
+        self.list_stack.set_visible_child_name(if has { "list" } else { "empty" });
+    }
+
+    fn rebind_row(&self, id: &str) {
+        let Some(pos) = self.state.borrow().row_pos(id) else { return };
+        let Some(obj) = self.list_store.item(pos as u32) else { return };
+        self.suppress.set(true);
+        self.list_store.remove(pos as u32);
+        self.list_store.insert(pos as u32, &obj);
+        self.suppress.set(false);
+    }
+
+    fn update_row(&self, id: &str) {
+        if !self.list_view.is_mapped() {
+            let mut dirty = self.list_dirty.borrow_mut();
+            if !dirty.iter().any(|x| x == id) {
+                dirty.push(id.to_string());
+            }
+            return;
+        }
+        self.rebind_row(id);
+    }
+
+    fn flush_dirty_rows(&self) {
+        let ids = std::mem::take(&mut *self.list_dirty.borrow_mut());
+        for id in ids {
+            self.rebind_row(&id);
+        }
+    }
+
+    fn remove_row(&self, id: &str) {
+        let Some(pos) = self.state.borrow().row_pos(id) else { return };
+        {
+            let mut st = self.state.borrow_mut();
+            st.rows.remove(pos);
+        }
+        self.suppress.set(true);
+        if self.selected_id().as_deref() == Some(id) {
+            let next = self
+                .state
+                .borrow()
+                .rows
+                .iter()
+                .enumerate()
+                .skip(pos)
+                .find_map(|(i, r)| match r {
+                    ListRow::Item(_) => Some(i),
+                    _ => None,
+                })
+                .or_else(|| {
+                    self.state.borrow().rows.iter().enumerate().take(pos).rev().find_map(|(i, r)| match r {
+                        ListRow::Item(_) => Some(i),
+                        _ => None,
+                    })
+                });
+            if let Some(p) = next {
+                self.list_selection.set_selected(p as u32);
+            }
+        }
+        self.list_store.remove(pos as u32);
+        self.suppress.set(false);
+        self.update_list_empty_state();
+    }
+
+    fn selected_id(&self) -> Option<String> {
+        self.state.borrow().selected.clone().map(|(_, id)| id)
+    }
+
+    // ── Sidebar ──
+
+    fn refresh_sidebar(&self) {
+        let state = self.state.borrow();
+        let mut filters = self.sidebar_filters.borrow_mut();
+        self.suppress.set(true);
+        let w = self.weak();
+        let cb: Rc<dyn Fn(i64)> = Rc::new(move |gid: i64| {
+            if let Some(app) = w.upgrade() {
+                app.toggle_group(gid);
+            }
+        });
+        sidebar::rebuild(&self.sidebar_list, &state, &mut filters, &cb);
+        self.suppress.set(false);
+    }
+
+    fn toggle_group(&self, gid: i64) {
+        {
+            let mut st = self.state.borrow_mut();
+            if !st.collapsed.remove(&gid) {
+                st.collapsed.insert(gid);
+            }
+        }
+        self.refresh_sidebar();
+    }
+
+    fn set_source(&self, f: Source) {
+        self.flush_keep_visible(None);
+        {
+            let mut st = self.state.borrow_mut();
+            st.source = f.clone();
+            st.search = None;
+            st.selected = st.last_opened.get(&f).cloned();
+        }
+        self.search_bar.set_search_mode(false);
+        self.list_title.set_title(&self.source_label_now());
+        self.refresh_sidebar();
+        self.load_page(false);
+        if let Some(sel) = self.selected_id() {
+            self.open_article_by_id(&sel, false, false);
+        } else {
+            self.update_reader_empty();
+        }
+        if self.outer.is_collapsed() {
+            self.outer.set_show_content(true);
+        }
+    }
+
+    fn source_label_now(&self) -> String {
+        let st = self.state.borrow();
+        match &st.source {
+            Source::Unread => "Ungelesen".into(),
+            Source::All => "Alle Artikel".into(),
+            Source::Saved => "Gespeichert".into(),
+            Source::Group(g) => st.groups.iter().find(|x| &x.id == g).map(|x| x.name.clone()).unwrap_or_else(|| "Gruppe".into()),
+            Source::Feed(f) => st.feed_title(*f),
+            Source::Search(q) => format!("Suche: {q}"),
+        }
+    }
+
+    // ── Artikel öffnen / Status ──
+
+    fn open_article_by_id(&self, id: &str, focus: bool, flush: bool) {
+        let Some(row) = self.state.borrow().article(id).cloned() else { return };
+        self.open_article(row, focus, flush);
+    }
+
+    fn open_article(&self, row: ArticleRow, focus: bool, flush: bool) {
+        if flush {
+            self.flush_keep_visible(Some(&row.id));
+        }
+        let id = row.id.clone();
+        {
+            let mut st = self.state.borrow_mut();
+            let src = st.effective_source();
+            st.selected = Some((row.feed_id, id.clone()));
+            st.last_opened.insert(src, (row.feed_id, id.clone()));
+            st.unread_guard.remove(&id);
+        }
+        if let Some(pos) = self.state.borrow().row_pos(&id) {
+            self.suppress.set(true);
+            self.list_selection.set_selected(pos as u32);
+            self.suppress.set(false);
+        }
+
+        self.reader.title.set_title(&row.title);
+        self.reader.title.set_subtitle(&row.feed_title);
+        self.update_reader_buttons(&row);
+        *self.reader.current.borrow_mut() = Some(id.clone());
+        self.reader.show_loading();
+
+        let row2 = row.clone();
+        let id_cb = id.clone();
+        let w = self.weak();
+        self.db_query(
+            move |db| db.content_html(row2.feed_id, &row2.id),
+            move |app, res: storage::Result<Option<String>>| {
+                let current = app.reader.current.borrow().clone();
+                if current.as_deref() != Some(&id_cb) {
+                    return;
+                }
+                match res {
+                    Ok(Some(html)) => {
+                        let style = app.reader.style.borrow();
+                        let rs = reader::ReaderStyle {
+                            font_size: style.font_size,
+                            measure_ch: style.measure_ch,
+                            line_height: style.line_height,
+                        };
+                        let tokens = *app.tokens.borrow();
+                        let doc = reader::ReaderDocument {
+                            kicker: &row.feed_title,
+                            title: &row.title,
+                            author: row.author.as_deref(),
+                            source: "",
+                            published: &fmt_full(row.published_ms),
+                            content_html: &html,
+                        };
+                        let html_doc = reader::render_document(&doc, &tokens, &rs);
+                        app.reader.load_html_doc(&html_doc);
+                    }
+                    _ => app.reader.show_error(),
+                }
+                let _ = w;
+            },
+        );
+
+        self.start_read_timer(id.clone());
+
+        if self.inner.is_collapsed() {
+            self.inner.set_show_content(true);
+        }
+        if focus {
+            self.reader.webview.grab_focus();
+        }
+    }
+
+    fn start_read_timer(&self, id: String) {
+        self.read_gen.set(self.read_gen.get() + 1);
+        let gen = self.read_gen.get();
+        let w = self.weak();
+        glib::timeout_add_local(Duration::from_millis(800), move || {
+            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
+            if app.read_gen.get() != gen || !app.window.is_active() {
+                return glib::ControlFlow::Break;
+            }
+            if app.reader.current.borrow().as_deref() != Some(id.as_str()) {
+                return glib::ControlFlow::Break;
+            }
+            if app.state.borrow().unread_guard.contains(&id) {
+                return glib::ControlFlow::Break;
+            }
+            let still_unread = app.state.borrow().article(&id).map(|a| a.unread).unwrap_or(false);
+            if still_unread {
+                let mut batch: UndoBatch = Vec::new();
+                app.apply_status(&id, Some(true), None, &mut batch);
+                app.undo_stack.borrow_mut().push(batch);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn apply_status(&self, id: &str, read: Option<bool>, saved: Option<bool>, batch: &mut UndoBatch) {
+        let prev = {
+            let st = self.state.borrow();
+            st.article(id).map(|a| (a.feed_id, a.unread, a.saved))
+        };
+        let Some((feed_id, prev_unread, prev_saved)) = prev else { return };
+        batch.push((feed_id, id.to_string(), prev_unread, prev_saved));
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(a) = st.article_mut(id) {
+                if let Some(r) = read {
+                    a.unread = !r;
+                }
+                if let Some(s) = saved {
+                    a.saved = s;
+                }
+            }
+            if let Some(r) = read {
+                let delta = if r { -1 } else { 1 };
+                st.counts.unread = (st.counts.unread + delta).max(0);
+                if let Some(entry) = st.counts.per_feed.iter_mut().find(|(f, _)| *f == feed_id) {
+                    entry.1 = (entry.1 + delta).max(0);
+                }
+                let gids: Vec<i64> = st
+                    .feeds
+                    .iter()
+                    .find(|f| f.id == feed_id)
+                    .map(|f| f.groups.clone())
+                    .unwrap_or_default();
+                for entry in st.counts.per_group.iter_mut() {
+                    if gids.contains(&entry.0) {
+                        entry.1 = (entry.1 + delta).max(0);
+                    }
+                }
+            }
+            if let Some(s) = saved {
+                st.counts.saved = (st.counts.saved + if s { 1 } else { -1 }).max(0);
+            }
+        }
+
+        let still_matches = {
+            let st = self.state.borrow();
+            let a = st.article(id);
+            match (&st.effective_source(), a) {
+                (_, None) => false,
+                (Source::Unread, Some(a)) => a.unread,
+                (Source::Saved, Some(a)) => a.saved,
+                _ => true,
+            }
+        };
+        if still_matches {
+            self.update_row(id);
+        } else if self.selected_id().as_deref() == Some(id)
+            || self.state.borrow().keep_visible.as_ref().map(|(_, i)| i.as_str()) == Some(id)
+        {
+            self.state.borrow_mut().keep_visible = Some((feed_id, id.to_string()));
+            self.update_row(id);
+        } else {
+            self.remove_row(id);
+        }
+
+        if self.reader.current.borrow().as_deref() == Some(id) {
+            if let Some(row) = self.state.borrow().article(id).cloned() {
+                self.update_reader_buttons(&row);
+            }
+        }
+        self.refresh_sidebar();
+
+        let feed_id2 = feed_id;
+        let id2 = id.to_string();
+        self.worker.send(move |db| db.set_status(feed_id2, &id2, read, saved));
+    }
+
+    fn flush_keep_visible(&self, new_selection: Option<&str>) {
+        let kv = self.state.borrow_mut().keep_visible.take();
+        if let Some((kv_feed, kv_id)) = kv {
+            if Some(kv_id.as_str()) == new_selection {
+                self.state.borrow_mut().keep_visible = Some((kv_feed, kv_id));
+                return;
+            }
+            let still_matches = {
+                let st = self.state.borrow();
+                match (&st.effective_source(), st.article(&kv_id)) {
+                    (_, None) => false,
+                    (Source::Unread, Some(a)) => a.unread,
+                    (Source::Saved, Some(a)) => a.saved,
+                    _ => true,
+                }
+            };
+            if !still_matches {
+                self.remove_row(&kv_id);
+            }
+        }
+    }
+
+    fn current_article(&self) -> Option<ArticleRow> {
+        let id = self.selected_id().or_else(|| self.reader.current.borrow().clone())?;
+        self.state.borrow().article(&id).cloned()
+    }
+
+    fn toggle_read(&self) {
+        let Some(row) = self.current_article() else { return };
+        let was_unread = row.unread;
+        let mut batch: UndoBatch = Vec::new();
+        self.apply_status(&row.id, Some(!was_unread), None, &mut batch);
+        if was_unread {
+            self.state.borrow_mut().unread_guard.remove(&row.id);
+        } else {
+            self.state.borrow_mut().unread_guard.insert(row.id.clone());
+        }
+        self.undo_stack.borrow_mut().push(batch);
+    }
+
+    fn toggle_saved(&self) {
+        let Some(row) = self.current_article() else { return };
+        let mut batch: UndoBatch = Vec::new();
+        self.apply_status(&row.id, None, Some(!row.saved), &mut batch);
+        self.undo_stack.borrow_mut().push(batch);
+    }
+
+    fn undo(&self) {
+        let Some(batch) = self.undo_stack.borrow_mut().pop() else {
+            self.show_toast("Nichts rückgängig zu machen");
+            return;
+        };
+        {
+            let mut st = self.state.borrow_mut();
+            for (feed_id, id, unread, saved) in &batch {
+                if let Some(a) = st.article_mut(id) {
+                    a.unread = *unread;
+                    a.saved = *saved;
+                }
+                let _ = feed_id;
+            }
+        }
+        for (_, id, _, _) in &batch {
+            self.update_row(id);
+        }
+        let batch2 = batch.clone();
+        self.worker.send(move |db| {
+            for (feed_id, id, unread, saved) in &batch2 {
+                db.set_status(*feed_id, id, Some(!unread), Some(*saved))?;
+            }
+            Ok::<_, storage::StorageError>(())
+        });
+        self.reload_counts();
+        self.show_toast("Aktion rückgängig gemacht");
+    }
+
+    fn mark_scope_dialog(&self) {
+        let ids: Vec<(i64, String)> = {
+            let st = self.state.borrow();
+            st.rows
+                .iter()
+                .filter_map(|r| match r {
+                    ListRow::Item(a) if a.unread => Some((a.feed_id, a.id.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let label = self.source_label_now();
+        if ids.is_empty() {
+            self.show_toast(&format!("„{label}“ enthält keine ungelesenen Artikel"));
+            return;
+        }
+        let dialog = adw::AlertDialog::builder()
+            .heading("Bereich als gelesen markieren")
+            .body(format!(
+                "„{label}“: {} zum Klickzeitpunkt bekannte Artikel werden als gelesen markiert. Rückgängig mit Strg+Z.",
+                ids.len()
+            ))
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("mark", &format!("{} als gelesen markieren", ids.len()));
+        dialog.set_response_appearance("mark", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            let Some(app) = w.upgrade() else { return };
+            if resp != "mark" {
+                return;
+            }
+            let mut batch: UndoBatch = Vec::new();
+            for (feed_id, id) in &ids {
+                let _ = feed_id;
+                app.apply_status(id, Some(true), None, &mut batch);
+            }
+            app.undo_stack.borrow_mut().push(batch);
+            app.show_toast(&format!("{} Artikel als gelesen markiert", ids.len()));
+        });
+    }
+
+    fn show_toast(&self, msg: &str) {
+        self.toast.add_toast(adw::Toast::new(msg));
+    }
+
+    // ── Navigation ──
+
+    fn move_selection(&self, delta: i32) {
+        let positions: Vec<usize> = self
+            .state
+            .borrow()
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                ListRow::Item(_) => Some(i),
+                _ => None,
+            })
+            .collect();
+        if positions.is_empty() {
+            return;
+        }
+        let cur_id = self.selected_id();
+        let cur_idx = cur_id
+            .as_ref()
+            .and_then(|id| self.state.borrow().row_pos(id))
+            .and_then(|p| positions.iter().position(|x| *x == p))
+            .map(|i| i as i32)
+            .unwrap_or(if delta > 0 { -1 } else { positions.len() as i32 });
+        let target = (cur_idx + delta).clamp(0, positions.len() as i32 - 1);
+        let idx = positions[target as usize];
+        let row = {
+            let st = self.state.borrow();
+            match st.rows.get(idx) {
+                Some(ListRow::Item(a)) => Some(a.clone()),
+                _ => None,
+            }
+        };
+        if let Some(row) = row {
+            self.open_article(row, false, true);
+        }
+    }
+
+    fn move_unread(&self, dir: i32) {
+        let positions: Vec<usize> = self
+            .state
+            .borrow()
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                ListRow::Item(a) if a.unread => Some(i),
+                _ => None,
+            })
+            .collect();
+        if positions.is_empty() {
+            self.show_toast("Keine weiteren ungelesenen Artikel in dieser Ansicht");
+            return;
+        }
+        let cur = self.selected_id().and_then(|id| self.state.borrow().row_pos(&id)).unwrap_or(0);
+        let next = if dir > 0 {
+            positions.iter().find(|&&p| p > cur).copied().or_else(|| positions.first().copied())
+        } else {
+            positions.iter().rev().find(|&&p| p < cur).copied().or_else(|| positions.last().copied())
+        };
+        if let Some(idx) = next {
+            let row = {
+                let st = self.state.borrow();
+                match st.rows.get(idx) {
+                    Some(ListRow::Item(a)) => Some(a.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(row) = row {
+                self.open_article(row, false, true);
+            }
+        }
+    }
+
+    fn focus_pane(&self, dir: i32) {
+        let panes = self.panes.borrow().clone();
+        let Some(focus) = gtk::prelude::GtkWindowExt::focus(&self.window) else {
+            if let Some(p) = panes.first() {
+                gtk::prelude::GtkWindowExt::set_focus(&self.window, Some(p));
+            }
+            return;
+        };
+        let mut current: Option<usize> = None;
+        let mut cur = Some(focus.clone());
+        while let Some(c) = cur {
+            if let Some(i) = panes.iter().position(|p| *p == c) {
+                current = Some(i);
+                break;
+            }
+            cur = c.parent();
+        }
+        let idx = match current {
+            Some(i) => ((i as i32 + dir).rem_euclid(panes.len() as i32)) as usize,
+            None => 0,
+        };
+        if let Some(p) = panes.get(idx) {
+            gtk::prelude::GtkWindowExt::set_focus(&self.window, Some(p));
+        }
+    }
+
+    fn back(&self) {
+        if self.inner.is_collapsed() && self.inner.shows_content() {
+            self.inner.set_show_content(false);
+        } else if self.outer.is_collapsed() && self.outer.shows_content() {
+            self.outer.set_show_content(false);
+        }
+    }
+
+    // ── Reader-Aktionen ──
+
+    fn update_reader_buttons(&self, row: &ArticleRow) {
+        self.reader.btn_read.set_icon_name(if row.unread { "mail-read-symbolic" } else { "mail-unread-symbolic" });
+        self.reader.btn_read.set_tooltip_text(Some(if row.unread {
+            "Als gelesen markieren (M)"
+        } else {
+            "Als ungelesen markieren (M)"
+        }));
+        self.reader.btn_saved.set_icon_name(if row.saved { "user-bookmarks-symbolic" } else { "bookmark-new-symbolic" });
+        self.reader.btn_saved.set_tooltip_text(Some(if row.saved { "Entspeichern (S)" } else { "Speichern (S)" }));
+    }
+
+    fn update_reader_empty(&self) {
+        let st = self.state.borrow();
+        let label = self.source_label_now();
+        let (unread, total) = match &st.source {
+            Source::Unread => (st.counts.unread, st.counts.unread),
+            Source::Saved => (st.counts.saved, st.counts.saved),
+            Source::All => (st.counts.unread, st.counts.total),
+            Source::Feed(f) => {
+                let total = st.rows.len() as i64;
+                (st.feed_unread(*f), total)
+            }
+            Source::Group(g) => (st.group_unread(*g), st.rows.len() as i64),
+            Source::Search(_) => (0, st.rows.len() as i64),
+        };
+        drop(st);
+        self.reader.show_empty(&label, &format!("{unread} ungelesen · {total} Artikel"));
+        self.reader.title.set_title(&label);
+        self.reader.title.set_subtitle("");
+    }
+
+    fn zoom(&self, delta: f64) {
+        {
+            let mut s = self.reader.style.borrow_mut();
+            s.font_size = (s.font_size + delta).clamp(14.0, 32.0);
+        }
+        self.reload_current(true);
+    }
+
+    fn zoom_reset(&self) {
+        self.reader.style.borrow_mut().font_size = ReaderStyleState::default().font_size;
+        self.reload_current(true);
+    }
+
+    fn reload_current(&self, preserve: bool) {
+        let Some(id) = self.reader.current.borrow().clone() else { return };
+        let row = self.state.borrow().article(&id).cloned();
+        let Some(row) = row else { return };
+        let w = self.weak();
+        self.db_query(
+            move |db| db.content_html(row.feed_id, &row.id),
+            move |app, res: storage::Result<Option<String>>| {
+                let Ok(Some(html)) = res else { return };
+                let style = app.reader.style.borrow();
+                let rs = reader::ReaderStyle {
+                    font_size: style.font_size,
+                    measure_ch: style.measure_ch,
+                    line_height: style.line_height,
+                };
+                let tokens = *app.tokens.borrow();
+                let published = fmt_full(row.published_ms);
+                let doc = reader::ReaderDocument {
+                    kicker: &row.feed_title,
+                    title: &row.title,
+                    author: row.author.as_deref(),
+                    source: "",
+                    published: &published,
+                    content_html: &html,
+                };
+                if preserve {
+                    let pane = Rc::clone(&app.reader);
+                    let wv = pane.webview.clone();
+                    let html_doc = reader::render_document(&doc, &tokens, &rs);
+                    wv.evaluate_javascript(
+                        "window.scrollY",
+                        None,
+                        None,
+                        None::<&gio::Cancellable>,
+                        move |res| {
+                            if let Ok(v) = res {
+                                if v.is_number() {
+                                    pane.pending_scroll.set(v.to_double());
+                                }
+                            }
+                            pane.load_html_doc(&html_doc);
+                        },
+                    );
+                } else {
+                    let html_doc = reader::render_document(&doc, &tokens, &rs);
+                    app.reader.load_html_doc(&html_doc);
+                }
+                let _ = w;
+            },
+        );
+    }
+
+    fn open_find(&self) {
+        self.reader.search_bar.set_search_mode(true);
+        self.reader.search_entry.grab_focus();
+    }
+
+    fn open_external(&self) {
+        let Some(url) = self.current_article().and_then(|a| a.url) else { return };
+        gtk::UriLauncher::new(&url).launch(None::<&gtk::Window>, None::<&gio::Cancellable>, |res| {
+            if let Err(e) = res {
+                eprintln!("Extern öffnen fehlgeschlagen: {e}");
+            }
+        });
+    }
+
+    fn copy_link(&self) {
+        let Some(url) = self.current_article().and_then(|a| a.url) else { return };
+        self.window.clipboard().set_text(&url);
+        self.show_toast("Link kopiert");
+    }
+
+    // ── Konto ──
+
+    fn do_refresh(&self) {
+        let feeds: Vec<(i64, String)> = self.state.borrow().feeds.iter().map(|f| (f.id, f.feed_url.clone())).collect();
+        if feeds.is_empty() {
+            self.show_toast("Noch keine Feeds abonniert (Strg+N)");
+            return;
+        }
+        for (feed_id, url) in feeds {
+            self.net.fetch_feed(self.worker.clone(), feed_id, url, true);
+        }
+        self.show_toast(&format!("Aktualisiere {} Feeds…", self.state.borrow().feeds.len()));
+    }
+
+    fn add_feed_dialog(&self) {
+        let entry = gtk::Entry::builder().placeholder_text("Feed- oder Website-URL").activates_default(true).build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Feed hinzufügen")
+            .body("URL eingeben; Lesefluss sucht den Feed und zeigt eine Vorschau.")
+            .extra_child(&entry)
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("add", "Suchen");
+        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("add"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            let Some(app) = w.upgrade() else { return };
+            if resp != "add" {
+                return;
+            }
+            let url = entry.text().trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            app.show_toast("Suche Feed…");
+            app.net.discover(url);
+        });
+    }
+
+    fn show_discovery_dialog(&self, candidates: Vec<provider_local::DiscoverCandidate>) {
+        let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
+        for c in &candidates {
+            let row = gtk::ListBoxRow::builder()
+                .child(&gtk::Label::builder().label(&format!("{} — {}", c.title, c.url)).xalign(0.0).margin_start(8).margin_end(8).margin_top(6).margin_bottom(6).build())
+                .build();
+            list.append(&row);
+        }
+        if let Some(r) = list.row_at_index(0) {
+            list.select_row(Some(&r));
+        }
+        let dialog = adw::AlertDialog::builder()
+            .heading("Feed gefunden")
+            .body("Bitte Feed auswählen und abonnieren.")
+            .extra_child(&list)
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("sub", "Abonnieren");
+        dialog.set_response_appearance("sub", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("sub"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            let Some(app) = w.upgrade() else { return };
+            if resp != "sub" {
+                return;
+            }
+            let Some(idx) = list.selected_row().map(|r| r.index() as usize) else { return };
+            let Some(c) = candidates.get(idx) else { return };
+            app.subscribe(&c.url, &c.title);
+        });
+    }
+
+    fn subscribe(&self, url: &str, title: &str) {
+        let url = url.to_string();
+        let title = title.to_string();
+        let w = self.weak();
+        self.db_query(
+            {
+                let url_db = url.clone();
+                move |db: &storage::Database| {
+                    if let Some(id) = db.feed_id_by_url(&url_db)? {
+                        return Ok::<_, storage::StorageError>((id, false));
+                    }
+                    let accent = ACCENTS[url_db.len() % ACCENTS.len()];
+                    let id = db.add_feed("local", &url_db, &title, None, accent)?;
+                    Ok((id, true))
+                }
+            },
+            move |app, res: storage::Result<(i64, bool)>| {
+                let Ok((feed_id, is_new)) = res else { return };
+                if is_new {
+                    let url2 = url.clone();
+                    app.net.fetch_feed(app.worker.clone(), feed_id, url2, true);
+                }
+                app.reload_meta_then_select(feed_id);
+                let _ = w;
+            },
+        );
+    }
+
+    fn reload_meta_then_select(&self, feed_id: i64) {
+        let w = self.weak();
+        self.db_query(
+            |db| Ok::<_, storage::StorageError>((db.list_feeds()?, db.list_groups()?, db.counts()?)),
+            move |app, res: storage::Result<(Vec<FeedRow>, Vec<GroupRow>, Counts)>| {
+                let Ok((feeds, groups, counts)) = res else { return };
+                {
+                    let mut st = app.state.borrow_mut();
+                    st.feeds = feeds;
+                    st.groups = groups;
+                    st.counts = counts;
+                }
+                app.set_source(Source::Feed(feed_id));
+                let _ = w;
+            },
+        );
+    }
+
+    // ── Thema & Layout ──
+
+    fn apply_theme_now(&self) {
+        let dark = adw::StyleManager::default().is_dark();
+        let tokens = tokens_for(dark);
+        *self.tokens.borrow_mut() = tokens;
+        self.css.load_from_string(&gtk_css_for(&tokens));
+        let rgba = gtk::gdk::RGBA::new(
+            tokens.surface_reader.r as f32 / 255.0,
+            tokens.surface_reader.g as f32 / 255.0,
+            tokens.surface_reader.b as f32 / 255.0,
+            1.0,
+        );
+        self.reader.webview.set_background_color(&rgba);
+    }
+
+    fn apply_theme(&self) {
+        self.apply_theme_now();
+        self.reload_current(true);
+    }
+
+    fn install_width_watcher(&self) {
+        let outer = self.outer.clone();
+        let inner = self.inner.clone();
+        let win = self.window.clone();
+        let apply = move || {
+            let w = gtk::prelude::NativeExt::surface(&win).map(|s| s.width()).unwrap_or_else(|| win.width());
+            outer.set_collapsed(w <= 1119);
+            inner.set_collapsed(w <= 779);
+        };
+        let apply_win = apply.clone();
+        self.window.connect_notify_local(None, move |_, pspec| {
+            let n = pspec.name();
+            if n == "fullscreened" || n == "maximized" {
+                apply_win();
+            }
+        });
+        let apply_realize = apply.clone();
+        self.window.connect_realize(move |win| {
+            if let Some(surface) = gtk::prelude::NativeExt::surface(win) {
+                let apply2 = apply_realize.clone();
+                surface.connect_notify_local(Some("width"), move |_, _| apply2());
+            }
+            apply_realize();
+        });
+        apply();
+    }
+
+    // ── Signale ──
 
     fn wire(&self, factory: gtk::SignalListItemFactory) {
-        let lib = Rc::clone(&self.lib);
         factory.connect_setup(|_, list_item| {
             let li = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
             li.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
@@ -283,8 +1341,7 @@ impl App {
             let Some(obj) = li.item() else { return };
             let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() else { return };
             let row = boxed.borrow::<ListRow>();
-            let widget = list::row_widget(&row, &lib.borrow());
-            li.set_child(Some(&widget));
+            li.set_child(Some(&list::row_widget(&row)));
         });
         factory.connect_unbind(|_, list_item| {
             let li = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
@@ -323,8 +1380,23 @@ impl App {
             let Some(obj) = sel.selected_item() else { return };
             let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() else { return };
             let row = boxed.borrow::<ListRow>();
-            if let ListRow::Item { id } = row.clone() {
-                app.schedule_preview(id);
+            if let ListRow::Item(a) = row.clone() {
+                app.schedule_preview(a);
+            }
+        });
+
+        let w = self.weak();
+        self.list_view.connect_activate(move |_, pos| {
+            let Some(app) = w.upgrade() else { return };
+            let row = {
+                let st = app.state.borrow();
+                match st.rows.get(pos as usize) {
+                    Some(ListRow::Item(a)) => Some(a.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(row) = row {
+                app.open_article(row, true, true);
             }
         });
 
@@ -338,6 +1410,7 @@ impl App {
                 glib::ControlFlow::Break
             });
         });
+
         let w = self.weak();
         let click = gtk::GestureClick::new();
         click.connect_pressed(move |_, _, _, _| {
@@ -351,12 +1424,8 @@ impl App {
         keys.connect_key_pressed(move |_, key, _, _| {
             if let Some(app) = w.upgrade() {
                 match key {
-                    gtk::gdk::Key::Up
-                    | gtk::gdk::Key::Down
-                    | gtk::gdk::Key::Home
-                    | gtk::gdk::Key::End
-                    | gtk::gdk::Key::Page_Up
-                    | gtk::gdk::Key::Page_Down => {
+                    gtk::gdk::Key::Up | gtk::gdk::Key::Down | gtk::gdk::Key::Home | gtk::gdk::Key::End
+                    | gtk::gdk::Key::Page_Up | gtk::gdk::Key::Page_Down => {
                         app.selection_cause.set(SelectionCause::Keyboard);
                     }
                     _ => {}
@@ -367,10 +1436,18 @@ impl App {
         self.list_view.add_controller(keys);
 
         let w = self.weak();
-        self.list_view.connect_activate(move |_, pos| {
+        self.list_scroll.vadjustment().connect_value_changed(move |adj| {
             let Some(app) = w.upgrade() else { return };
-            if let Some(id) = app.item_id_at(pos) {
-                app.open_article(id, true, true);
+            let near_bottom = adj.value() + adj.page_size() >= adj.upper() - 400.0;
+            if !near_bottom {
+                return;
+            }
+            let st = app.state.borrow();
+            let can_more = st.cursor.is_some() && !st.loading_more;
+            drop(st);
+            if can_more {
+                app.state.borrow_mut().loading_more = true;
+                app.load_page(true);
             }
         });
 
@@ -383,6 +1460,28 @@ impl App {
             find_next(&webview2);
         });
         self.reader.search_bar.set_key_capture_widget(Some(&self.window));
+
+        let w = self.weak();
+        self.search_entry.connect_search_changed(move |entry| {
+            let Some(app) = w.upgrade() else { return };
+            let q = entry.text().trim().to_string();
+            if let Some(old) = app.search_timer.borrow_mut().take() {
+                old.remove();
+            }
+            let w2 = w.clone();
+            let timer = glib::timeout_add_local(Duration::from_millis(150), move || {
+                let Some(app) = w2.upgrade() else { return glib::ControlFlow::Break };
+                *app.search_timer.borrow_mut() = None;
+                {
+                    let mut st = app.state.borrow_mut();
+                    st.search = if q.is_empty() { None } else { Some(q.clone()) };
+                }
+                app.list_title.set_title(&app.source_label_now());
+                app.load_page(false);
+                glib::ControlFlow::Break
+            });
+            *app.search_timer.borrow_mut() = Some(timer);
+        });
 
         let w = self.weak();
         self.reader.webview.connect_load_changed(move |_, event| {
@@ -401,34 +1500,25 @@ impl App {
         });
     }
 
-    fn install_breakpoints(&self) {
-        let outer = self.outer.clone();
-        let inner = self.inner.clone();
-        let win = self.window.clone();
-        let apply = move || {
-            let w = gtk::prelude::NativeExt::surface(&win)
-                .map(|s| s.width())
-                .unwrap_or_else(|| win.width());
-            outer.set_collapsed(w <= 1119);
-            inner.set_collapsed(w <= 779);
-        };
-        let apply_win = apply.clone();
-        self.window.connect_notify_local(None, move |_, pspec| {
-            let n = pspec.name();
-            if n == "fullscreened" || n == "maximized" {
-                apply_win();
+    fn schedule_preview(&self, row: ArticleRow) {
+        if let Some(old) = self.preview_timer.borrow_mut().take() {
+            old.remove();
+        }
+        let w = self.weak();
+        let timer = glib::timeout_add_local(Duration::from_millis(220), move || {
+            if let Some(app) = w.upgrade() {
+                *app.preview_timer.borrow_mut() = None;
+                let is_current = app.reader.current.borrow().as_deref() == Some(row.id.as_str());
+                if !is_current {
+                    app.open_article(row.clone(), false, true);
+                }
             }
+            glib::ControlFlow::Break
         });
-        let apply_realize = apply.clone();
-        self.window.connect_realize(move |win| {
-            if let Some(surface) = gtk::prelude::NativeExt::surface(win) {
-                let apply2 = apply_realize.clone();
-                surface.connect_notify_local(Some("width"), move |_, _| apply2());
-            }
-            apply_realize();
-        });
-        apply();
+        *self.preview_timer.borrow_mut() = Some(timer);
     }
+
+    // ── Actions ──
 
     fn register_actions(&self, application: &adw::Application) {
         macro_rules! win_action {
@@ -458,6 +1548,10 @@ impl App {
         win_action!("zoom-out", |a| a.zoom(-2.0));
         win_action!("zoom-reset", |a| a.zoom_reset());
         win_action!("find", |a| a.open_find());
+        win_action!("article-search", |a| {
+            a.search_bar.set_search_mode(true);
+            a.search_entry.grab_focus();
+        });
         win_action!("reader-retry", |a| a.reload_current(false));
         win_action!("undo", |a| a.undo());
         win_action!("close", |a| a.window.close());
@@ -500,6 +1594,7 @@ impl App {
         application.set_accels_for_action("win.toggle-saved", &["s"]);
         application.set_accels_for_action("win.open-external", &["o"]);
         application.set_accels_for_action("win.find", &["<Control>f"]);
+        application.set_accels_for_action("win.article-search", &["<Control>l"]);
         application.set_accels_for_action("win.refresh", &["<Control>r"]);
         application.set_accels_for_action("win.add-feed", &["<Control>n"]);
         application.set_accels_for_action("win.mark-scope-read", &["<Control><Shift>m"]);
@@ -513,746 +1608,4 @@ impl App {
         application.set_accels_for_action("win.close", &["<Control>w"]);
         application.set_accels_for_action("app.quit", &["<Control>q"]);
     }
-
-    // ── Thema ──
-
-    fn apply_theme_now(&self) {
-        let dark = adw::StyleManager::default().is_dark();
-        let tokens = tokens_for(dark);
-        *self.tokens.borrow_mut() = tokens;
-        self.css.load_from_string(&gtk_css_for(&tokens));
-        let rgba = gtk::gdk::RGBA::new(
-            tokens.surface_reader.r as f32 / 255.0,
-            tokens.surface_reader.g as f32 / 255.0,
-            tokens.surface_reader.b as f32 / 255.0,
-            1.0,
-        );
-        self.reader.webview.set_background_color(&rgba);
-    }
-
-    fn apply_theme(&self) {
-        self.apply_theme_now();
-        self.reload_current(true);
-    }
-
-    // ── Sidebar ──
-
-    fn refresh_sidebar(&self) {
-        let lib = self.lib.borrow();
-        let source = self.source.borrow().clone();
-        let mut collapsed = self.collapsed_groups.borrow_mut();
-        let mut filters = self.sidebar_filters.borrow_mut();
-        self.suppress.set(true);
-        let w = self.weak();
-        let cb: Rc<dyn Fn(String)> = Rc::new(move |id: String| {
-            if let Some(app) = w.upgrade() {
-                app.toggle_group(&id);
-            }
-        });
-        sidebar::rebuild(&self.sidebar_list, &lib, &source, &mut collapsed, &mut filters, &cb);
-        self.suppress.set(false);
-    }
-
-    fn toggle_group(&self, id: &str) {
-        {
-            let mut c = self.collapsed_groups.borrow_mut();
-            if !c.remove(id) {
-                c.insert(id.to_string());
-            }
-        }
-        self.refresh_sidebar();
-    }
-
-    // ── Liste ──
-
-    fn refresh_list(&self) {
-        let rows = {
-            let lib = self.lib.borrow();
-            let source = self.source.borrow().clone();
-            rows_for(&lib, &source, now_ms())
-        };
-        self.suppress.set(true);
-        self.list_store.remove_all();
-        let mut has_items = false;
-        for r in rows {
-            if matches!(r, ListRow::Item { .. }) {
-                has_items = true;
-            }
-            self.list_store.append(&glib::BoxedAnyObject::new(r));
-        }
-        self.list_stack.set_visible_child_name(if has_items { "list" } else { "empty" });
-        if let Some(sel) = self.selected.borrow().clone() {
-            if let Some(pos) = self.row_pos(&sel) {
-                self.list_selection.set_selected(pos);
-            }
-        }
-        self.suppress.set(false);
-    }
-
-    fn row_pos(&self, id: &str) -> Option<u32> {
-        for pos in 0..self.list_store.n_items() {
-            if self.item_id_at(pos).as_deref() == Some(id) {
-                return Some(pos);
-            }
-        }
-        None
-    }
-
-    fn item_id_at(&self, pos: u32) -> Option<ArticleId> {
-        let obj = self.list_store.item(pos)?;
-        let boxed = obj.downcast_ref::<glib::BoxedAnyObject>()?;
-        let row = boxed.borrow::<ListRow>();
-        match &*row {
-            ListRow::Item { id } => Some(id.clone()),
-            ListRow::Header { .. } => None,
-        }
-    }
-
-    fn item_positions(&self) -> Vec<u32> {
-        (0..self.list_store.n_items()).filter(|p| self.item_id_at(*p).is_some()).collect()
-    }
-
-    // ── Auswahl und Öffnen ──
-
-    fn set_source(&self, f: SourceFilter) {
-        self.flush_keep_visible(None);
-        *self.source.borrow_mut() = f.clone();
-        self.list_title.set_title(&source_label(&self.lib.borrow(), &f));
-        let restore = self
-            .last_opened
-            .borrow()
-            .get(&f)
-            .cloned()
-            .filter(|id| {
-                let lib = self.lib.borrow();
-                article_of(&lib, id).map(|a| crate::state::matches(&lib, a, &f)).unwrap_or(false)
-            });
-        *self.selected.borrow_mut() = restore.clone();
-        self.refresh_sidebar();
-        self.refresh_list();
-        if let Some(id) = restore {
-            self.open_article(id, false, false);
-        } else {
-            self.update_reader_empty();
-        }
-        if self.outer.is_collapsed() {
-            self.outer.set_show_content(true);
-        }
-    }
-
-    fn schedule_preview(&self, id: ArticleId) {
-        if let Some(old) = self.preview_timer.borrow_mut().take() {
-            old.remove();
-        }
-        let w = self.weak();
-        let timer = glib::timeout_add_local(Duration::from_millis(220), move || {
-            if let Some(app) = w.upgrade() {
-                *app.preview_timer.borrow_mut() = None;
-                let is_current = app.reader.current.borrow().as_deref() == Some(id.as_str());
-                if !is_current {
-                    app.open_article(id.clone(), false, true);
-                }
-                *app.selected.borrow_mut() = Some(id.clone());
-            }
-            glib::ControlFlow::Break
-        });
-        *self.preview_timer.borrow_mut() = Some(timer);
-    }
-
-    fn open_article(&self, id: ArticleId, focus: bool, flush: bool) {
-        if flush {
-            self.flush_keep_visible(Some(&id));
-        }
-        let Some(html) = self.render_article(&id) else { return };
-        *self.selected.borrow_mut() = Some(id.clone());
-        self.last_opened
-            .borrow_mut()
-            .insert(self.source.borrow().clone(), id.clone());
-        self.unread_guard.borrow_mut().remove(&id);
-
-        if let Some(pos) = self.row_pos(&id) {
-            self.suppress.set(true);
-            self.list_selection.set_selected(pos);
-            self.suppress.set(false);
-        }
-
-        self.reader.load_html_doc(&html);
-        *self.reader.current.borrow_mut() = Some(id.clone());
-        self.update_reader_header(&id);
-        self.update_reader_buttons(&id);
-        self.start_read_timer(id);
-
-        if self.inner.is_collapsed() {
-            self.inner.set_show_content(true);
-        }
-        if focus {
-            self.reader.webview.grab_focus();
-        }
-    }
-
-    fn start_read_timer(&self, id: ArticleId) {
-        self.read_gen.set(self.read_gen.get() + 1);
-        let gen = self.read_gen.get();
-        dbg_log(&format!("read-timer gestartet für {id} (gen {gen})"));
-        let w = self.weak();
-        glib::timeout_add_local(Duration::from_millis(800), move || {
-            if let Some(app) = w.upgrade() {
-                if app.read_gen.get() != gen || !app.window.is_active() {
-                    return glib::ControlFlow::Break;
-                }
-                if app.reader.current.borrow().as_deref() != Some(id.as_str()) {
-                    return glib::ControlFlow::Break;
-                }
-                if app.unread_guard.borrow().contains(&id) {
-                    return glib::ControlFlow::Break;
-                }
-                let still_unread = {
-                    let lib = app.lib.borrow();
-                    article_of(&lib, &id).map(|a| a.unread).unwrap_or(false)
-                };
-                if still_unread {
-                    dbg_log(&format!("read-timer feuert: {id} -> gelesen"));
-                    let mut batch: UndoBatch = Vec::new();
-                    app.apply_status(&id, Some(true), None, &mut batch);
-                    app.undo_stack.borrow_mut().push(batch);
-                } else {
-                    dbg_log(&format!("read-timer feuert: {id} bereits gelesen/geschützt"));
-                }
-            }
-            glib::ControlFlow::Break
-        });
-    }
-
-    fn render_article(&self, id: &str) -> Option<String> {
-        let lib = self.lib.borrow();
-        let a = article_of(&lib, id)?;
-        let feed = feed_of(&lib, &a.feed_id);
-        let content = lib.contents.get(id).cloned().unwrap_or_else(|| "<p>Inhalt fehlt.</p>".into());
-        let style = self.reader.style.borrow();
-        let tokens = *self.tokens.borrow();
-        let rs = reader::ReaderStyle {
-            font_size: style.font_size,
-            measure_ch: style.measure_ch,
-            line_height: style.line_height,
-        };
-        let published = fmt_full(a.published_at);
-        let doc = reader::ReaderDocument {
-            kicker: feed.map(|f| f.title.as_str()).unwrap_or(""),
-            title: &a.title,
-            author: a.author.as_deref(),
-            source: "",
-            published: &published,
-            content_html: &content,
-        };
-        Some(reader::render_document(&doc, &tokens, &rs))
-    }
-
-    fn update_reader_header(&self, id: &str) {
-        let lib = self.lib.borrow();
-        let Some(a) = article_of(&lib, id) else { return };
-        let feed_title = feed_of(&lib, &a.feed_id).map(|f| f.title.clone()).unwrap_or_default();
-        self.reader.title.set_title(&a.title);
-        self.reader.title.set_subtitle(&feed_title);
-    }
-
-    fn update_reader_buttons(&self, id: &str) {
-        let lib = self.lib.borrow();
-        let Some(a) = article_of(&lib, id) else { return };
-        self.reader.btn_read.set_icon_name(if a.unread {
-            "mail-read-symbolic"
-        } else {
-            "mail-unread-symbolic"
-        });
-        self.reader.btn_read.set_tooltip_text(Some(if a.unread {
-            "Als gelesen markieren (M)"
-        } else {
-            "Als ungelesen markieren (M)"
-        }));
-        self.reader.btn_saved.set_icon_name(if a.saved {
-            "user-bookmarks-symbolic"
-        } else {
-            "bookmark-new-symbolic"
-        });
-        self.reader.btn_saved.set_tooltip_text(Some(if a.saved {
-            "Entspeichern (S)"
-        } else {
-            "Speichern (S)"
-        }));
-    }
-
-    fn update_reader_empty(&self) {
-        let lib = self.lib.borrow();
-        let source = self.source.borrow().clone();
-        let ids = visible_articles(&lib, &source, now_ms());
-        let unread = ids
-            .iter()
-            .filter(|id| article_of(&lib, id).map(|a| a.unread).unwrap_or(false))
-            .count();
-        *self.reader.current.borrow_mut() = None;
-        self.reader.show_empty(
-            &source_label(&lib, &source),
-            &format!("{unread} ungelesen · {} Artikel", ids.len()),
-        );
-        let label = source_label(&lib, &source);
-        self.reader.title.set_title(&label);
-        self.reader.title.set_subtitle("");
-    }
-
-    fn flush_keep_visible(&self, new_selection: Option<&str>) {
-        let kv = self.keep_visible.borrow_mut().take();
-        if let Some(kv) = kv {
-            if Some(kv.as_str()) == new_selection {
-                *self.keep_visible.borrow_mut() = Some(kv);
-                return;
-            }
-            let still_matches = {
-                let lib = self.lib.borrow();
-                let source = self.source.borrow().clone();
-                article_of(&lib, &kv).map(|a| crate::state::matches(&lib, a, &source)).unwrap_or(false)
-            };
-            if !still_matches {
-                self.remove_row(&kv);
-            }
-        }
-    }
-
-    fn remove_row(&self, id: &str) {
-        if let Some(pos) = self.row_pos(id) {
-            self.suppress.set(true);
-            if self.selected.borrow().as_deref() == Some(id) {
-                let next = self
-                    .item_positions()
-                    .into_iter()
-                    .find(|p| *p > pos)
-                    .or_else(|| self.item_positions().into_iter().rev().find(|p| *p < pos));
-                if let Some(p) = next {
-                    self.list_selection.set_selected(p);
-                }
-            }
-            self.list_store.remove(pos);
-            self.suppress.set(false);
-        }
-        if self.item_positions().is_empty() {
-            self.list_stack.set_visible_child_name("empty");
-        }
-    }
-
-    fn update_row_in_place(&self, id: &str) {
-        if !self.list_view.is_mapped() {
-            let mut dirty = self.list_dirty.borrow_mut();
-            if !dirty.iter().any(|x| x == id) {
-                dirty.push(id.to_string());
-            }
-            return;
-        }
-        self.rebind_row(id);
-    }
-
-    fn rebind_row(&self, id: &str) {
-        let Some(pos) = self.row_pos(id) else { return };
-        let Some(obj) = self.list_store.item(pos) else { return };
-        self.suppress.set(true);
-        self.list_store.remove(pos);
-        self.list_store.insert(pos, &obj);
-        self.suppress.set(false);
-    }
-
-    fn flush_dirty_rows(&self) {
-        let ids = std::mem::take(&mut *self.list_dirty.borrow_mut());
-        for id in ids {
-            self.rebind_row(&id);
-        }
-    }
-
-    // ── Status-Mutationen ──
-
-    fn apply_status(&self, id: &str, read: Option<bool>, saved: Option<bool>, batch: &mut UndoBatch) {
-        let prev = {
-            let lib = self.lib.borrow();
-            article_of(&lib, id).map(|a| (a.id.clone(), a.unread, a.saved))
-        };
-        let Some((pid, prev_unread, prev_saved)) = prev else { return };
-        batch.push((pid, prev_unread, prev_saved));
-        {
-            let mut lib = self.lib.borrow_mut();
-            if let Some(a) = article_mut(&mut lib, id) {
-                if let Some(r) = read {
-                    a.unread = !r;
-                }
-                if let Some(s) = saved {
-                    a.saved = s;
-                }
-            }
-        }
-        let still_matches = {
-            let lib = self.lib.borrow();
-            let source = self.source.borrow().clone();
-            article_of(&lib, id).map(|a| crate::state::matches(&lib, a, &source)).unwrap_or(false)
-        };
-        dbg_log(&format!(
-            "apply_status {id}: unread={} saved={} still_matches={} selected={:?}",
-            self.lib.borrow().articles.iter().find(|a| a.id == id).map(|a| a.unread).unwrap_or(false),
-            self.lib.borrow().articles.iter().find(|a| a.id == id).map(|a| a.saved).unwrap_or(false),
-            still_matches,
-            self.selected.borrow()
-        ));
-        if still_matches {
-            let pos = self.row_pos(id);
-            dbg_log(&format!("update_row_in_place {id} pos={pos:?}"));
-            self.update_row_in_place(id);
-        } else if self.selected.borrow().as_deref() == Some(id)
-            || self.keep_visible.borrow().as_deref() == Some(id)
-        {
-            *self.keep_visible.borrow_mut() = Some(id.to_string());
-        } else {
-            self.remove_row(id);
-        }
-
-        if self.reader.current.borrow().as_deref() == Some(id) {
-            self.update_reader_buttons(id);
-        }
-        self.refresh_sidebar();
-    }
-
-    fn current_article_id(&self) -> Option<ArticleId> {
-        self.selected
-            .borrow()
-            .clone()
-            .or_else(|| self.reader.current.borrow().clone())
-    }
-
-    fn toggle_read(&self) {
-        let Some(id) = self.current_article_id() else { return };
-        let unread = {
-            let lib = self.lib.borrow();
-            article_of(&lib, &id).map(|a| a.unread).unwrap_or(false)
-        };
-        let mut batch: UndoBatch = Vec::new();
-        self.apply_status(&id, Some(!unread), None, &mut batch);
-        if unread {
-            self.unread_guard.borrow_mut().remove(&id);
-        } else {
-            self.unread_guard.borrow_mut().insert(id.clone());
-        }
-        self.undo_stack.borrow_mut().push(batch);
-    }
-
-    fn toggle_saved(&self) {
-        let Some(id) = self.current_article_id() else { return };
-        let saved = {
-            let lib = self.lib.borrow();
-            article_of(&lib, &id).map(|a| a.saved).unwrap_or(false)
-        };
-        let mut batch: UndoBatch = Vec::new();
-        self.apply_status(&id, None, Some(!saved), &mut batch);
-        self.undo_stack.borrow_mut().push(batch);
-    }
-
-    fn undo(&self) {
-        let Some(batch) = self.undo_stack.borrow_mut().pop() else {
-            self.show_toast("Nichts rückgängig zu machen");
-            return;
-        };
-        {
-            let mut lib = self.lib.borrow_mut();
-            for (id, unread, saved) in &batch {
-                if let Some(a) = article_mut(&mut lib, id) {
-                    a.unread = *unread;
-                    a.saved = *saved;
-                }
-            }
-        }
-        self.refresh_list();
-        self.refresh_sidebar();
-        if let Some(id) = self.reader.current.borrow().clone() {
-            self.update_reader_buttons(&id);
-        }
-        self.show_toast("Aktion rückgängig gemacht");
-    }
-
-    fn mark_scope_dialog(&self) {
-        let ids: Vec<ArticleId> = {
-            let lib = self.lib.borrow();
-            let source = self.source.borrow().clone();
-            visible_articles(&lib, &source, now_ms())
-                .into_iter()
-                .filter(|id| article_of(&lib, id).map(|a| a.unread).unwrap_or(false))
-                .collect()
-        };
-        let label = source_label(&self.lib.borrow(), &self.source.borrow());
-        if ids.is_empty() {
-            self.show_toast(&format!("„{label}“ enthält keine ungelesenen Artikel"));
-            return;
-        }
-        let dialog = adw::AlertDialog::builder()
-            .heading("Bereich als gelesen markieren")
-            .body(format!(
-                "„{label}“: {} zum Klickzeitpunkt bekannte Artikel werden als gelesen markiert. Rückgängig mit Strg+Z.",
-                ids.len()
-            ))
-            .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("mark", &format!("{} als gelesen markieren", ids.len()));
-        dialog.set_response_appearance("mark", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let w = self.weak();
-        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
-            let Some(app) = w.upgrade() else { return };
-            if resp != "mark" {
-                return;
-            }
-            let mut batch: UndoBatch = Vec::new();
-            for id in &ids {
-                app.apply_status(id, Some(true), None, &mut batch);
-            }
-            app.undo_stack.borrow_mut().push(batch);
-            app.show_toast(&format!("{} Artikel als gelesen markiert", ids.len()));
-        });
-    }
-
-    fn show_toast(&self, msg: &str) {
-        self.toast.add_toast(adw::Toast::new(msg));
-    }
-
-    // ── Navigation ──
-
-    fn move_selection(&self, delta: i32) {
-        let positions = self.item_positions();
-        if positions.is_empty() {
-            return;
-        }
-        let cur_id = self.selected.borrow().clone();
-        let cur_idx = cur_id
-            .as_ref()
-            .and_then(|id| {
-                positions
-                    .iter()
-                    .position(|p| self.item_id_at(*p).as_deref() == Some(id.as_str()))
-            })
-            .map(|i| i as i32)
-            .unwrap_or(if delta > 0 { -1 } else { positions.len() as i32 });
-        let target = (cur_idx + delta).clamp(0, positions.len() as i32 - 1);
-        if let Some(id) = self.item_id_at(positions[target as usize]) {
-            self.open_article(id, false, true);
-        }
-    }
-
-    fn move_unread(&self, dir: i32) {
-        let positions = self.item_positions();
-        if positions.is_empty() {
-            return;
-        }
-        let cur_id = self.selected.borrow().clone();
-        let cur_idx = cur_id
-            .as_ref()
-            .and_then(|id| {
-                positions
-                    .iter()
-                    .position(|p| self.item_id_at(*p).as_deref() == Some(id.as_str()))
-            })
-            .unwrap_or(0);
-        let n = positions.len() as i32;
-        for step in 1..=n {
-            let idx = ((cur_idx as i32 + dir * step) % n + n) % n;
-            if let Some(id) = self.item_id_at(positions[idx as usize]) {
-                let unread = {
-                    let lib = self.lib.borrow();
-                    article_of(&lib, &id).map(|a| a.unread).unwrap_or(false)
-                };
-                if unread {
-                    self.open_article(id, false, true);
-                    return;
-                }
-            }
-        }
-        self.show_toast("Keine weiteren ungelesenen Artikel in dieser Ansicht");
-    }
-
-    fn focus_pane(&self, dir: i32) {
-        let panes = self.panes.borrow().clone();
-        let Some(focus) = gtk::prelude::GtkWindowExt::focus(&self.window) else {
-            if let Some(p) = panes.first() {
-                gtk::prelude::GtkWindowExt::set_focus(&self.window, Some(p));
-            }
-            return;
-        };
-        let mut current: Option<usize> = None;
-        let mut cur = Some(focus.clone());
-        while let Some(c) = cur {
-            if let Some(i) = panes.iter().position(|p| *p == c) {
-                current = Some(i);
-                break;
-            }
-            cur = c.parent();
-        }
-        let idx = match current {
-            Some(i) => ((i as i32 + dir).rem_euclid(panes.len() as i32)) as usize,
-            None => 0,
-        };
-        if let Some(p) = panes.get(idx) {
-            gtk::prelude::GtkWindowExt::set_focus(&self.window, Some(p));
-        }
-    }
-
-    fn back(&self) {
-        if self.inner.is_collapsed() && self.inner.shows_content() {
-            self.inner.set_show_content(false);
-        } else if self.outer.is_collapsed() && self.outer.shows_content() {
-            self.outer.set_show_content(false);
-        }
-    }
-
-    // ── Reader-Aktionen ──
-
-    fn zoom(&self, delta: f64) {
-        {
-            let mut s = self.reader.style.borrow_mut();
-            s.font_size = (s.font_size + delta).clamp(14.0, 32.0);
-        }
-        self.reload_current(true);
-    }
-
-    fn zoom_reset(&self) {
-        self.reader.style.borrow_mut().font_size = ReaderStyleState::default().font_size;
-        self.reload_current(true);
-    }
-
-    fn reload_current(&self, preserve: bool) {
-        let Some(id) = self.reader.current.borrow().clone() else { return };
-        let Some(html) = self.render_article(&id) else { return };
-        if preserve {
-            let webview = self.reader.webview.clone();
-            let pane = Rc::clone(&self.reader);
-            webview.evaluate_javascript(
-                "window.scrollY",
-                None,
-                None,
-                None::<&gio::Cancellable>,
-                move |res| {
-                    if let Ok(v) = res {
-                        if v.is_number() {
-                            pane.pending_scroll.set(v.to_double());
-                        }
-                    }
-                    pane.load_html_doc(&html);
-                },
-            );
-        } else {
-            self.reader.pending_scroll.set(-1.0);
-            self.reader.load_html_doc(&html);
-        }
-    }
-
-    fn open_find(&self) {
-        self.reader.search_bar.set_search_mode(true);
-        self.reader.search_entry.grab_focus();
-    }
-
-    fn open_external(&self) {
-        let Some(url) = self.current_url() else { return };
-        gtk::UriLauncher::new(&url).launch(None::<&gtk::Window>, None::<&gio::Cancellable>, |res| {
-            if let Err(e) = res {
-                eprintln!("Extern öffnen fehlgeschlagen: {e}");
-            }
-        });
-    }
-
-    fn copy_link(&self) {
-        let Some(url) = self.current_url() else { return };
-        self.window.clipboard().set_text(&url);
-        self.show_toast("Link kopiert");
-    }
-
-    fn current_url(&self) -> Option<String> {
-        let id = self.current_article_id()?;
-        let lib = self.lib.borrow();
-        article_of(&lib, &id).and_then(|a| a.url.clone())
-    }
-
-    // ── Konto-Aktionen (Fixtures) ──
-
-    fn do_refresh(&self) {
-        let now = now_ms();
-        self.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(now)));
-        self.show_toast("Aktualisiert (M1: Fixture-Bestand, echter Abruf folgt in M2)");
-    }
-
-    fn add_feed_dialog(&self) {
-        let entry = gtk::Entry::builder()
-            .placeholder_text("Feed- oder Website-URL")
-            .activates_default(true)
-            .build();
-        let dialog = adw::AlertDialog::builder()
-            .heading("Feed hinzufügen")
-            .body("URL eingeben. Discovery und Abruf folgen in M2; der Feed wird lokal angelegt.")
-            .extra_child(&entry)
-            .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("add", "Hinzufügen");
-        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("add"));
-        dialog.set_close_response("cancel");
-        let w = self.weak();
-        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
-            let Some(app) = w.upgrade() else { return };
-            if resp != "add" {
-                return;
-            }
-            let url = entry.text().trim().to_string();
-            if url.is_empty() {
-                return;
-            }
-            let n = app.custom_feed_counter.get() + 1;
-            app.custom_feed_counter.set(n);
-            let host = url
-                .split("://")
-                .nth(1)
-                .unwrap_or(url.as_str())
-                .split('/')
-                .next()
-                .unwrap_or("Neuer Feed");
-            let id = format!("f-custom-{n}");
-            app.lib.borrow_mut().feeds.push(domain::Feed {
-                id: id.clone(),
-                title: host.to_string(),
-                website: Some(url),
-                accent: "#7A8B99".into(),
-                groups: vec![],
-            });
-            app.set_source(SourceFilter::Feed(id));
-            app.list_empty.set_title("Noch keine Artikel");
-            app.list_empty.set_description(Some(
-                "Der Feed wurde angelegt — Discovery und Abruf folgen in M2.",
-            ));
-            app.show_toast("Feed hinzugefügt (lokal, ohne Abruf)");
-        });
-    }
-}
-
-thread_local! {
-    static APP: std::cell::RefCell<Option<Rc<App>>> = const { std::cell::RefCell::new(None) };
-}
-
-pub fn run_and_keep(application: &adw::Application) -> Rc<App> {
-    let app = App::new(application);
-    APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
-    if std::env::var("LF_SELFTEST").is_ok() {
-        let a = Rc::clone(&app);
-        glib::timeout_add_local(Duration::from_millis(800), move || {
-            a.set_source(SourceFilter::Feed("f-tagesschau".into()));
-            glib::ControlFlow::Break
-        });
-        let a = Rc::clone(&app);
-        glib::timeout_add_local(Duration::from_millis(1400), move || {
-            a.open_article("a-ts-1".into(), false, true);
-            glib::ControlFlow::Break
-        });
-        let a = Rc::clone(&app);
-        glib::timeout_add_local(Duration::from_millis(3500), move || {
-            a.inner.set_show_content(false);
-            glib::ControlFlow::Break
-        });
-    }
-    app
 }
