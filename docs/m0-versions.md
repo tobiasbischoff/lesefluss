@@ -49,6 +49,12 @@ libadwaita ≥ 1.4, WebKitGTK ≥ 6.0-API. System hat 4.22/1.9/2.52 — Puffer v
 - [ ] Link-Klick im WebView (Probe lädt HTML neu; in M1: Navigation abfangen → externer Browser).
 - [ ] Webprozess-Sandbox aktiv: `ps aux | grep -i webkit` zeigt `WebKitWebProcess` mit Sandbox-Flags.
 
+## Portale und Secret Service (Diagnose auf diesem Rechner)
+
+- `xdg-desktop-portal` 1.22.1 mit Backends `desktop.hyprland` und `desktop.gtk` aktiv.
+- `org.freedesktop.secrets` wird von gnome-keyring 50.0 bedient; `libsecret` 0.21.7 vorhanden.
+- Konsequenz: Token-Ablage über Secret Service möglich; Datei-/URI-Portale über gtk-Backend erwartbar (in M3/M6 gegentesten).
+
 ## Feedly (Abschnitt 12.1)
 
 Offener externer Blocker: Zugangsweg für persönliche Konten muss mit Testkonto
