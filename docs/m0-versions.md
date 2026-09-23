@@ -55,7 +55,21 @@ libadwaita ≥ 1.4, WebKitGTK ≥ 6.0-API. System hat 4.22/1.9/2.52 — Puffer v
 - `org.freedesktop.secrets` wird von gnome-keyring 50.0 bedient; `libsecret` 0.21.7 vorhanden.
 - Konsequenz: Token-Ablage über Secret Service möglich; Datei-/URI-Portale über gtk-Backend erwartbar (in M3/M6 gegentesten).
 
-## Feedly (Abschnitt 12.1)
+## Feedly (Abschnitt 12.1) — geprüft am 23.09.2026
 
-Offener externer Blocker: Zugangsweg für persönliche Konten muss mit Testkonto
-geprüft werden, bevor M4/M5 begonnen werden. Noch nicht geprüft.
+**Ergebnis: persönliches Standard-Konto funktioniert.** Vollständiges Protokoll in
+`docs/feedly-api-vertrag.md`.
+
+- Zugangsweg (privater Testbetrieb): Legacy-OAuth-Code-Flow mit `client_id=feedly` +
+  PKCE S256, Redirect `https://feedly.com/i/login`; Token 7 Tage gültig.
+- Alte Dev-Token-Seite `/v3/auth/dev/tokens` ist tot; Self-Service-Tokens laut Doku
+  nur für Enterprise. Für die Distribution eigene Client-Registrierung bei Feedly
+  nötig (NewsFlash-Modell: staff-ausgestellte `client_id`/`client_secret`).
+- Bestätigt (live, Zwei-Wege-Roundtrips): profile, subscriptions (GET/POST/DELETE),
+  categories, streams/contents, streams/ids, entries/.mget, markers/counts,
+  markAsRead/keepUnread (Wirkung verifiziert), markers/reads-Delta,
+  Saved via PUT+Body / DELETE (Wirkung verifiziert).
+- Blocker-Reste: `markers/unreads` = 404 (kein Unread-Delta → Inventarabgleich),
+  Saved-POST mit 200-ACK aber ohne Wirkung (Falle dokumentiert),
+  Rate-Limits/Refresh/Kategorie-Writes offen (siehe Vertrag §4).
+
