@@ -40,11 +40,15 @@ fn article_row(id: &str, lib: &Library) -> gtk::Box {
         .use_markup(true)
         .label(&format!(
             "<span weight=\"bold\" foreground=\"{}\">{}</span><span> · {}</span>",
-            accent,
+            if a.unread { accent } else { "#8a8d96" },
             glib::markup_escape_text(feed_title),
             fmt_time(a.published_at)
         ))
-        .css_classes(vec!["lf-article-meta".to_string()])
+        .css_classes(vec![if a.unread {
+            "lf-article-meta".to_string()
+        } else {
+            "lf-article-meta-read".to_string()
+        }])
         .ellipsize(pango::EllipsizeMode::End)
         .xalign(0.0)
         .hexpand(true)
@@ -59,18 +63,9 @@ fn article_row(id: &str, lib: &Library) -> gtk::Box {
             .build();
         meta_box.append(&saved_icon);
     }
-    if !a.unread {
-        let read_icon = gtk::Image::builder()
-            .icon_name("object-select-symbolic")
-            .pixel_size(12)
-            .tooltip_text("Gelesen")
-            .css_classes(vec!["lf-status-icon".to_string()])
-            .build();
-        meta_box.append(&read_icon);
-    }
     text_col.append(&meta_box);
 
-    let title_cls = if a.unread { "lf-article-title-unread" } else { "lf-article-title" };
+    let title_cls = if a.unread { "lf-article-title-unread" } else { "lf-article-title-read" };
     let title = gtk::Label::builder()
         .label(&a.title)
         .css_classes(vec![title_cls.to_string()])
@@ -85,7 +80,11 @@ fn article_row(id: &str, lib: &Library) -> gtk::Box {
 
     let excerpt = gtk::Label::builder()
         .label(&a.excerpt)
-        .css_classes(vec!["lf-article-excerpt".to_string()])
+        .css_classes(vec![if a.unread {
+            "lf-article-excerpt".to_string()
+        } else {
+            "lf-article-excerpt-read".to_string()
+        }])
         .xalign(0.0)
         .wrap(true)
         .wrap_mode(pango::WrapMode::WordChar)

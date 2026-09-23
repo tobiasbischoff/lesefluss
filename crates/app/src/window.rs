@@ -13,6 +13,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub fn dbg_log(msg: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var("LF_DEBUG").is_ok()) {
+        eprintln!("[lf] {msg}");
+    }
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -51,6 +58,7 @@ pub struct App {
     pub read_gen: Cell<u64>,
     pub suppress: Cell<bool>,
     pub selection_cause: Cell<SelectionCause>,
+    pub list_dirty: RefCell<Vec<ArticleId>>,
     pub tokens: RefCell<reader::tokens::Tokens>,
     pub css: gtk::CssProvider,
     pub panes: RefCell<Vec<gtk::Widget>>,
@@ -231,6 +239,7 @@ impl App {
             read_gen: Cell::new(0),
             suppress: Cell::new(false),
             selection_cause: Cell::new(SelectionCause::Unknown),
+            list_dirty: RefCell::new(Vec::new()),
             tokens: RefCell::new(tokens_for(true)),
             css,
             panes: RefCell::new(Vec::new()),
@@ -319,6 +328,16 @@ impl App {
             }
         });
 
+        let w = self.weak();
+        self.list_view.connect_map(move |_| {
+            let w2 = w.clone();
+            glib::idle_add_local(move || {
+                if let Some(app) = w2.upgrade() {
+                    app.flush_dirty_rows();
+                }
+                glib::ControlFlow::Break
+            });
+        });
         let w = self.weak();
         let click = gtk::GestureClick::new();
         click.connect_pressed(move |_, _, _, _| {
@@ -674,6 +693,7 @@ impl App {
     fn start_read_timer(&self, id: ArticleId) {
         self.read_gen.set(self.read_gen.get() + 1);
         let gen = self.read_gen.get();
+        dbg_log(&format!("read-timer gestartet für {id} (gen {gen})"));
         let w = self.weak();
         glib::timeout_add_local(Duration::from_millis(800), move || {
             if let Some(app) = w.upgrade() {
@@ -691,9 +711,12 @@ impl App {
                     article_of(&lib, &id).map(|a| a.unread).unwrap_or(false)
                 };
                 if still_unread {
+                    dbg_log(&format!("read-timer feuert: {id} -> gelesen"));
                     let mut batch: UndoBatch = Vec::new();
                     app.apply_status(&id, Some(true), None, &mut batch);
                     app.undo_stack.borrow_mut().push(batch);
+                } else {
+                    dbg_log(&format!("read-timer feuert: {id} bereits gelesen/geschützt"));
                 }
             }
             glib::ControlFlow::Break
@@ -796,17 +819,17 @@ impl App {
     fn remove_row(&self, id: &str) {
         if let Some(pos) = self.row_pos(id) {
             self.suppress.set(true);
-            self.list_store.remove(pos);
             if self.selected.borrow().as_deref() == Some(id) {
                 let next = self
                     .item_positions()
                     .into_iter()
-                    .find(|p| *p >= pos)
-                    .or_else(|| self.item_positions().last().copied());
+                    .find(|p| *p > pos)
+                    .or_else(|| self.item_positions().into_iter().rev().find(|p| *p < pos));
                 if let Some(p) = next {
                     self.list_selection.set_selected(p);
                 }
             }
+            self.list_store.remove(pos);
             self.suppress.set(false);
         }
         if self.item_positions().is_empty() {
@@ -815,8 +838,29 @@ impl App {
     }
 
     fn update_row_in_place(&self, id: &str) {
-        if let Some(pos) = self.row_pos(id) {
-            self.list_store.items_changed(pos, 1, 1);
+        if !self.list_view.is_mapped() {
+            let mut dirty = self.list_dirty.borrow_mut();
+            if !dirty.iter().any(|x| x == id) {
+                dirty.push(id.to_string());
+            }
+            return;
+        }
+        self.rebind_row(id);
+    }
+
+    fn rebind_row(&self, id: &str) {
+        let Some(pos) = self.row_pos(id) else { return };
+        let Some(obj) = self.list_store.item(pos) else { return };
+        self.suppress.set(true);
+        self.list_store.remove(pos);
+        self.list_store.insert(pos, &obj);
+        self.suppress.set(false);
+    }
+
+    fn flush_dirty_rows(&self) {
+        let ids = std::mem::take(&mut *self.list_dirty.borrow_mut());
+        for id in ids {
+            self.rebind_row(&id);
         }
     }
 
@@ -845,7 +889,16 @@ impl App {
             let source = self.source.borrow().clone();
             article_of(&lib, id).map(|a| crate::state::matches(&lib, a, &source)).unwrap_or(false)
         };
+        dbg_log(&format!(
+            "apply_status {id}: unread={} saved={} still_matches={} selected={:?}",
+            self.lib.borrow().articles.iter().find(|a| a.id == id).map(|a| a.unread).unwrap_or(false),
+            self.lib.borrow().articles.iter().find(|a| a.id == id).map(|a| a.saved).unwrap_or(false),
+            still_matches,
+            self.selected.borrow()
+        ));
         if still_matches {
+            let pos = self.row_pos(id);
+            dbg_log(&format!("update_row_in_place {id} pos={pos:?}"));
             self.update_row_in_place(id);
         } else if self.selected.borrow().as_deref() == Some(id)
             || self.keep_visible.borrow().as_deref() == Some(id)
@@ -1184,5 +1237,22 @@ thread_local! {
 pub fn run_and_keep(application: &adw::Application) -> Rc<App> {
     let app = App::new(application);
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
+    if std::env::var("LF_SELFTEST").is_ok() {
+        let a = Rc::clone(&app);
+        glib::timeout_add_local(Duration::from_millis(800), move || {
+            a.set_source(SourceFilter::Feed("f-tagesschau".into()));
+            glib::ControlFlow::Break
+        });
+        let a = Rc::clone(&app);
+        glib::timeout_add_local(Duration::from_millis(1400), move || {
+            a.open_article("a-ts-1".into(), false, true);
+            glib::ControlFlow::Break
+        });
+        let a = Rc::clone(&app);
+        glib::timeout_add_local(Duration::from_millis(3500), move || {
+            a.inner.set_show_content(false);
+            glib::ControlFlow::Break
+        });
+    }
     app
 }

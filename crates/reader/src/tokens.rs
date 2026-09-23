@@ -104,6 +104,9 @@ listview.lf-articles > row:selected {{ background: transparent; }}
 .lf-article-row {{ padding: 12px 16px; min-height: 92px; border-bottom: 1px solid {sep2}; }}
 .lf-article-row:selected, listview.lf-articles > row:selected .lf-article-row {{ background-color: {sel}; border-radius: 8px; }}
 .lf-article-title {{ font-size: 14px; font-weight: 400; }}
+.lf-article-title-read {{ font-size: 14px; font-weight: 400; color: {ts2}; }}
+.lf-article-meta-read {{ font-size: 11px; color: {ts2}; opacity: 0.85; }}
+.lf-article-excerpt-read {{ font-size: 12px; color: {ts2}; opacity: 0.85; }}
 .lf-article-title-unread {{ font-size: 14.5px; font-weight: 600; }}
 .lf-article-meta {{ font-size: 11px; color: {ts}; }}
 .lf-article-excerpt {{ font-size: 12px; color: {ts}; }}
@@ -119,7 +122,8 @@ searchbar > revealer > box {{ background-color: {sl}; border-color: {sep}; box-s
             sl = self.surface_list.css(),
             tp = self.text_primary.css(),
             ts = self.text_secondary.css(),
-            sep = self.separator.css(),
+            ts2 = self.text_secondary.rgba(0.9),
+                        sep = self.separator.css(),
             sep2 = self.separator.rgba(0.55),
             sel = self.selection.css(),
             sidebar_bg_decl = sidebar_bg_decl,
