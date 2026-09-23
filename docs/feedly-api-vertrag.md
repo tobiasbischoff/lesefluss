@@ -30,6 +30,17 @@ eigenem Public-Client** (`client_id=feedly`, ohne Secret, mit PKCE S256):
   Flow gegen `https://cloud.feedly.com/v3/auth/auth`, Redirect `http://localhost`,
   Token-Tausch mit Secret. Beweist: Feedly registriert weiterhin Third-Party-Reader-Clients
   auf Anfrage.
+- RSS Guard (`martinrotter/rssguard`, Plugin `librssguard-feedly`): zweigleisig —
+  (a) offizielle Builds injizieren `FEEDLY_CLIENT_ID/SECRET` zur Bauzeit via CMake
+  (OAuth2 gegen `cloud.feedly.com/v3/auth/auth`, Loopback-Redirect `localhost:14466`,
+  mit Refresh-Token); (b) normale Builds verweisen Nutzer auf
+  **`https://feedly.com/v3/auth/dev`** — diese Seite ist **live (HTTP 200)** und
+  erzeugt „Developer Access Tokens" zum manuellen Einfügen. Das ist der von Feedly
+  geduldete Selbstbedienungsweg für persönliche Konten und der praktikable
+  Standard-Login für unsere App, bis eigene Client-Zugangsdaten vorliegen.
+  Gespeichert-Status fährt RSS Guard über `markers` (`markAsSaved`/`markAsUnsaved`),
+  nicht über die Tags-API — von uns live bestätigt (siehe Matrix oben).
+
 - **Konsequenz für den Release:** Für die verteilbare App eigene Client-Registrierung bei
   Feedly beantragen (Kontakt sales@feedly.com / Entwicklerprogramm). Der hier getestete
   `client_id=feedly`-PKCE-Weg ist Feedlys eigener First-Party-Client und gilt nur als
@@ -55,6 +66,7 @@ eigenem Public-Client** (`client_id=feedly`, ohne Secret, mit PKCE S256):
 | Unreads-Delta lesen | `GET /v3/markers/unreads` | **404 — Endpoint existiert nicht (mehr)** |
 | Gespeichert setzen | `PUT /v3/tags/<enc(user/UUID/tag/global.saved)>`, Body `{"entryId":"<id>"}` | 200; Entry bekommt Tag `global.saved` („Saved For Later"), erscheint im Saved-Stream |
 | Gespeichert entfernen | `DELETE /v3/tags/<enc(tagId)>/<enc(entryId)>` | 200; Entry-Tag wechselt auf `global.unsaved`, verschwindet aus Saved-Stream |
+| Gespeichert (Marker, **bevorzugt**) | `POST /v3/markers`, Body `{"action":"markAsSaved"|"markAsUnsaved","type":"entries","entryIds":[...]}` | 200; Wirkung per `.mget` verifiziert: Tags wechseln `global.saved`↔`global.unsaved`. Batch-fähig, konsistent zur Read/Unread-Mutation |
 | Tag-Liste | `GET /v3/tags` | 200: `[{id,label,actionTimestamp}]` |
 
 ## 3. Bestätigte Semantik-Details und Fallen
@@ -65,9 +77,10 @@ eigenem Public-Client** (`client_id=feedly`, ohne Secret, mit PKCE S256):
   zusammengesetzt werden. IDs/Cursor immer URL-encodieren.
 - **Saved-Falle:** `POST /v3/tags/{tagId}/{entryId}` (auch mit `{"label":...}`) liefert
   **200, wirkt aber nicht** (Entry bleibt `global.unsaved`, Saved-Stream leer).
-  Verbindlich ist `PUT /v3/tags/{tagId}` mit Body `{"entryId":...}`. Erfolg immer per
-  `.mget`/`tags` verifizieren, nicht per Statuscode allein. → Outbox-Design (§13.5):
-  ACK ≠ bestätigt.
+  Funktionierende Wege: `PUT /v3/tags/{tagId}` mit Body `{"entryId":...}` oder
+  **bevorzugt `POST /v3/markers` mit `markAsSaved`/`markAsUnsaved`** (batch-fähig,
+  dieselbe Domänenoperation wie Read/Unread). Erfolg immer per `.mget`/`tags`
+  verifizieren, nicht per Statuscode allein. → Outbox-Design (§13.5): ACK ≠ bestätigt.
 - **Entries tragen explizite Status-Tags:** `global.unsaved` als Default-Tag; Zustände
   sind über `tags` maschinenlesbar.
 - **`markers/unreads` fehlt:** Kein Unread-Delta-Journal. Konsequenz für §13.4:
