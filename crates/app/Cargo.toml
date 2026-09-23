@@ -10,6 +10,8 @@ name = "lesefluss-probe"
 path = "src/probe.rs"
 
 [dependencies]
+domain = { workspace = true }
+reader = { workspace = true }
 glib = { workspace = true }
 gtk = { workspace = true }
 adw = { workspace = true }

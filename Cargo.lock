@@ -423,9 +423,11 @@ dependencies = [
 name = "lesefluss-app"
 version = "0.1.0"
 dependencies = [
+ "domain",
  "glib",
  "gtk4",
  "libadwaita",
+ "reader",
  "webkit6",
 ]
 
