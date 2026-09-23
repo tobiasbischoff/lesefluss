@@ -17,6 +17,13 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SelectionCause {
+    Unknown,
+    Pointer,
+    Keyboard,
+}
+
 pub struct App {
     pub window: adw::ApplicationWindow,
     pub toast: adw::ToastOverlay,
@@ -43,6 +50,7 @@ pub struct App {
     pub preview_timer: RefCell<Option<glib::SourceId>>,
     pub read_gen: Cell<u64>,
     pub suppress: Cell<bool>,
+    pub selection_cause: Cell<SelectionCause>,
     pub tokens: RefCell<reader::tokens::Tokens>,
     pub css: gtk::CssProvider,
     pub panes: RefCell<Vec<gtk::Widget>>,
@@ -222,6 +230,7 @@ impl App {
             preview_timer: RefCell::new(None),
             read_gen: Cell::new(0),
             suppress: Cell::new(false),
+            selection_cause: Cell::new(SelectionCause::Unknown),
             tokens: RefCell::new(tokens_for(true)),
             css,
             panes: RefCell::new(Vec::new()),
@@ -297,6 +306,11 @@ impl App {
             if app.suppress.get() {
                 return;
             }
+            let cause = app.selection_cause.get();
+            app.selection_cause.set(SelectionCause::Unknown);
+            if cause != SelectionCause::Keyboard {
+                return;
+            }
             let Some(obj) = sel.selected_item() else { return };
             let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() else { return };
             let row = boxed.borrow::<ListRow>();
@@ -304,6 +318,34 @@ impl App {
                 app.schedule_preview(id);
             }
         });
+
+        let w = self.weak();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |_, _, _, _| {
+            if let Some(app) = w.upgrade() {
+                app.selection_cause.set(SelectionCause::Pointer);
+            }
+        });
+        self.list_view.add_controller(click);
+        let w = self.weak();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if let Some(app) = w.upgrade() {
+                match key {
+                    gtk::gdk::Key::Up
+                    | gtk::gdk::Key::Down
+                    | gtk::gdk::Key::Home
+                    | gtk::gdk::Key::End
+                    | gtk::gdk::Key::Page_Up
+                    | gtk::gdk::Key::Page_Down => {
+                        app.selection_cause.set(SelectionCause::Keyboard);
+                    }
+                    _ => {}
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.list_view.add_controller(keys);
 
         let w = self.weak();
         self.list_view.connect_activate(move |_, pos| {
@@ -650,7 +692,7 @@ impl App {
                 };
                 if still_unread {
                     let mut batch: UndoBatch = Vec::new();
-                    app.apply_status(&id, Some(false), None, &mut batch);
+                    app.apply_status(&id, Some(true), None, &mut batch);
                     app.undo_stack.borrow_mut().push(batch);
                 }
             }
@@ -798,12 +840,6 @@ impl App {
                 }
             }
         }
-        if read == Some(false) {
-            self.unread_guard.borrow_mut().insert(id.to_string());
-        } else if read.is_some() {
-            self.unread_guard.borrow_mut().remove(id);
-        }
-
         let still_matches = {
             let lib = self.lib.borrow();
             let source = self.source.borrow().clone();
@@ -840,6 +876,11 @@ impl App {
         };
         let mut batch: UndoBatch = Vec::new();
         self.apply_status(&id, Some(!unread), None, &mut batch);
+        if unread {
+            self.unread_guard.borrow_mut().remove(&id);
+        } else {
+            self.unread_guard.borrow_mut().insert(id.clone());
+        }
         self.undo_stack.borrow_mut().push(batch);
     }
 
@@ -910,7 +951,7 @@ impl App {
             }
             let mut batch: UndoBatch = Vec::new();
             for id in &ids {
-                app.apply_status(id, Some(false), None, &mut batch);
+                app.apply_status(id, Some(true), None, &mut batch);
             }
             app.undo_stack.borrow_mut().push(batch);
             app.show_toast(&format!("{} Artikel als gelesen markiert", ids.len()));
