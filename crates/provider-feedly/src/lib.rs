@@ -11,6 +11,8 @@ pub enum FeedlyError {
     Json(#[from] serde_json::Error),
     #[error("Antwort zu groß: {got} Bytes (Limit {limit})")]
     TooLarge { got: usize, limit: usize },
+    #[error(transparent)]
+    Pager(#[from] PagerError),
 }
 
 pub type Result<T> = std::result::Result<T, FeedlyError>;
@@ -121,8 +123,61 @@ impl Entry {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
-#[serde(default)]
+/// Fortschrittsmaschine für opake Cursor.
+/// Behandelt leere Seiten mit Cursor, wiederkehrende Cursor und ein
+/// Sicherheitslimit als **unvollständig** statt als Erfolg.
+#[derive(Debug, Default)]
+pub struct Pager {
+    seen: std::collections::HashSet<String>,
+    pub pages: usize,
+    pub items: usize,
+    pub complete: bool,
+    pub stopped_because: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PagerError {
+    #[error("Pagination unvollständig: {0}")]
+    Incomplete(String),
+}
+
+impl Pager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registriert eine weitergereichte Continuation. `false` bedeutet: weitermachen.
+    pub fn accept(&mut self, continuation: Option<&str>, page_items: usize, max_pages: usize) -> bool {
+        self.pages += 1;
+        self.items += page_items;
+        let Some(cursor) = continuation.filter(|c| !c.is_empty()) else {
+            self.complete = true;
+            return false;
+        };
+        if page_items == 0 && self.pages > 1 && !self.seen.is_empty() && self.seen.contains(cursor) {
+            self.stopped_because = Some("Cursor wiederholt sich".to_string());
+            return false;
+        }
+        if !self.seen.insert(cursor.to_string()) {
+            self.stopped_because = Some(format!("Cursor-Zyklus bei {cursor}"));
+            return false;
+        }
+        if self.pages >= max_pages {
+            self.stopped_because = Some(format!("Sicherheitslimit {max_pages} Seiten erreicht"));
+            return false;
+        }
+        true
+    }
+
+    pub fn into_result(self) -> Result<()> {
+        match self.stopped_because {
+            Some(reason) => Err(PagerError::Incomplete(reason).into()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct StreamPage {
     pub id: Option<String>,
     pub updated: Option<i64>,
@@ -130,8 +185,7 @@ pub struct StreamPage {
     pub items: Vec<Entry>,
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
-#[serde(default)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct IdsPage {
     pub ids: Vec<String>,
     pub continuation: Option<String>,
@@ -365,6 +419,45 @@ mod tests {
     }
 
     #[test]
+    fn pager_follows_cursor_over_empty_pages() {
+        let mut p = Pager::new();
+        assert!(p.accept(Some("c1"), 100, 50));
+        assert!(p.accept(Some("c2"), 0, 50), "leere Seite mit Cursor wird weiterverfolgt");
+        assert!(!p.accept(None, 0, 50));
+        assert!(p.complete);
+        assert_eq!(p.items, 100);
+        assert!(p.into_result().is_ok());
+    }
+
+    #[test]
+    fn pager_detects_cursor_cycles() {
+        let mut p = Pager::new();
+        assert!(p.accept(Some("a"), 10, 50));
+        assert!(p.accept(Some("b"), 10, 50));
+        assert!(!p.accept(Some("a"), 10, 50), "wiederkehrender Cursor bricht ab");
+        assert!(!p.complete);
+        let err = p.into_result().unwrap_err();
+        assert!(err.to_string().contains("Zyklus"), "{err}");
+    }
+
+    #[test]
+    fn pager_reports_safety_limit_as_incomplete() {
+        let mut p = Pager::new();
+        for i in 0..2 {
+            assert!(p.accept(Some(&format!("c{i}")), 10, 3));
+        }
+        assert!(!p.accept(Some("c2"), 10, 3), "Limit beendet die Schleife");
+        let err = p.into_result().unwrap_err();
+        assert!(err.to_string().contains("Sicherheitslimit"), "{err}");
+    }
+
+    #[test]
+    fn empty_json_is_not_a_valid_inventory() {
+        assert!(serde_json::from_str::<IdsPage>("{}").is_err(), "ids fehlen");
+        assert!(serde_json::from_str::<IdsPage>(r#"{"ids":[]}"#).is_ok());
+        assert!(serde_json::from_str::<StreamPage>(r#"{"id":"s"}"#).is_err(), "items fehlen");
+    }
+
     fn stream_page_continuation() {
         let json = r#"{"id":"s","updated":1,"continuation":"c1","items":[]}"#;
         let p: StreamPage = serde_json::from_str(json).unwrap();

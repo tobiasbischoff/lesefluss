@@ -1,4 +1,5 @@
 use crate::dbworker::DbWorker;
+use crate::window::dbg_log;
 use crate::net::Net;
 use provider_feedly as pf;
 
@@ -217,7 +218,8 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
             let newer_than = storage::now_ms() - 30 * 86_400_000;
             let mut continuation: Option<String> = None;
             let mut added = 0usize;
-            for _page in 0..100 {
+            let mut pager = pf::Pager::new();
+            while pager.accept(continuation.as_deref(), 0, 100) {
                 let page = client
                     .stream_contents(&stream, 100, continuation.as_deref(), Some(newer_than), false)
                     .await
@@ -226,11 +228,18 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
                 added += ingest_entries(&worker, &account_id, items)
                     .await
                     .map_err(string_err)?;
-                match page.continuation {
-                    Some(c) if !c.is_empty() => continuation = Some(c),
-                    _ => break,
+                let next = page.continuation.filter(|c| !c.is_empty());
+                if !pager.accept(next.as_deref(), page.items.len(), 100) {
+                    break;
                 }
+                continuation = next;
             }
+            dbg_log(&format!(
+                "Erst-Sync: {} Seiten, {} Einträge, {:?}",
+                pager.pages,
+                pager.items,
+                pager.stopped_because
+            ));
             db(&worker, move |db2| db2.set_last_sync(&account_id, storage::now_ms())).await?;
             Ok(added)
         }
@@ -348,7 +357,8 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
             let stream = pf::global_all_stream(&account_id);
             let mut continuation: Option<String> = None;
             let mut added = 0usize;
-            for _page in 0..50 {
+            let mut pager = pf::Pager::new();
+            while pager.accept(continuation.as_deref(), 0, 50) {
                 let page = client
                     .stream_contents(&stream, 100, continuation.as_deref(), Some(overlap), false)
                     .await
@@ -356,26 +366,31 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
                 added += ingest_entries(&worker, &account_id, page.items.clone())
                     .await
                     .map_err(string_err)?;
-                match page.continuation {
-                    Some(c) if !c.is_empty() => continuation = Some(c),
-                    _ => break,
+                let next = page.continuation.filter(|c| !c.is_empty());
+                if !pager.accept(next.as_deref(), page.items.len(), 50) {
+                    break;
                 }
+                continuation = next;
             }
             let saved_stream = pf::saved_stream(&account_id);
             let mut continuation: Option<String> = None;
             let mut remote_saved: Vec<String> = Vec::new();
-            for _page in 0..50 {
+            let mut saved_pager = pf::Pager::new();
+            while saved_pager.accept(continuation.as_deref(), 0, 50) {
                 let page = client
                     .stream_ids(&saved_stream, 1000, continuation.as_deref(), false)
                     .await
                     .map_err(io_err)?;
-                let n = page.ids.len();
-                remote_saved.extend(page.ids);
-                match page.continuation {
-                    Some(c) if !c.is_empty() && n > 0 => continuation = Some(c),
-                    _ => break,
+                remote_saved.extend(page.ids.iter().cloned());
+                let next = page.continuation.filter(|c| !c.is_empty());
+                if !saved_pager.accept(next.as_deref(), page.ids.len(), 50) {
+                    break;
                 }
+                continuation = next;
             }
+            saved_pager
+                .into_result()
+                .map_err(|e| string_err(e.to_string()))?;
             let local_saved: Vec<String> = db(&worker, {
                 let account_id = account_id.clone();
                 move |db2| db2.saved_ids_for_account(&account_id)
