@@ -10,6 +10,7 @@ mod theme_omarchy;
 mod reader;
 mod seed;
 mod sidebar;
+mod strings;
 mod state;
 mod style;
 mod window;

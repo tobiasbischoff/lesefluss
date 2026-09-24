@@ -372,6 +372,7 @@ pub struct App {
     pub prefs: RefCell<Prefs>,
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
     pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<((i64, String), u64, Vec<(String, String)>)>>>,
+    pub strings: crate::strings::Strings,
     pub bg_jobs_tx: std::sync::mpsc::Sender<Box<dyn FnOnce(&Rc<App>) + Send>>,
     pub bg_jobs_rx: std::sync::mpsc::Receiver<Box<dyn FnOnce(&Rc<App>) + Send>>,
     pub drain_active: Cell<bool>,
@@ -397,6 +398,7 @@ impl App {
         worker: DbWorker,
         net: Rc<Net>,
     ) -> Rc<Self> {
+        let st = crate::strings::Strings::detect();
         let reader = Rc::new(ReaderPane::new());
 
         let sidebar_list = gtk::ListBox::builder()
@@ -432,21 +434,24 @@ impl App {
         primary_menu.append_section(None, &settings_section);
         let btn_hamburger = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
-            .tooltip_text("Menü")
+            .tooltip_text(&st.get("Menü", "Menu"))
             .menu_model(&primary_menu)
             .primary(true)
             .build();
         let btn_refresh = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text("Aktualisieren (Strg+R)")
+            .tooltip_text(&st.get("Aktualisieren (Strg+R)", "Refresh (Ctrl+R)"))
             .action_name("win.refresh")
             .build();
         let btn_add = gtk::Button::builder()
             .icon_name("list-add-symbolic")
-            .tooltip_text("Feed hinzufügen (Strg+N)")
+            .tooltip_text(&st.get("Feed hinzufügen (Strg+N)", "Add feed (Ctrl+N)"))
             .action_name("win.add-feed")
             .build();
-        let sidebar_title = adw::WindowTitle::new("Lesefluss", "Lokale Bibliothek");
+        let sidebar_title = adw::WindowTitle::new(
+            "Lesefluss",
+            &st.get("Lokale Bibliothek", "Local library"),
+        );
         let sidebar_header = adw::HeaderBar::builder().title_widget(&sidebar_title).build();
         sidebar_header.pack_start(&btn_hamburger);
         sidebar_header.pack_end(&btn_refresh);
@@ -477,8 +482,11 @@ impl App {
             .build();
         let list_empty = adw::StatusPage::builder()
             .icon_name("mailbox-symbolic")
-            .title("Keine Artikel")
-            .description("In dieser Ansicht ist gerade nichts los.")
+            .title(&st.get("Keine Artikel", "No articles"))
+            .description(&st.get(
+                "In dieser Ansicht ist gerade nichts los.",
+                "There is nothing in this view right now.",
+            ))
             .vexpand(true)
             .build();
         let new_articles_label = gtk::Button::builder()
@@ -498,11 +506,14 @@ impl App {
         let search_entry = gtk::SearchEntry::builder().placeholder_text("Artikel durchsuchen (Strg+L)").build();
         let search_bar = gtk::SearchBar::builder().child(&search_entry).show_close_button(true).build();
 
-        let list_title = adw::WindowTitle::new("Ungelesen", "");
+        let list_title = adw::WindowTitle::new(&st.get("Ungelesen", "Unread"), "");
         let list_header = adw::HeaderBar::builder().title_widget(&list_title).build();
         let sort_button = gtk::Button::builder()
             .icon_name("view-sort-descending-symbolic")
-            .tooltip_text("Reihenfolge umkehren (Strg+Shift+P)")
+            .tooltip_text(&st.get(
+                "Reihenfolge umkehren (Strg+Shift+P)",
+                "Reverse order (Ctrl+Shift+P)",
+            ))
             .action_name("win.toggle-sort-order")
             .build();
         list_header.pack_start(&sort_button);
@@ -551,6 +562,21 @@ impl App {
             .action_name("win.reader-back")
             .build();
         reader.header.pack_start(&btn_back);
+
+        // Zugängliche Namen für reine Icon-Schaltflächen (§16)
+        fn label(btn: &gtk::Widget, text: &str) {
+            btn.update_property(&[gtk::accessible::Property::Label(text)]);
+        }
+        label(
+            btn_hamburger.upcast_ref(),
+            &st.get("Menü", "Menu"),
+        );
+        label(btn_refresh.upcast_ref(), &st.get("Aktualisieren", "Refresh"));
+        label(btn_add.upcast_ref(), &st.get("Feed hinzufügen", "Add feed"));
+        label(
+            btn_hamburger.upcast_ref(),
+            &st.get("Menü: OPML, Backup, Einstellungen", "Menu: OPML, backup, settings"),
+        );
 
         let inner = adw::NavigationSplitView::builder()
             .min_sidebar_width(280.0)
@@ -622,6 +648,7 @@ impl App {
             ),
             pending_db: RefCell::new(Vec::new()),
             pending_media: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            strings: crate::strings::Strings { lang: st.lang },
             bg_jobs_tx: bg_jobs_tx.clone(),
             bg_jobs_rx,
             drain_active: Cell::new(false),
@@ -1098,38 +1125,23 @@ impl App {
     fn sync_store(&self, append: bool) {
         let rows = self.state.borrow().rows.clone();
         self.suppress.set(true);
-        let existing = self.list_store.n_items() as usize;
+        let mut existing = self.list_store.n_items() as usize;
         if append {
             for r in rows.iter().skip(existing) {
                 self.list_store.append(&glib::BoxedAnyObject::new(r.clone()));
-            }
-        } else if existing == rows.len() {
-            for (pos, r) in rows.iter().enumerate() {
-                self.list_store.remove(pos as u32);
-                self.list_store.insert(pos as u32, &glib::BoxedAnyObject::new(r.clone()));
-            }
-            self.list_store.splice(
-                rows.len() as u32,
-                existing as u32 - rows.len() as u32,
-                &[] as &[glib::BoxedAnyObject],
-            );
-        } else if existing > rows.len() {
-            self.list_store.splice(
-                rows.len() as u32,
-                existing as u32 - rows.len() as u32,
-                &[] as &[glib::BoxedAnyObject],
-            );
-            for (pos, r) in rows.iter().enumerate() {
-                self.list_store.remove(pos as u32);
-                self.list_store.insert(pos as u32, &glib::BoxedAnyObject::new(r.clone()));
+                existing += 1;
             }
         } else {
-            for (pos, r) in rows.iter().enumerate() {
-                self.list_store.remove(pos as u32);
-                self.list_store.insert(pos as u32, &glib::BoxedAnyObject::new(r.clone()));
+            while self.list_store.n_items() as usize > rows.len() {
+                let last = self.list_store.n_items().saturating_sub(1);
+                self.list_store.remove(last);
             }
-            for r in rows.iter().skip(existing) {
-                self.list_store.append(&glib::BoxedAnyObject::new(r.clone()));
+            for (pos, r) in rows.iter().enumerate() {
+                let pos = pos as u32;
+                if pos < self.list_store.n_items() {
+                    self.list_store.remove(pos);
+                }
+                self.list_store.insert(pos, &glib::BoxedAnyObject::new(r.clone()));
             }
         }
         if let Some(sel) = self.state.borrow().selected.clone() {
@@ -2991,7 +3003,12 @@ impl App {
             .await
             .unwrap_or(false);
             if let Some(app) = w.upgrade() {
-                app.show_toast(if res { "Backup erstellt" } else { "Backup fehlgeschlagen" });
+                let message = if res {
+                    app.strings.get("Backup erstellt", "Backup created")
+                } else {
+                    app.strings.get("Backup fehlgeschlagen", "Backup failed")
+                };
+                app.show_toast(&message);
             }
         });
     }
