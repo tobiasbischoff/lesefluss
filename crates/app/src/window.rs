@@ -225,10 +225,20 @@ impl App {
         sidebar_footer.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         sidebar_footer.append(&last_sync_label);
 
-        let btn_hamburger = gtk::Button::builder()
+        let primary_menu = gio::Menu::new();
+        primary_menu.append(Some("Feedly verbinden …"), Some("win.connect-feedly"));
+        primary_menu.append(Some("OPML importieren …"), Some("win.import-opml"));
+        primary_menu.append(Some("OPML exportieren …"), Some("win.export-opml"));
+        primary_menu.append(Some("Backup erstellen …"), Some("win.backup"));
+        primary_menu.append(Some("Aus Backup wiederherstellen …"), Some("win.restore"));
+        let settings_section = gio::Menu::new();
+        settings_section.append(Some("Einstellungen"), Some("win.settings"));
+        primary_menu.append_section(None, &settings_section);
+        let btn_hamburger = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
-            .tooltip_text("Quellen einblenden")
-            .action_name("win.toggle-sources")
+            .tooltip_text("Menü")
+            .menu_model(&primary_menu)
+            .primary(true)
             .build();
         let btn_refresh = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -240,27 +250,9 @@ impl App {
             .tooltip_text("Feed hinzufügen (Strg+N)")
             .action_name("win.add-feed")
             .build();
-        let library_menu = gio::Menu::new();
-        library_menu.append(Some("Feedly verbinden …"), Some("win.connect-feedly"));
-        library_menu.append(Some("OPML importieren …"), Some("win.import-opml"));
-        library_menu.append(Some("OPML exportieren …"), Some("win.export-opml"));
-        library_menu.append(Some("Backup erstellen …"), Some("win.backup"));
-        library_menu.append(Some("Aus Backup wiederherstellen …"), Some("win.restore"));
-        let btn_library = gtk::MenuButton::builder()
-            .icon_name("document-open-symbolic")
-            .tooltip_text("Bibliothek: OPML, Backup")
-            .menu_model(&library_menu)
-            .build();
         let sidebar_title = adw::WindowTitle::new("Lesefluss", "Lokale Bibliothek");
         let sidebar_header = adw::HeaderBar::builder().title_widget(&sidebar_title).build();
-        let btn_settings = gtk::Button::builder()
-            .icon_name("preferences-system-symbolic")
-            .tooltip_text("Einstellungen (Strg+,)")
-            .action_name("win.settings")
-            .build();
         sidebar_header.pack_start(&btn_hamburger);
-        sidebar_header.pack_start(&btn_settings);
-        sidebar_header.pack_end(&btn_library);
         sidebar_header.pack_end(&btn_refresh);
         sidebar_header.pack_end(&btn_add);
 
@@ -361,7 +353,6 @@ impl App {
             .build();
 
         btn_back.bind_property("visible", &inner, "collapsed").sync_create().build();
-        btn_hamburger.bind_property("visible", &outer, "collapsed").sync_create().build();
 
         let toast = adw::ToastOverlay::new();
         toast.set_child(Some(&outer));
@@ -2786,7 +2777,6 @@ impl App {
             }};
         }
 
-        win_action!("toggle-sources", |a| a.outer.set_show_content(false));
         win_action!("reader-back", |a| a.back());
         win_action!("back", |a| a.back());
         win_action!("refresh", |a| a.do_refresh());
