@@ -1,8 +1,91 @@
-use crate::model::ListRow;
 use crate::state::fmt_time;
 use gtk::pango;
 use gtk::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 use storage::ArticleRow;
+
+#[derive(Clone)]
+pub struct RowHandles {
+    pub root: gtk::Box,
+    pub title: gtk::Label,
+    pub meta: gtk::Label,
+    pub excerpt: gtk::Label,
+    pub saved_icon: gtk::Image,
+}
+
+fn meta_markup(a: &ArticleRow) -> String {
+    format!(
+        "<span weight=\"bold\" foreground=\"{}\">{}</span><span> · {}</span>",
+        if a.unread { a.accent.clone() } else { "#8a8d96".into() },
+        glib::markup_escape_text(&a.feed_title),
+        fmt_time(a.published_ms)
+    )
+}
+
+impl RowHandles {
+    fn apply(&self, a: &ArticleRow) {
+        self.title.set_css_classes(&[if a.unread {
+            "lf-article-title-unread"
+        } else {
+            "lf-article-title-read"
+        }]);
+        self.meta.set_markup(&meta_markup(a));
+        self.meta.set_css_classes(&[if a.unread { "lf-article-meta" } else { "lf-article-meta-read" }]);
+        self.excerpt.set_css_classes(&[if a.unread {
+            "lf-article-excerpt"
+        } else {
+            "lf-article-excerpt-read"
+        }]);
+        self.saved_icon.set_visible(a.saved);
+    }
+}
+
+pub struct RowCell {
+    pub data: RefCell<ArticleRow>,
+    bound: RefCell<Vec<RowHandles>>,
+}
+
+impl RowCell {
+    pub fn new(a: ArticleRow) -> Self {
+        Self { data: RefCell::new(a), bound: RefCell::new(Vec::new()) }
+    }
+
+    pub fn article(&self) -> ArticleRow {
+        self.data.borrow().clone()
+    }
+
+    pub fn update(&self, a: ArticleRow) {
+        *self.data.borrow_mut() = a.clone();
+        let handles: Vec<RowHandles> = self.bound.borrow().clone();
+        for h in handles {
+            h.apply(&a);
+        }
+    }
+
+    fn register(&self, h: RowHandles) {
+        self.bound.borrow_mut().push(h);
+    }
+
+    fn unregister(&self, root: &gtk::Box) {
+        self.bound.borrow_mut().retain(|h| &h.root != root);
+    }
+}
+
+#[derive(Clone)]
+pub enum ListRow {
+    Header { key: String, label: String },
+    Item(Rc<RowCell>),
+}
+
+impl ListRow {
+    pub fn article(&self) -> Option<ArticleRow> {
+        match self {
+            ListRow::Item(c) => Some(c.article()),
+            _ => None,
+        }
+    }
+}
 
 pub fn row_widget(row: &ListRow) -> gtk::Widget {
     match row {
@@ -12,11 +95,24 @@ pub fn row_widget(row: &ListRow) -> gtk::Widget {
             .css_classes(vec!["lf-day-header".to_string()])
             .build()
             .upcast(),
-        ListRow::Item(a) => article_row(a).upcast(),
+        ListRow::Item(cell) => {
+            let a = cell.article();
+            let (root, handles) = article_row(&a);
+            cell.register(handles);
+            root.upcast()
+        }
     }
 }
 
-fn article_row(a: &ArticleRow) -> gtk::Box {
+pub fn unregister(row: &ListRow, widget: &gtk::Widget) {
+    if let ListRow::Item(cell) = row {
+        if let Some(b) = widget.downcast_ref::<gtk::Box>() {
+            cell.unregister(b);
+        }
+    }
+}
+
+fn article_row(a: &ArticleRow) -> (gtk::Box, RowHandles) {
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
@@ -28,36 +124,32 @@ fn article_row(a: &ArticleRow) -> gtk::Box {
     text_col.set_valign(gtk::Align::Start);
 
     let meta_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let meta_cls = if a.unread { "lf-article-meta" } else { "lf-article-meta-read" };
     let meta = gtk::Label::builder()
         .use_markup(true)
-        .label(&format!(
-            "<span weight=\"bold\" foreground=\"{}\">{}</span><span> · {}</span>",
-            if a.unread { a.accent.clone() } else { "#8a8d96".into() },
-            glib::markup_escape_text(&a.feed_title),
-            fmt_time(a.published_ms)
-        ))
-        .css_classes(vec![meta_cls.to_string()])
+        .label(&meta_markup(a))
+        .css_classes(vec![if a.unread { "lf-article-meta".to_string() } else { "lf-article-meta-read".to_string() }])
         .ellipsize(pango::EllipsizeMode::End)
         .xalign(0.0)
         .hexpand(true)
         .build();
     meta_box.append(&meta);
-    if a.saved {
-        let saved_icon = gtk::Image::builder()
-            .icon_name("user-bookmarks-symbolic")
-            .pixel_size(12)
-            .tooltip_text("Gespeichert")
-            .css_classes(vec!["lf-status-icon".to_string()])
-            .build();
-        meta_box.append(&saved_icon);
-    }
+    let saved_icon = gtk::Image::builder()
+        .icon_name("user-bookmarks-symbolic")
+        .pixel_size(12)
+        .tooltip_text("Gespeichert")
+        .css_classes(vec!["lf-status-icon".to_string()])
+        .build();
+    saved_icon.set_visible(a.saved);
+    meta_box.append(&saved_icon);
     text_col.append(&meta_box);
 
-    let title_cls = if a.unread { "lf-article-title-unread" } else { "lf-article-title-read" };
     let title = gtk::Label::builder()
         .label(&a.title)
-        .css_classes(vec![title_cls.to_string()])
+        .css_classes(vec![if a.unread {
+            "lf-article-title-unread".to_string()
+        } else {
+            "lf-article-title-read".to_string()
+        }])
         .xalign(0.0)
         .wrap(true)
         .wrap_mode(pango::WrapMode::WordChar)
@@ -67,10 +159,13 @@ fn article_row(a: &ArticleRow) -> gtk::Box {
         .build();
     text_col.append(&title);
 
-    let excerpt_cls = if a.unread { "lf-article-excerpt" } else { "lf-article-excerpt-read" };
     let excerpt = gtk::Label::builder()
         .label(&a.excerpt)
-        .css_classes(vec![excerpt_cls.to_string()])
+        .css_classes(vec![if a.unread {
+            "lf-article-excerpt".to_string()
+        } else {
+            "lf-article-excerpt-read".to_string()
+        }])
         .xalign(0.0)
         .wrap(true)
         .wrap_mode(pango::WrapMode::WordChar)
@@ -104,5 +199,12 @@ fn article_row(a: &ArticleRow) -> gtk::Box {
     thumb.append(&thumb_label);
     root.append(&thumb);
 
-    root
+    let handles = RowHandles {
+        root: root.clone(),
+        title: title.clone(),
+        meta: meta.clone(),
+        excerpt: excerpt.clone(),
+        saved_icon: saved_icon.clone(),
+    };
+    (root, handles)
 }

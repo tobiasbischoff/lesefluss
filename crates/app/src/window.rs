@@ -71,7 +71,6 @@ pub struct App {
     pub suppress: Cell<bool>,
     pub syncing_filters: Cell<bool>,
     pub selection_cause: Cell<SelectionCause>,
-    pub list_dirty: RefCell<Vec<String>>,
     pub undo_stack: RefCell<Vec<UndoBatch>>,
     pub tokens: RefCell<reader::tokens::Tokens>,
     pub css: gtk::CssProvider,
@@ -279,7 +278,6 @@ impl App {
             suppress: Cell::new(false),
             syncing_filters: Cell::new(false),
             selection_cause: Cell::new(SelectionCause::Unknown),
-            list_dirty: RefCell::new(Vec::new()),
             undo_stack: RefCell::new(Vec::new()),
             tokens: RefCell::new(tokens_for(true)),
             css,
@@ -569,24 +567,6 @@ impl App {
         self.suppress.set(false);
     }
 
-    fn update_row(&self, id: &str) {
-        if !self.list_view.is_mapped() {
-            let mut dirty = self.list_dirty.borrow_mut();
-            if !dirty.iter().any(|x| x == id) {
-                dirty.push(id.to_string());
-            }
-            return;
-        }
-        self.rebind_row(id);
-    }
-
-    fn flush_dirty_rows(&self) {
-        let ids = std::mem::take(&mut *self.list_dirty.borrow_mut());
-        for id in ids {
-            self.rebind_row(&id);
-        }
-    }
-
     fn remove_row(&self, id: &str) {
         let Some(pos) = self.state.borrow().row_pos(id) else { return };
         {
@@ -716,7 +696,7 @@ impl App {
     // ── Artikel öffnen / Status ──
 
     fn open_article_by_id(&self, id: &str, focus: bool, flush: bool) {
-        let Some(row) = self.state.borrow().article(id).cloned() else { return };
+        let Some(row) = self.state.borrow().article(id) else { return };
         self.open_article(row, focus, flush);
     }
 
@@ -792,17 +772,28 @@ impl App {
         let gen = self.read_gen.get();
         let w = self.weak();
         glib::timeout_add_local(Duration::from_millis(800), move || {
-            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
-            if app.read_gen.get() != gen || !app.window.is_active() {
+            let Some(app) = w.upgrade() else {
+                dbg_log("read-timer: app tot");
+                return glib::ControlFlow::Break;
+            };
+            if app.read_gen.get() != gen {
+                dbg_log(&format!("read-timer {id}: gen ueberholt"));
+                return glib::ControlFlow::Break;
+            }
+            if !app.window.is_active() {
+                dbg_log(&format!("read-timer {id}: fenster inaktiv"));
                 return glib::ControlFlow::Break;
             }
             if app.reader.current.borrow().as_deref() != Some(id.as_str()) {
+                dbg_log(&format!("read-timer {id}: nicht mehr aktuell"));
                 return glib::ControlFlow::Break;
             }
             if app.state.borrow().unread_guard.contains(&id) {
+                dbg_log(&format!("read-timer {id}: guard"));
                 return glib::ControlFlow::Break;
             }
             let still_unread = app.state.borrow().article(&id).map(|a| a.unread).unwrap_or(false);
+            dbg_log(&format!("read-timer {id}: feuert, unread={still_unread}"));
             if still_unread {
                 let mut batch: UndoBatch = Vec::new();
                 app.apply_status(&id, Some(true), None, &mut batch);
@@ -813,22 +804,22 @@ impl App {
     }
 
     fn apply_status(&self, id: &str, read: Option<bool>, saved: Option<bool>, batch: &mut UndoBatch) {
-        let prev = {
-            let st = self.state.borrow();
-            st.article(id).map(|a| (a.feed_id, a.unread, a.saved))
-        };
-        let Some((feed_id, prev_unread, prev_saved)) = prev else { return };
+        let prev = self.state.borrow().article(id);
+        let Some(mut cur) = prev else { return };
+        let feed_id = cur.feed_id;
+        let (prev_unread, prev_saved) = (cur.unread, cur.saved);
         batch.push((feed_id, id.to_string(), prev_unread, prev_saved));
         {
-            let mut st = self.state.borrow_mut();
-            if let Some(a) = st.article_mut(id) {
-                if let Some(r) = read {
-                    a.unread = !r;
-                }
-                if let Some(s) = saved {
-                    a.saved = s;
-                }
+            if let Some(r) = read {
+                cur.unread = !r;
             }
+            if let Some(sv) = saved {
+                cur.saved = sv;
+            }
+            self.state.borrow().set_article(id, cur);
+        }
+        {
+            let mut st = self.state.borrow_mut();
             if let Some(r) = read {
                 let delta = if r { -1 } else { 1 };
                 st.counts.unread = (st.counts.unread + delta).max(0);
@@ -853,10 +844,9 @@ impl App {
         }
 
         let _ = feed_id;
-        self.update_row(id);
 
         if self.reader.current.borrow().as_deref() == Some(id) {
-            if let Some(row) = self.state.borrow().article(id).cloned() {
+            if let Some(row) = self.state.borrow().article(id) {
                 self.update_reader_buttons(&row);
             }
         }
@@ -870,7 +860,7 @@ impl App {
 
     fn current_article(&self) -> Option<ArticleRow> {
         let id = self.selected_id().or_else(|| self.reader.current.borrow().clone())?;
-        self.state.borrow().article(&id).cloned()
+        self.state.borrow().article(&id)
     }
 
     fn toggle_read(&self) {
@@ -899,17 +889,15 @@ impl App {
             return;
         };
         {
-            let mut st = self.state.borrow_mut();
+            let st = self.state.borrow();
             for (feed_id, id, unread, saved) in &batch {
-                if let Some(a) = st.article_mut(id) {
+                if let Some(mut a) = st.article(id) {
                     a.unread = *unread;
                     a.saved = *saved;
+                    st.set_article(id, a);
                 }
                 let _ = feed_id;
             }
-        }
-        for (_, id, _, _) in &batch {
-            self.update_row(id);
         }
         let batch2 = batch.clone();
         self.worker.send(move |db| {
@@ -927,9 +915,13 @@ impl App {
             let st = self.state.borrow();
             st.rows
                 .iter()
-                .filter_map(|r| match r {
-                    ListRow::Item(a) if a.unread => Some((a.feed_id, a.id.clone())),
-                    _ => None,
+                .filter_map(|r| {
+                    let a = r.article()?;
+                    if a.unread {
+                        Some((a.feed_id, a.id.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         };
@@ -996,13 +988,7 @@ impl App {
             .unwrap_or(if delta > 0 { -1 } else { positions.len() as i32 });
         let target = (cur_idx + delta).clamp(0, positions.len() as i32 - 1);
         let idx = positions[target as usize];
-        let row = {
-            let st = self.state.borrow();
-            match st.rows.get(idx) {
-                Some(ListRow::Item(a)) => Some(a.clone()),
-                _ => None,
-            }
-        };
+        let row = self.state.borrow().rows.get(idx).and_then(|r| r.article());
         if let Some(row) = row {
             self.open_article(row, false, true);
             self.scroll_to_selected();
@@ -1024,9 +1010,13 @@ impl App {
             .rows
             .iter()
             .enumerate()
-            .filter_map(|(i, r)| match r {
-                ListRow::Item(a) if a.unread => Some(i),
-                _ => None,
+            .filter_map(|(i, r)| {
+                let a = r.article()?;
+                if a.unread {
+                    Some(i)
+                } else {
+                    None
+                }
             })
             .collect();
         if positions.is_empty() {
@@ -1040,13 +1030,7 @@ impl App {
             positions.iter().rev().find(|&&p| p < cur).copied().or_else(|| positions.last().copied())
         };
         if let Some(idx) = next {
-            let row = {
-                let st = self.state.borrow();
-                match st.rows.get(idx) {
-                    Some(ListRow::Item(a)) => Some(a.clone()),
-                    _ => None,
-                }
-            };
+            let row = self.state.borrow().rows.get(idx).and_then(|r| r.article());
             if let Some(row) = row {
                 self.open_article(row, false, true);
                 self.scroll_to_selected();
@@ -1131,8 +1115,7 @@ impl App {
 
     fn reload_current(&self, preserve: bool) {
         let Some(id) = self.reader.current.borrow().clone() else { return };
-        let row = self.state.borrow().article(&id).cloned();
-        let Some(row) = row else { return };
+        let Some(row) = self.state.borrow().article(&id) else { return };
         let w = self.weak();
         self.db_query(
             move |db| db.content_html(row.feed_id, &row.id),
@@ -1385,6 +1368,12 @@ impl App {
         });
         factory.connect_unbind(|_, list_item| {
             let li = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+            if let (Some(obj), Some(child)) = (li.item(), li.child()) {
+                if let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() {
+                    let row = boxed.borrow::<ListRow>();
+                    list::unregister(&row, &child);
+                }
+            }
             li.set_child(None::<&gtk::Widget>);
         });
 
@@ -1421,7 +1410,7 @@ impl App {
             let Some(obj) = sel.selected_item() else { return };
             let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() else { return };
             let row = boxed.borrow::<ListRow>();
-            if let ListRow::Item(a) = row.clone() {
+            if let Some(a) = row.article() {
                 app.schedule_preview(a);
             }
         });
@@ -1429,27 +1418,10 @@ impl App {
         let w = self.weak();
         self.list_view.connect_activate(move |_, pos| {
             let Some(app) = w.upgrade() else { return };
-            let row = {
-                let st = app.state.borrow();
-                match st.rows.get(pos as usize) {
-                    Some(ListRow::Item(a)) => Some(a.clone()),
-                    _ => None,
-                }
-            };
+            let row = app.state.borrow().rows.get(pos as usize).and_then(|r| r.article());
             if let Some(row) = row {
                 app.open_article(row, true, true);
             }
-        });
-
-        let w = self.weak();
-        self.list_view.connect_map(move |_| {
-            let w2 = w.clone();
-            glib::idle_add_local(move || {
-                if let Some(app) = w2.upgrade() {
-                    app.flush_dirty_rows();
-                }
-                glib::ControlFlow::Break
-            });
         });
 
         let w = self.weak();

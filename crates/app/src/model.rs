@@ -1,12 +1,9 @@
+pub use crate::list::ListRow;
+use crate::list::RowCell;
 use crate::state::day_key_label;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use storage::{ArticleRow, Counts, FeedRow, GroupRow, Filter, Scope};
-
-#[derive(Clone, Debug)]
-pub enum ListRow {
-    Header { key: String, label: String },
-    Item(ArticleRow),
-}
 
 pub struct UiState {
     pub scope: Scope,
@@ -57,21 +54,7 @@ impl UiState {
         }
     }
 
-    pub fn build_rows(&mut self, articles: Vec<ArticleRow>) {
-        self.rows.clear();
-        let mut last_day: Option<String> = None;
-        for a in articles {
-            let (key, label) = day_key_label(a.published_ms);
-            if last_day.as_deref() != Some(key.as_str()) {
-                self.rows.push(ListRow::Header { key: key.clone(), label });
-                last_day = Some(key);
-            }
-            self.rows.push(ListRow::Item(a));
-        }
-        self.cursor = self.last_item().map(|a| (a.published_ms, a.id.clone()));
-    }
-
-    pub fn append_rows(&mut self, articles: Vec<ArticleRow>) {
+    fn push_rows(&mut self, articles: Vec<ArticleRow>) {
         let mut last_day = self.rows.iter().rev().find_map(|r| match r {
             ListRow::Header { key, .. } => Some(key.clone()),
             _ => None,
@@ -82,37 +65,49 @@ impl UiState {
                 self.rows.push(ListRow::Header { key: key.clone(), label });
                 last_day = Some(key);
             }
-            self.rows.push(ListRow::Item(a));
+            self.rows.push(ListRow::Item(Rc::new(RowCell::new(a))));
         }
+    }
+
+    pub fn build_rows(&mut self, articles: Vec<ArticleRow>) {
+        self.rows.clear();
+        self.push_rows(articles);
         self.cursor = self.last_item().map(|a| (a.published_ms, a.id.clone()));
     }
 
-    pub fn last_item(&self) -> Option<&ArticleRow> {
-        self.rows.iter().rev().find_map(|r| match r {
-            ListRow::Item(a) => Some(a),
-            _ => None,
-        })
+    pub fn append_rows(&mut self, articles: Vec<ArticleRow>) {
+        self.push_rows(articles);
+        self.cursor = self.last_item().map(|a| (a.published_ms, a.id.clone()));
+    }
+
+    pub fn last_item(&self) -> Option<ArticleRow> {
+        self.rows.iter().rev().find_map(|r| r.article())
     }
 
     pub fn row_pos(&self, id: &str) -> Option<usize> {
-        self.rows.iter().position(|r| match r {
-            ListRow::Item(a) => a.id == id,
-            _ => false,
+        self.rows.iter().position(|r| r.article().map(|a| a.id == id).unwrap_or(false))
+    }
+
+    pub fn article(&self, id: &str) -> Option<ArticleRow> {
+        self.rows.iter().find_map(|r| {
+            let a = r.article()?;
+            if a.id == id {
+                Some(a)
+            } else {
+                None
+            }
         })
     }
 
-    pub fn article(&self, id: &str) -> Option<&ArticleRow> {
-        self.rows.iter().find_map(|r| match r {
-            ListRow::Item(a) if a.id == id => Some(a),
-            _ => None,
-        })
-    }
-
-    pub fn article_mut(&mut self, id: &str) -> Option<&mut ArticleRow> {
-        self.rows.iter_mut().find_map(|r| match r {
-            ListRow::Item(a) if a.id == id => Some(a),
-            _ => None,
-        })
+    pub fn set_article(&self, id: &str, new: ArticleRow) {
+        for r in &self.rows {
+            if let ListRow::Item(cell) = r {
+                if cell.data.borrow().id == id {
+                    cell.update(new);
+                    return;
+                }
+            }
+        }
     }
 
     pub fn feed_unread(&self, feed_id: i64) -> i64 {
