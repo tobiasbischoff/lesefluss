@@ -279,12 +279,28 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
             let entry_ids: Vec<String> = entries.iter().map(|(_, _, e)| e.clone()).collect();
             let sent: Vec<(i64, i64)> = entries.iter().map(|(id, rev, _)| (*id, *rev)).collect();
             let all_ids: Vec<i64> = entries.iter().map(|(id, _, _)| *id).collect();
+            let entries_for_notice: Vec<(String, String)> = entries
+                .iter()
+                .map(|(_, _, entity)| (account_id.clone(), entity.clone()))
+                .collect();
             match client.markers_entries(action, &entry_ids).await {
                 Ok(()) => {
                     let _ = db(&worker, move |db2| db2.outbox_ack(&sent)).await;
                 }
-                Err(pf::FeedlyError::Api { status: 404, .. }) => {
-                    let _ = db(&worker, move |db2| db2.outbox_ack(&sent)).await;
+                Err(pf::FeedlyError::Api { status: 404, message }) => {
+                    let permanent_ids: Vec<i64> = sent.iter().map(|(id, _)| *id).collect();
+                    let _ = db(&worker, move |db2| {
+                        db2.outbox_fail_permanent(&permanent_ids)?;
+                        db2.mark_unsynced(&entries_for_notice)?;
+                        Ok::<_, storage::StorageError>(())
+                    })
+                    .await;
+                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        message: format!(
+                            "404 für {n} Änderungen: {message} — bleiben lokal erhalten und werden nicht erneut gesendet",
+                            n = sent.len()
+                        ),
+                    });
                 }
                 Err(pf::FeedlyError::Api { status: 429, .. }) => {
                     let next = storage::now_ms() + 5 * 60_000;

@@ -291,6 +291,14 @@ INSERT INTO remote_confirmations(account_id, entity_id, field, value, confirmed_
     SELECT account_id, entity_id, field, desired, revision, ?1 FROM outbox;
 "#,
     ),
+    (
+        8,
+        r#"
+ALTER TABLE articles ADD COLUMN unsynced INTEGER NOT NULL DEFAULT 0;
+UPDATE articles SET unsynced=1 WHERE EXISTS (
+    SELECT 1 FROM outbox o WHERE o.entity_id=articles.id AND o.status='failed');
+"#,
+    ),
 ];
 
 pub struct Database {
@@ -1391,10 +1399,52 @@ impl Database {
         Ok(())
     }
 
+    pub fn outbox_fail_permanent(&self, ids: &[i64]) -> Result<()> {
+        self.outbox_fail(ids, 0, true)
+    }
+
+    pub fn outbox_stuck(&self, account_id: &str) -> Result<i64> {
+        let v: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND status='failed'",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        Ok(v)
+    }
+
+    /// Markiert Artikel, deren Statusänderung dauerhaft nicht bestätigt werden konnte.
+    pub fn article_unsynced(&self, feed_id: i64, article_id: &str) -> Result<bool> {
+        let v: i64 = self.conn.query_row(
+            "SELECT unsynced FROM articles WHERE feed_id=?1 AND id=?2",
+            params![feed_id, article_id],
+            |r| r.get(0),
+        )?;
+        Ok(v != 0)
+    }
+
+    pub fn mark_unsynced(&self, entries: &[(String, String)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (account_id, entity_id) in entries {
+            tx.execute(
+                "UPDATE articles SET unsynced=1
+                 WHERE id=?2 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?1)",
+                params![account_id, entity_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn outbox_fail(&self, ids: &[i64], next_try_ms: i64, permanent: bool) -> Result<()> {
         for id in ids {
             if permanent {
                 self.conn.execute("UPDATE outbox SET status='failed' WHERE id=?1", params![id])?;
+                self.conn.execute(
+                    "UPDATE articles SET unsynced=1
+                     WHERE id IN (SELECT entity_id FROM outbox WHERE id=?1)
+                       AND feed_id IN (SELECT id FROM feeds WHERE account_id=(SELECT account_id FROM outbox WHERE id=?1))",
+                    params![id],
+                )?;
             } else {
                 self.conn.execute(
                     "UPDATE outbox SET status='pending', attempts=attempts+1, next_try_ms=?2 WHERE id=?1",
@@ -1750,6 +1800,22 @@ mod tests {
         assert!(db.outbox_pending(&remote, now, 10).unwrap().is_empty());
         db.apply_status_with_outbox(feed, "e1", Some(false), None).unwrap();
         assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 2, "Revision bleibt dauerhaft monoton");
+    }
+
+    #[test]
+    fn permanent_outbox_failure_is_kept_and_marked_unsynced() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now).unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None).unwrap();
+        let rows = db.outbox_pending(&remote, now, 10).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        db.outbox_fail_permanent(&ids).unwrap();
+        assert!(db.outbox_pending(&remote, now + 86_400_000, 10).unwrap().is_empty(), "kein erneuter Versuch");
+        assert_eq!(db.outbox_stuck(&remote).unwrap(), 1, "bleibt sichtbar erhalten");
+        assert_eq!(db.article_unsynced(feed, "e1").unwrap(), true);
     }
 
     #[test]

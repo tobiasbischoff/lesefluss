@@ -291,6 +291,7 @@ pub struct App {
     pub syncing_filters: Cell<bool>,
     pub selection_cause: Cell<SelectionCause>,
     pub undo_stack: RefCell<Vec<UndoBatch>>,
+    pub redo_stack: RefCell<Vec<UndoBatch>>,
     pub tokens: RefCell<reader::tokens::Tokens>,
     pub css: gtk::CssProvider,
     pub panes: RefCell<Vec<gtk::Widget>>,
@@ -517,6 +518,7 @@ impl App {
             syncing_filters: Cell::new(false),
             selection_cause: Cell::new(SelectionCause::Unknown),
             undo_stack: RefCell::new(Vec::new()),
+            redo_stack: RefCell::new(Vec::new()),
             tokens: RefCell::new(tokens_for(true)),
             css,
             panes: RefCell::new(Vec::new()),
@@ -1237,11 +1239,43 @@ impl App {
     }
 
     fn apply_status(&self, id: &str, read: Option<bool>, saved: Option<bool>, batch: &mut UndoBatch) {
+        self.apply_status_inner(id, read, saved, batch, true)
+    }
+
+    fn apply_status_persisted(
+        &self,
+        feed_id: i64,
+        id: &str,
+        read: Option<bool>,
+        saved: Option<bool>,
+    ) {
+        if self.state.borrow().article(id).is_none() {
+            let id2 = id.to_string();
+            self.worker.send(move |db| {
+                db.apply_status_with_outbox(feed_id, &id2, read, saved)?;
+                Ok::<_, storage::StorageError>(())
+            });
+        }
+    }
+
+    fn apply_status_inner(
+        &self,
+        id: &str,
+        read: Option<bool>,
+        saved: Option<bool>,
+        batch: &mut UndoBatch,
+        record_undo: bool,
+    ) {
         let prev = self.state.borrow().article(id);
         let Some(mut cur) = prev else { return };
+        if record_undo {
+            self.redo_stack.borrow_mut().clear();
+        }
         let feed_id = cur.feed_id;
         let (prev_unread, prev_saved) = (cur.unread, cur.saved);
-        batch.push((feed_id, id.to_string(), prev_unread, prev_saved));
+        if record_undo {
+            batch.push((feed_id, id.to_string(), prev_unread, prev_saved));
+        }
         {
             if let Some(r) = read {
                 cur.unread = !r;
@@ -1325,19 +1359,36 @@ impl App {
             return;
         };
         let mut redo: UndoBatch = Vec::new();
-        for (_feed_id, id, unread, saved) in &batch {
-            self.apply_status(id, Some(!unread), Some(*saved), &mut redo);
-        }
-        self.undo_stack.borrow_mut().push(redo);
-        let batch2 = batch.clone();
-        self.worker.send(move |db| {
-            for (feed_id, id, unread, saved) in &batch2 {
-                db.set_status(*feed_id, id, Some(!unread), Some(*saved))?;
+        for (feed_id, id, unread, saved) in &batch {
+            if self.state.borrow().article(id).is_some() {
+                self.apply_status_inner(id, Some(!unread), Some(*saved), &mut redo, false);
+            } else {
+                self.apply_status_persisted(*feed_id, id, Some(!unread), Some(*saved));
+                redo.push((*feed_id, id.clone(), *unread, *saved));
             }
-            Ok::<_, storage::StorageError>(())
-        });
+        }
+        self.redo_stack.borrow_mut().push(redo);
         self.reload_counts();
         self.show_toast("Aktion rückgängig gemacht");
+    }
+
+    fn redo(&self) {
+        let Some(batch) = self.redo_stack.borrow_mut().pop() else {
+            self.show_toast("Nichts wiederherzustellen");
+            return;
+        };
+        let mut undo: UndoBatch = Vec::new();
+        for (feed_id, id, unread, saved) in &batch {
+            if self.state.borrow().article(id).is_some() {
+                self.apply_status_inner(id, Some(!unread), Some(*saved), &mut undo, false);
+            } else {
+                self.apply_status_persisted(*feed_id, id, Some(!unread), Some(*saved));
+                undo.push((*feed_id, id.clone(), *unread, *saved));
+            }
+        }
+        self.undo_stack.borrow_mut().push(undo);
+        self.reload_counts();
+        self.show_toast("Aktion wiederhergestellt");
     }
 
     fn mark_scope_dialog(&self) {
@@ -1428,19 +1479,26 @@ impl App {
         };
         let remote_ids: Vec<String> = scope_feeds.iter().map(|(_, r)| r.clone()).collect();
         let local_ids: Vec<i64> = scope_feeds.iter().map(|(id, _)| *id).collect();
+        let n_feeds = remote_ids.len();
         let tx = self.net.event_sender();
+        let worker = self.worker.clone();
         self.net.spawn(async move {
             let client = provider_feedly::FeedlyClient::new(token);
-            if let Err(e) = client.markers_feeds("markAsRead", &remote_ids).await {
-                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed { message: e.to_string() });
+            match client.markers_feeds("markAsRead", &remote_ids).await {
+                Ok(()) => {
+                    let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added: 0 });
+                    let _ = worker.send(move |db| db.mark_feeds_read(&local_ids));
+                }
+                Err(e) => {
+                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        message: format!("Serverseitig als gelesen fehlgeschlagen: {e}"),
+                    });
+                }
             }
         });
-        let worker = self.worker.clone();
-        std::thread::spawn(move || {
-            let _ = worker.send(move |db| db.mark_feeds_read(&local_ids));
-        });
-        self.show_toast("Serverseitig als gelesen markiert; lokale Bestände aktualisiert");
-        self.reload_meta_keep();
+        self.show_toast(&format!(
+            "Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung"
+        ));
     }
 
     pub fn show_toast(&self, msg: &str) {
@@ -2940,6 +2998,7 @@ impl App {
         });
         win_action!("reader-retry", |a| a.reload_current(false));
         win_action!("undo", |a| a.undo());
+        win_action!("redo", |a| a.redo());
         win_action!("close", |a| a.window.close());
         win_action!("next-article", |a| a.move_selection(1));
         win_action!("prev-article", |a| a.move_selection(-1));
@@ -2979,6 +3038,7 @@ impl App {
         application.set_accels_for_action("win.add-feed", &["<Control>n"]);
         application.set_accels_for_action("win.mark-scope-read", &["<Control><Shift>m"]);
         application.set_accels_for_action("win.undo", &["<Control>z"]);
+        application.set_accels_for_action("win.redo", &["<Control>y", "<Control><Shift>z"]);
         application.set_accels_for_action("win.zoom-in", &["<Control>plus", "<Control>equal", "<Control>KP_Add"]);
         application.set_accels_for_action("win.zoom-out", &["<Control>minus", "<Control>KP_Subtract"]);
         application.set_accels_for_action("win.zoom-reset", &["<Control>0"]);
