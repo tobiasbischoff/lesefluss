@@ -14,6 +14,59 @@ pub fn token_path() -> std::path::PathBuf {
     base.join("lesefluss").join("feedly-token")
 }
 
+/// Der Schlüsselbund-Eintrag ist an das bestätigte Profil gebunden, damit ein
+/// Token nicht versehentlich mit der Outbox eines anderen Kontos gekoppelt wird.
+pub fn keyring_account() -> Option<String> {
+    let out = std::process::Command::new("secret-tool")
+        .args(["lookup", "lesefluss", "feedly-account"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+fn keyring_store_account(account: &str) -> bool {
+    use std::io::Write;
+    let mut child = match std::process::Command::new("secret-tool")
+        .args([
+            "store",
+            "--label=Lesefluss: Feedly-Konto",
+            "lesefluss",
+            "feedly-account",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(account.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+fn keyring_clear() {
+    let _ = std::process::Command::new("secret-tool")
+        .args(["clear", "lesefluss", "feedly-token"])
+        .output();
+    let _ = std::process::Command::new("secret-tool")
+        .args(["clear", "lesefluss", "feedly-account"])
+        .output();
+    let _ = std::fs::remove_file(token_path());
+}
+
+pub fn forget_token() {
+    keyring_clear();
+}
+
 fn keyring_lookup() -> Option<String> {
     let out = std::process::Command::new("secret-tool")
         .args(["lookup", "lesefluss", "feedly-token"])
@@ -61,22 +114,44 @@ pub fn token_from_disk() -> Option<String> {
     Some(t)
 }
 
-pub fn save_token(token: &str) -> std::io::Result<()> {
+pub fn save_token(token: &str, account_id: Option<&str>) -> std::io::Result<()> {
     if keyring_store(token) {
+        if let Some(acc) = account_id {
+            let _ = keyring_store_account(acc);
+        }
         let _ = std::fs::remove_file(token_path());
         return Ok(());
     }
     let p = token_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
-    std::fs::write(&p, token.trim())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    write_private(&p, token.trim().as_bytes())
+}
+
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 async fn db<T, F>(worker: &DbWorker, f: F) -> T

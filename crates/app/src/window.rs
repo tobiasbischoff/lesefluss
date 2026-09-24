@@ -28,6 +28,14 @@ pub fn dbg_log(msg: &str) {
     }
 }
 
+/// Externe Einstiegspunkte: nur http(s), ohne Userinfo.
+pub fn external_uri_allowed(raw: &str) -> bool {
+    match url::Url::parse(raw) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => u.username().is_empty() && u.password().is_none(),
+        _ => false,
+    }
+}
+
 pub fn read_intent(was_unread: bool) -> bool {
     was_unread
 }
@@ -157,6 +165,21 @@ mod router_tests {
             saved,
             has_content,
             sort_ms: 0,
+        }
+    }
+
+    #[test]
+    fn external_uris_are_restricted_to_http_without_userinfo() {
+        assert!(external_uri_allowed("https://example.com/a"));
+        assert!(external_uri_allowed("http://example.com/a"));
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<h1>x",
+            "ftp://example.com/x",
+            "https://user:pass@example.com/x",
+        ] {
+            assert!(!external_uri_allowed(bad), "{bad}");
         }
     }
 
@@ -1909,9 +1932,16 @@ impl App {
 
     fn open_external(&self) {
         let Some(url) = self.current_article().and_then(|a| a.url) else { return };
-        gtk::UriLauncher::new(&url).launch(None::<&gtk::Window>, None::<&gio::Cancellable>, |res| {
-            if let Err(e) = res {
-                eprintln!("Extern öffnen fehlgeschlagen: {e}");
+        if !external_uri_allowed(&url) {
+            self.show_toast("Link nicht geöffnet: nur http(s) ist erlaubt");
+            return;
+        }
+        let w = self.weak();
+        gtk::UriLauncher::new(&url).launch(None::<&gtk::Window>, None::<&gio::Cancellable>, move |res| {
+            if res.is_err() {
+                if let Some(app) = w.upgrade() {
+                    app.show_toast("Extern öffnen fehlgeschlagen");
+                }
             }
         });
     }
@@ -2023,7 +2053,7 @@ impl App {
                     if token.is_empty() {
                         return;
                     }
-                    if feedly_sync::save_token(&token).is_ok() {
+                    if feedly_sync::save_token(&token, None).is_ok() {
                         app.start_feedly(token);
                     }
                 });
