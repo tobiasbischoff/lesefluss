@@ -1,6 +1,6 @@
 use crate::state::day_key_label;
 use std::collections::{HashMap, HashSet};
-use storage::{ArticleRow, Counts, FeedRow, GroupRow, Source};
+use storage::{ArticleRow, Counts, FeedRow, GroupRow, Filter, Scope};
 
 #[derive(Clone, Debug)]
 pub enum ListRow {
@@ -9,7 +9,8 @@ pub enum ListRow {
 }
 
 pub struct UiState {
-    pub source: Source,
+    pub scope: Scope,
+    pub filter: Filter,
     pub search: Option<String>,
     pub rows: Vec<ListRow>,
     pub feeds: Vec<FeedRow>,
@@ -21,14 +22,15 @@ pub struct UiState {
     pub cursor: Option<(i64, String)>,
     pub loading_more: bool,
     pub unread_guard: HashSet<String>,
-    pub last_opened: HashMap<Source, (i64, String)>,
+    pub last_opened: HashMap<(Scope, Filter), (i64, String)>,
     pub fetching: HashSet<i64>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            source: Source::Unread,
+            scope: Scope::Global,
+            filter: Filter::Unread,
             search: None,
             rows: Vec::new(),
             feeds: Vec::new(),
@@ -47,10 +49,11 @@ impl Default for UiState {
 }
 
 impl UiState {
-    pub fn effective_source(&self) -> Source {
-        match &self.search {
-            Some(q) if !q.is_empty() => Source::Search(q.clone()),
-            _ => self.source.clone(),
+    pub fn effective_scope(&self) -> Option<Scope> {
+        if self.search.is_some() {
+            None
+        } else {
+            Some(self.scope.clone())
         }
     }
 

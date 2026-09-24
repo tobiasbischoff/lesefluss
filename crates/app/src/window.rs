@@ -13,9 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
-use storage::{ArticleRow, Counts, FeedRow, GroupRow, Source};
-#[allow(unused_imports)]
-use storage::Source as SourceFilter;
+use storage::{ArticleRow, Counts, FeedRow, GroupRow, Filter, Scope};
 
 pub fn dbg_log(msg: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -46,7 +44,7 @@ pub struct App {
     pub outer: adw::NavigationSplitView,
     pub inner: adw::NavigationSplitView,
     pub sidebar_list: gtk::ListBox,
-    pub sidebar_filters: RefCell<Vec<Option<Source>>>,
+    pub sidebar_filters: RefCell<Vec<Option<Scope>>>,
     pub last_sync_label: gtk::Label,
     pub list_title: adw::WindowTitle,
     pub list_stack: gtk::Stack,
@@ -57,6 +55,9 @@ pub struct App {
     pub list_empty: adw::StatusPage,
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
+    pub filter_saved: gtk::ToggleButton,
+    pub filter_unread: gtk::ToggleButton,
+    pub filter_all: gtk::ToggleButton,
     pub reader: Rc<ReaderPane>,
     pub state: RefCell<UiState>,
     pub worker: DbWorker,
@@ -176,9 +177,32 @@ impl App {
             .tooltip_text("Listenaktionen")
             .build();
         list_header.pack_end(&list_more);
+        let filter_saved = gtk::ToggleButton::builder()
+            .icon_name("user-bookmarks-symbolic")
+            .tooltip_text("Gespeicherte Artikel anzeigen")
+            .build();
+        let filter_unread = gtk::ToggleButton::builder()
+            .icon_name("mail-unread-symbolic")
+            .tooltip_text("Ungelesene Artikel anzeigen")
+            .active(true)
+            .build();
+        let filter_all = gtk::ToggleButton::builder()
+            .icon_name("view-list-symbolic")
+            .tooltip_text("Alle Artikel anzeigen")
+            .build();
+        let filter_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        filter_box.add_css_class("linked");
+        filter_box.append(&filter_saved);
+        filter_box.append(&filter_unread);
+        filter_box.append(&filter_all);
+        let filter_wrap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        filter_wrap.set_halign(gtk::Align::Center);
+        filter_wrap.set_margin_bottom(8);
+        filter_wrap.append(&filter_box);
         let list_toolbar = adw::ToolbarView::builder().content(&list_stack).build();
         list_toolbar.add_top_bar(&list_header);
         list_toolbar.add_top_bar(&search_bar);
+        list_toolbar.add_bottom_bar(&filter_wrap);
         let list_page = adw::NavigationPage::new(&list_toolbar, "Artikel");
 
         let btn_back = gtk::Button::builder()
@@ -237,6 +261,9 @@ impl App {
             list_empty,
             search_bar,
             search_entry,
+            filter_saved,
+            filter_unread,
+            filter_all,
             reader,
             state: RefCell::new(UiState::default()),
             worker,
@@ -428,20 +455,20 @@ impl App {
     }
 
     fn load_page(&self, append: bool) {
-        let (src, cursor) = {
+        let (scope, filter, cursor, search) = {
             let st = self.state.borrow();
-            if append {
-                (st.effective_source(), st.cursor.clone())
-            } else {
-                (st.effective_source(), None)
-            }
+            let cur = if append { st.cursor.clone() } else { None };
+            (st.scope.clone(), st.filter, cur, st.search.clone())
         };
         if append && cursor.is_none() {
             return;
         }
         let cur = cursor.clone();
         self.db_query(
-            move |db| db.query_articles(&src, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200),
+            move |db| match &search {
+                Some(q) if !q.is_empty() => db.search(q, 200),
+                _ => db.query_articles(&scope, filter, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200),
+            },
             move |app, res: storage::Result<Vec<ArticleRow>>| {
                 let Ok(rows) = res else { return };
                 let had_full_page = rows.len() >= 200;
@@ -602,15 +629,19 @@ impl App {
         self.refresh_sidebar();
     }
 
-    fn set_source(&self, f: Source) {
+    fn set_scope(&self, f: Scope, reset_filter_to_unread: bool) {
         {
             let mut st = self.state.borrow_mut();
-            st.source = f.clone();
+            st.scope = f.clone();
+            if reset_filter_to_unread {
+                st.filter = Filter::Unread;
+            }
             st.search = None;
-            st.selected = st.last_opened.get(&f).cloned();
+            st.selected = st.last_opened.get(&(f.clone(), st.filter)).cloned();
         }
+        self.sync_filter_buttons();
         self.search_bar.set_search_mode(false);
-        self.list_title.set_title(&self.source_label_now());
+        self.list_title.set_title(&self.scope_label_now());
         self.refresh_sidebar();
         self.load_page(false);
         if let Some(sel) = self.selected_id() {
@@ -623,15 +654,38 @@ impl App {
         }
     }
 
-    fn source_label_now(&self) -> String {
+    fn set_filter(&self, f: Filter) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.filter = f;
+            st.search = None;
+            st.selected = st.last_opened.get(&(st.scope.clone(), f)).cloned();
+        }
+        self.sync_filter_buttons();
+        self.load_page(false);
+        if let Some(sel) = self.selected_id() {
+            self.open_article_by_id(&sel, false, false);
+        } else {
+            self.update_reader_empty();
+        }
+    }
+
+    fn sync_filter_buttons(&self) {
+        let f = self.state.borrow().filter;
+        self.filter_saved.set_active(f == Filter::Saved);
+        self.filter_unread.set_active(f == Filter::Unread);
+        self.filter_all.set_active(f == Filter::All);
+    }
+
+    fn scope_label_now(&self) -> String {
         let st = self.state.borrow();
-        match &st.source {
-            Source::Unread => "Ungelesen".into(),
-            Source::All => "Alle Artikel".into(),
-            Source::Saved => "Gespeichert".into(),
-            Source::Group(g) => st.groups.iter().find(|x| &x.id == g).map(|x| x.name.clone()).unwrap_or_else(|| "Gruppe".into()),
-            Source::Feed(f) => st.feed_title(*f),
-            Source::Search(q) => format!("Suche: {q}"),
+        if let Some(q) = &st.search {
+            return format!("Suche: {q}");
+        }
+        match &st.scope {
+            Scope::Global => "Ungelesen".into(),
+            Scope::Group(g) => st.groups.iter().find(|x| &x.id == g).map(|x| x.name.clone()).unwrap_or_else(|| "Gruppe".into()),
+            Scope::Feed(f) => st.feed_title(*f),
         }
     }
 
@@ -646,16 +700,15 @@ impl App {
         let id = row.id.clone();
         {
             let mut st = self.state.borrow_mut();
-            let src = st.effective_source();
+            let key = (st.scope.clone(), st.filter);
             st.selected = Some((row.feed_id, id.clone()));
-            st.last_opened.insert(src, (row.feed_id, id.clone()));
+            st.last_opened.insert(key, (row.feed_id, id.clone()));
             st.unread_guard.remove(&id);
         }
         if let Some(pos) = self.state.borrow().row_pos(&id) {
             self.suppress.set(true);
             self.list_selection.set_selected(pos as u32);
             self.suppress.set(false);
-            self.list_view.scroll_to(pos as u32, gtk::ListScrollFlags::NONE, None::<gtk::ScrollInfo>);
         }
 
         self.reader.title.set_title(&row.title);
@@ -855,7 +908,7 @@ impl App {
                 })
                 .collect()
         };
-        let label = self.source_label_now();
+        let label = self.scope_label_now();
         if ids.is_empty() {
             self.show_toast(&format!("„{label}“ enthält keine ungelesenen Artikel"));
             return;
@@ -927,6 +980,15 @@ impl App {
         };
         if let Some(row) = row {
             self.open_article(row, false, true);
+            self.scroll_to_selected();
+        }
+    }
+
+    fn scroll_to_selected(&self) {
+        if let Some(id) = self.selected_id() {
+            if let Some(pos) = self.state.borrow().row_pos(&id) {
+                self.list_view.scroll_to(pos as u32, gtk::ListScrollFlags::NONE, None::<gtk::ScrollInfo>);
+            }
         }
     }
 
@@ -962,6 +1024,7 @@ impl App {
             };
             if let Some(row) = row {
                 self.open_article(row, false, true);
+                self.scroll_to_selected();
             }
         }
     }
@@ -1015,18 +1078,13 @@ impl App {
 
     fn update_reader_empty(&self) {
         let st = self.state.borrow();
-        let label = self.source_label_now();
-        let (unread, total) = match &st.source {
-            Source::Unread => (st.counts.unread, st.counts.unread),
-            Source::Saved => (st.counts.saved, st.counts.saved),
-            Source::All => (st.counts.unread, st.counts.total),
-            Source::Feed(f) => {
-                let total = st.rows.len() as i64;
-                (st.feed_unread(*f), total)
-            }
-            Source::Group(g) => (st.group_unread(*g), st.rows.len() as i64),
-            Source::Search(_) => (0, st.rows.len() as i64),
+        let label = self.scope_label_now();
+        let unread = match &st.scope {
+            Scope::Global => st.counts.unread,
+            Scope::Feed(f) => st.feed_unread(*f),
+            Scope::Group(g) => st.group_unread(*g),
         };
+        let total = st.rows.iter().filter(|r| matches!(r, ListRow::Item(_))).count() as i64;
         drop(st);
         self.reader.show_empty(&label, &format!("{unread} ungelesen · {total} Artikel"));
         self.reader.title.set_title(&label);
@@ -1232,7 +1290,7 @@ impl App {
                     st.groups = groups;
                     st.counts = counts;
                 }
-                app.set_source(Source::Feed(feed_id));
+                app.set_scope(Scope::Feed(feed_id), true);
                 let _ = w;
             },
         );
@@ -1320,7 +1378,7 @@ impl App {
                     _ => return,
                 }
             };
-            app.set_source(f);
+            app.set_scope(f, matches!(f, Scope::Global));
         });
 
         let w = self.weak();
@@ -1392,6 +1450,22 @@ impl App {
         });
         self.list_view.add_controller(keys);
 
+        for (btn, f) in [
+            (self.filter_saved.clone(), Filter::Saved),
+            (self.filter_unread.clone(), Filter::Unread),
+            (self.filter_all.clone(), Filter::All),
+        ] {
+            let w = self.weak();
+            btn.connect_toggled(move |b| {
+                let Some(app) = w.upgrade() else { return };
+                if !b.is_active() {
+                    b.set_active(true);
+                    return;
+                }
+                app.set_filter(f);
+            });
+        }
+
         let w = self.weak();
         self.list_scroll.vadjustment().connect_value_changed(move |adj| {
             let Some(app) = w.upgrade() else { return };
@@ -1433,7 +1507,7 @@ impl App {
                     let mut st = app.state.borrow_mut();
                     st.search = if q.is_empty() { None } else { Some(q.clone()) };
                 }
-                app.list_title.set_title(&app.source_label_now());
+                app.list_title.set_title(&app.scope_label_now());
                 app.load_page(false);
                 glib::ControlFlow::Break
             });

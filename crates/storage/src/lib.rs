@@ -57,13 +57,17 @@ pub struct Counts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Source {
+pub enum Scope {
+    Global,
+    Feed(i64),
+    Group(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Filter {
     Unread,
     All,
     Saved,
-    Feed(i64),
-    Group(i64),
-    Search(String),
 }
 
 #[derive(Clone, Debug)]
@@ -465,14 +469,11 @@ impl Database {
 
     pub fn query_articles(
         &self,
-        source: &Source,
+        scope: &Scope,
+        filter: Filter,
         before: Option<(i64, &str)>,
         limit: u32,
     ) -> Result<Vec<ArticleRow>> {
-        match source {
-            Source::Search(q) => return self.search(q, limit),
-            _ => {}
-        }
         let mut sql = String::from(
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
                     a.excerpt, a.unread, a.saved,
@@ -482,20 +483,23 @@ impl Database {
         );
         let mut where_clauses: Vec<String> = Vec::new();
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        match source {
-            Source::Unread => where_clauses.push("a.unread=1".into()),
-            Source::Saved => where_clauses.push("a.saved=1".into()),
-            Source::All => {}
-            Source::Feed(id) => {
+        match filter {
+            Filter::Unread => where_clauses.push("a.unread=1".into()),
+            Filter::Saved => where_clauses.push("a.saved=1".into()),
+            Filter::All => {}
+        }
+        match scope {
+            Scope::Global => {}
+            Scope::Feed(id) => {
                 where_clauses.push("a.feed_id=?".into());
                 args.push(Box::new(*id));
             }
-            Source::Group(_) | Source::Search(_) => {}
+            Scope::Group(_) => {}
         }
-        let join_groups = matches!(source, Source::Group(_));
+        let join_groups = matches!(scope, Scope::Group(_));
         if !join_groups {
             sql = sql.replace(" JOIN feed_groups fg ON fg.feed_id=a.feed_id", "");
-        } else if let Source::Group(g) = source {
+        } else if let Scope::Group(g) = scope {
             where_clauses.push("fg.group_id=?".into());
             args.push(Box::new(*g));
         }
@@ -587,7 +591,7 @@ impl Database {
         Ok(c)
     }
 
-    pub fn mark_source_read(&self, source: &Source, ids: &[(i64, String)]) -> Result<()> {
+    pub fn mark_source_read(&self, ids: &[(i64, String)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for (feed_id, id) in ids {
             tx.execute(
@@ -595,7 +599,6 @@ impl Database {
                 params![feed_id, id],
             )?;
         }
-        let _ = source;
         tx.commit()?;
         Ok(())
     }
@@ -761,7 +764,7 @@ mod tests {
         let (unread, saved) = db.article_status(feed, "a1").unwrap().unwrap();
         assert!(!unread, "Re-Import darf nicht ungelesen machen");
         assert!(saved, "Re-Import darf Speicherstatus nicht verlieren");
-        let rows = db.query_articles(&Source::All, None, 10).unwrap();
+        let rows = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
         assert_eq!(rows[0].title, "Titel eins (update)");
     }
 
@@ -774,16 +777,16 @@ mod tests {
             db.upsert_article(feed, &format!("a{i}"), &format!("T{i}"), None, None, now - i * 1000, "x", None, now)
                 .unwrap();
         }
-        let page1 = db.query_articles(&Source::All, None, 10).unwrap();
+        let page1 = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
         assert_eq!(page1.len(), 10);
         let last = page1.last().unwrap();
         let page2 = db
-            .query_articles(&Source::All, Some((last.published_ms, &last.id)), 10)
+            .query_articles(&Scope::Global, Filter::All, Some((last.published_ms, &last.id)), 10)
             .unwrap();
         assert_eq!(page2.len(), 10);
         assert!(!page1.iter().any(|r| page2.iter().any(|s| s.id == r.id)));
         db.set_status(feed, "a3", Some(true), None).unwrap();
-        let unread = db.query_articles(&Source::Unread, None, 100).unwrap();
+        let unread = db.query_articles(&Scope::Global, Filter::Unread, None, 100).unwrap();
         assert_eq!(unread.len(), 24);
         assert!(!unread.iter().any(|r| r.id == "a3"));
     }
@@ -845,7 +848,7 @@ mod tests {
         db.upsert_article(f2, "y", "Y", None, None, now, "e", None, now).unwrap();
         let c = db.counts().unwrap();
         assert_eq!(c.per_group, vec![(g, 2)]);
-        let rows = db.query_articles(&Source::Group(g), None, 10).unwrap();
+        let rows = db.query_articles(&Scope::Group(g), Filter::Unread, None, 10).unwrap();
         assert_eq!(rows.len(), 2);
     }
 }

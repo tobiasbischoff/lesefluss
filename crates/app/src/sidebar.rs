@@ -1,7 +1,7 @@
 use crate::model::UiState;
 use gtk::prelude::*;
 use std::rc::Rc;
-use storage::Source;
+use storage::Scope as Source;
 
 pub fn rebuild(
     list: &gtk::ListBox,
@@ -15,9 +15,7 @@ pub fn rebuild(
     filters_out.clear();
 
     add_section(list, filters_out, "Bibliothek");
-    add_smart_row(list, filters_out, "mail-unread-symbolic", "Ungelesen", state.counts.unread, true, Source::Unread);
-    add_smart_row(list, filters_out, "view-list-symbolic", "Alle Artikel", state.counts.total, false, Source::All);
-    add_smart_row(list, filters_out, "user-bookmarks-symbolic", "Gespeichert", state.counts.saved, false, Source::Saved);
+    add_smart_row(list, filters_out, "mail-unread-symbolic", "Ungelesen", state.counts.unread, true, Source::Global);
 
     add_section(list, filters_out, "Abonnements");
     let mut grouped: Vec<i64> = Vec::new();
@@ -56,7 +54,7 @@ pub fn rebuild(
 
     if state.search.is_none() {
         for (i, f) in filters_out.iter().enumerate() {
-            if f.as_ref() == Some(&state.source) {
+            if f.as_ref() == Some(&state.scope) {
                 if let Some(row) = list.row_at_index(i as i32) {
                     list.select_row(Some(&row));
                 }
