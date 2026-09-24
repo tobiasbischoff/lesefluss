@@ -256,7 +256,7 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
         let client = pf::FeedlyClient::new(token);
         let res: storage::Result<usize> = async {
             let overlap = last_sync_ms - 5 * 60_000;
-            if let Ok(reads) = client.markers_reads(overlap).await {
+            if let Ok(reads) = client.markers_reads(overlap, 1000).await {
                 for m in reads.entries {
                     let pending = db(&worker, {
                         let account_id = account_id.clone();

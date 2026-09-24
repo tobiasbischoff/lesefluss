@@ -250,9 +250,26 @@ impl FeedlyClient {
         self.json(resp).await
     }
 
-    pub async fn markers_reads(&self, newer_than: i64) -> Result<ReadsPage> {
-        let url = format!("markers/reads?newerThan={newer_than}");
+    pub async fn markers_reads(&self, newer_than: i64, count: u32) -> Result<ReadsPage> {
+        let url = format!("markers/reads?newerThan={newer_than}&count={count}");
         self.json(self.get(&url).send().await?).await
+    }
+
+    pub async fn markers_feeds(&self, action: &str, feed_remote_ids: &[String]) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}markers", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "action": action, "type": "feeds", "feedIds": feed_remote_ids }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let bytes = resp.bytes().await?;
+        if !status.is_success() {
+            let message = String::from_utf8_lossy(&bytes).chars().take(300).collect();
+            return Err(FeedlyError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
     }
 
     pub async fn markers_entries(&self, action: &str, ids: &[String]) -> Result<()> {

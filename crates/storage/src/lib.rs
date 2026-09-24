@@ -18,6 +18,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub struct FeedRow {
     pub id: i64,
     pub account_id: String,
+    pub remote_id: Option<String>,
     pub feed_url: String,
     pub title: String,
     pub website: Option<String>,
@@ -439,17 +440,18 @@ impl Database {
 
     pub fn list_feeds(&self) -> Result<Vec<FeedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, account_id, feed_url, title, website, accent FROM feeds ORDER BY lower(title)",
+            "SELECT id, account_id, remote_id, feed_url, title, website, accent FROM feeds ORDER BY lower(title)",
         )?;
         let mut feeds: Vec<FeedRow> = stmt
             .query_map([], |r| {
                 Ok(FeedRow {
                     id: r.get(0)?,
                     account_id: r.get(1)?,
-                    feed_url: r.get(2)?,
-                    title: r.get(3)?,
-                    website: r.get(4)?,
-                    accent: r.get(5)?,
+                    remote_id: r.get(2)?,
+                    feed_url: r.get(3)?,
+                    title: r.get(4)?,
+                    website: r.get(5)?,
+                    accent: r.get(6)?,
                     groups: Vec::new(),
                 })
             })?
@@ -1079,6 +1081,14 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn mark_feeds_read(&self, feed_ids: &[i64]) -> Result<usize> {
+        let mut n = 0usize;
+        for fid in feed_ids {
+            n += self.conn.execute("UPDATE articles SET unread=0 WHERE feed_id=?1", params![fid])?;
+        }
+        Ok(n)
     }
 
     pub fn update_fetch_error(&self, feed_id: i64, error_count: i64, last_error: &str, next_fetch_ms: i64, last_fetch_ms: i64) -> Result<()> {

@@ -453,6 +453,22 @@ impl App {
                 self.show_toast(&format!("Kein Feed gefunden: {message}"));
             }
             NetEvent::FeedlySyncDone { added } => {
+                let w = self.weak();
+                self.db_query(
+                    |db| {
+                        let acc = db.list_accounts()?.into_iter().find(|(_, k, _)| k == "feedly");
+                        match acc {
+                            Some((id, _, _)) => Ok::<_, storage::StorageError>(db.last_sync(&id)?.unwrap_or(0)),
+                            None => Ok(0),
+                        }
+                    },
+                    move |app, res: storage::Result<i64>| {
+                        if let Ok(v) = res {
+                            app.state.borrow_mut().feedly_last_sync = v;
+                        }
+                        let _ = w;
+                    },
+                );
                 self.reload_meta_keep();
                 if added > 0 {
                     self.show_toast(&format!("Feedly: {added} neue Artikel"));
@@ -490,10 +506,15 @@ impl App {
                 let counts = db.counts()?;
                 let last = db.last_sync("local")?;
                 let accounts = db.list_accounts()?;
-                Ok::<_, storage::StorageError>((feeds, groups, counts, last, accounts))
+                let feedly_id = accounts.iter().find(|(_, k, _)| k == "feedly").map(|(id, _, _)| id.clone());
+                let feedly_last = match feedly_id {
+                    Some(id) => db.last_sync(&id)?.unwrap_or(0),
+                    None => 0,
+                };
+                Ok::<_, storage::StorageError>((feeds, groups, counts, last, accounts, feedly_last))
             },
-            move |app, res: storage::Result<(Vec<FeedRow>, Vec<GroupRow>, Counts, Option<i64>, Vec<(String, String, String)>)>| {
-                let Ok((feeds, groups, counts, last, accounts)) = res else { return };
+            move |app, res: storage::Result<(Vec<FeedRow>, Vec<GroupRow>, Counts, Option<i64>, Vec<(String, String, String)>, i64)>| {
+                let Ok((feeds, groups, counts, last, accounts, feedly_last)) = res else { return };
                 let has_feedly_account = accounts.iter().any(|(_, k, _)| k == "feedly");
                 {
                     let mut st = app.state.borrow_mut();
@@ -502,6 +523,7 @@ impl App {
                     st.counts = counts;
                     st.last_sync = last;
                     st.accounts = accounts;
+                    st.feedly_last_sync = feedly_last;
                 }
                 app.start_feedly_scheduler();
                 app.start_outbox_tick();
@@ -1061,21 +1083,35 @@ impl App {
             self.show_toast(&format!("„{label}“ enthält keine ungelesenen Artikel"));
             return;
         }
+        let server_scope = self.feedly_scope_feeds();
+        let body = format!(
+            "„{label}“: {} zum Klickzeitpunkt bekannte Artikel werden als gelesen markiert. Rückgängig mit Strg+Z.{}",
+            ids.len(),
+            if server_scope.is_empty() {
+                String::new()
+            } else {
+                " Serverseitig können weitere Artikel außerhalb des geladenen Fensters existieren.".to_string()
+            }
+        );
         let dialog = adw::AlertDialog::builder()
             .heading("Bereich als gelesen markieren")
-            .body(format!(
-                "„{label}“: {} zum Klickzeitpunkt bekannte Artikel werden als gelesen markiert. Rückgängig mit Strg+Z.",
-                ids.len()
-            ))
+            .body(body)
             .build();
         dialog.add_response("cancel", "Abbrechen");
         dialog.add_response("mark", &format!("{} als gelesen markieren", ids.len()));
+        if !server_scope.is_empty() {
+            dialog.add_response("server", "Alle serverseitig (komplette Feeds)");
+        }
         dialog.set_response_appearance("mark", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
         let w = self.weak();
         dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
             let Some(app) = w.upgrade() else { return };
+            if resp == "server" {
+                app.mark_scope_server();
+                return;
+            }
             if resp != "mark" {
                 return;
             }
@@ -1087,6 +1123,47 @@ impl App {
             app.undo_stack.borrow_mut().push(batch);
             app.show_toast(&format!("{} Artikel als gelesen markiert", ids.len()));
         });
+    }
+
+    fn feedly_scope_feeds(&self) -> Vec<(i64, String)> {
+        let st = self.state.borrow();
+        let feeds: Vec<&FeedRow> = match &st.scope {
+            Scope::Feed(f) => st.feeds.iter().filter(|x| x.id == *f).collect(),
+            Scope::Group(g) => st.feeds.iter().filter(|x| x.groups.contains(g)).collect(),
+            Scope::Account(a) => st.feeds.iter().filter(|x| &x.account_id == a).collect(),
+            Scope::Global => Vec::new(),
+        };
+        feeds
+            .into_iter()
+            .filter(|f| f.account_id != "local")
+            .filter_map(|f| f.remote_id.clone().map(|r| (f.id, r)))
+            .collect()
+    }
+
+    fn mark_scope_server(&self) {
+        let scope_feeds = self.feedly_scope_feeds();
+        if scope_feeds.is_empty() {
+            return;
+        }
+        let Some(token) = feedly_sync::token_from_disk() else {
+            self.show_toast("Kein Feedly-Token vorhanden");
+            return;
+        };
+        let remote_ids: Vec<String> = scope_feeds.iter().map(|(_, r)| r.clone()).collect();
+        let local_ids: Vec<i64> = scope_feeds.iter().map(|(id, _)| *id).collect();
+        let tx = self.net.event_sender();
+        self.net.spawn(async move {
+            let client = provider_feedly::FeedlyClient::new(token);
+            if let Err(e) = client.markers_feeds("markAsRead", &remote_ids).await {
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed { message: e.to_string() });
+            }
+        });
+        let worker = self.worker.clone();
+        std::thread::spawn(move || {
+            let _ = worker.send(move |db| db.mark_feeds_read(&local_ids));
+        });
+        self.show_toast("Serverseitig als gelesen markiert; lokale Bestände aktualisiert");
+        self.reload_meta_keep();
     }
 
     fn show_toast(&self, msg: &str) {
@@ -1567,7 +1644,12 @@ impl App {
                     let (account_id, last_sync) = {
                         let st = app.state.borrow();
                         let acc = st.accounts.iter().find(|(_, k, _)| k == "feedly").map(|(id, _, _)| id.clone());
-                        (acc, st.last_sync_for_feedly())
+                        let ls = if st.feedly_last_sync > 0 {
+                            st.feedly_last_sync
+                        } else {
+                            now_ms() - 30 * 86_400_000
+                        };
+                        (acc, ls)
                     };
                     if let Some(account_id) = account_id {
                         feedly_sync::delta_sync(app.worker.clone(), &app.net, token, account_id, last_sync);
