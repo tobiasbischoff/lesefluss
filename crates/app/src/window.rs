@@ -504,6 +504,11 @@ impl App {
                     st.accounts = accounts;
                 }
                 app.start_feedly_scheduler();
+                app.start_outbox_tick();
+                let w2 = app.worker.clone();
+                std::thread::spawn(move || {
+                    let _ = w2.send(|db| db.outbox_reset_inflight());
+                });
                 if std::env::var("LF_FEEDLY_CONNECT").is_ok() && !has_feedly_account {
                     if let Some(token) = feedly_sync::token_from_disk() {
                         app.start_feedly(token);
@@ -974,8 +979,20 @@ impl App {
 
         let feed_id2 = feed_id;
         let id2 = id.to_string();
-        dbg_log(&format!("set_status job: {id2} read={read:?} saved={saved:?}"));
-        self.worker.send(move |db| db.set_status(feed_id2, &id2, read, saved));
+        self.worker.send(move |db| {
+            db.set_status(feed_id2, &id2, read, saved)?;
+            if let Some(acc) = db.account_id_for_article(&id2)? {
+                if acc != "local" {
+                    if let Some(r) = read {
+                        db.enqueue_outbox(&acc, &id2, "read", r)?;
+                    }
+                    if let Some(sv) = saved {
+                        db.enqueue_outbox(&acc, &id2, "saved", sv)?;
+                    }
+                }
+            }
+            Ok::<_, storage::StorageError>(())
+        });
     }
 
     fn current_article(&self) -> Option<ArticleRow> {
@@ -1008,17 +1025,11 @@ impl App {
             self.show_toast("Nichts rückgängig zu machen");
             return;
         };
-        {
-            let st = self.state.borrow();
-            for (feed_id, id, unread, saved) in &batch {
-                if let Some(mut a) = st.article(id) {
-                    a.unread = *unread;
-                    a.saved = *saved;
-                    st.set_article(id, a);
-                }
-                let _ = feed_id;
-            }
+        let mut redo: UndoBatch = Vec::new();
+        for (_feed_id, id, unread, saved) in &batch {
+            self.apply_status(id, Some(!unread), Some(*saved), &mut redo);
         }
+        self.undo_stack.borrow_mut().push(redo);
         let batch2 = batch.clone();
         self.worker.send(move |db| {
             for (feed_id, id, unread, saved) in &batch2 {
@@ -1493,6 +1504,39 @@ impl App {
     fn start_feedly(&self, token: String) {
         self.show_toast("Feedly: Erst-Sync gestartet …");
         feedly_sync::initial_sync(self.worker.clone(), &self.net, token);
+    }
+
+    fn start_outbox_tick(&self) {
+        let w = self.weak();
+        glib::timeout_add_local(Duration::from_secs(10), move || {
+            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
+            let should = {
+                let st = app.state.borrow();
+                st.accounts.iter().any(|(_, k, _)| k == "feedly")
+            };
+            if should {
+                if let Some(token) = feedly_sync::token_from_disk() {
+                    let acc = app.state.borrow().accounts.iter().find(|(_, k, _)| k == "feedly").map(|(id, _, _)| id.clone());
+                    if let Some(account_id) = acc {
+                        let acc2 = account_id.clone();
+                        let has = app
+                            .worker
+                            .clone()
+                            .send(move |db| db.outbox_pending(&acc2, storage::now_ms(), 1).map(|v| !v.is_empty()))
+                            .recv()
+                            .ok()
+                            .and_then(|b| b.downcast::<storage::Result<bool>>().ok())
+                            .map(|b| *b)
+                            .unwrap_or(Ok(false))
+                            .unwrap_or(false);
+                        if has {
+                            feedly_sync::process_outbox(app.worker.clone(), &app.net, token, account_id);
+                        }
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     fn start_feedly_scheduler(&self) {

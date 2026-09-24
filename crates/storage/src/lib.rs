@@ -87,6 +87,16 @@ pub struct NewArticle {
     pub content_hash: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub account_id: String,
+    pub entity_id: String,
+    pub field: String,
+    pub desired: bool,
+    pub revision: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FetchState {
     pub etag: Option<String>,
@@ -205,6 +215,24 @@ CREATE TABLE read_positions (
         r#"
 ALTER TABLE feeds ADD COLUMN remote_id TEXT;
 ALTER TABLE groups ADD COLUMN remote_id TEXT;
+"#,
+    ),
+    (
+        4,
+        r#"
+CREATE TABLE outbox (
+    id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    desired INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_try_ms INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_ms INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX outbox_unique ON outbox(account_id, entity_id, field);
 "#,
     ),
 ];
@@ -940,6 +968,119 @@ impl Database {
         Ok(())
     }
 
+    pub fn enqueue_outbox(&self, account_id: &str, entity_id: &str, field: &str, desired: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO outbox(account_id, entity_id, field, desired, revision, created_ms)
+             VALUES (?1,?2,?3,?4,1,?5)
+             ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
+               desired=excluded.desired,
+               revision=outbox.revision+1,
+               attempts=0,
+               next_try_ms=0,
+               status='pending'",
+            params![account_id, entity_id, field, desired as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn outbox_pending(&self, account_id: &str, now_ms: i64, limit: u32) -> Result<Vec<OutboxRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account_id, entity_id, field, desired, revision FROM outbox
+             WHERE account_id=?1 AND status='pending' AND next_try_ms<=?2
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id, now_ms, limit], |r| {
+                Ok(OutboxRow {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    entity_id: r.get(2)?,
+                    field: r.get(3)?,
+                    desired: r.get::<_, i64>(4)? == 1,
+                    revision: r.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn outbox_mark_inflight(&self, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            self.conn.execute("UPDATE outbox SET status='inflight' WHERE id=?1", params![id])?;
+        }
+        Ok(())
+    }
+
+    pub fn outbox_ack(&self, sent: &[(i64, i64)]) -> Result<()> {
+        for (id, revision) in sent {
+            let cur: Option<i64> = self
+                .conn
+                .query_row("SELECT revision FROM outbox WHERE id=?1", params![id], |r| r.get(0))
+                .optional()?;
+            match cur {
+                Some(c) if c == *revision => {
+                    self.conn.execute("DELETE FROM outbox WHERE id=?1", params![id])?;
+                }
+                Some(_) => {
+                    self.conn.execute(
+                        "UPDATE outbox SET status='pending', attempts=0, next_try_ms=0 WHERE id=?1",
+                        params![id],
+                    )?;
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn outbox_fail(&self, ids: &[i64], next_try_ms: i64, permanent: bool) -> Result<()> {
+        for id in ids {
+            if permanent {
+                self.conn.execute("UPDATE outbox SET status='failed' WHERE id=?1", params![id])?;
+            } else {
+                self.conn.execute(
+                    "UPDATE outbox SET status='pending', attempts=attempts+1, next_try_ms=?2 WHERE id=?1",
+                    params![id, next_try_ms],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn outbox_reset_inflight(&self) -> Result<()> {
+        self.conn.execute("UPDATE outbox SET status='pending' WHERE status='inflight'", [])?;
+        Ok(())
+    }
+
+    pub fn outbox_has_pending(&self, account_id: &str, entity_id: &str, field: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND entity_id=?2 AND field=?3 AND status IN ('pending','inflight')",
+            params![account_id, entity_id, field],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
+    }
+
+    pub fn outbox_counts(&self) -> Result<(i64, i64)> {
+        let pending: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE status IN ('pending','inflight')",
+            [],
+            |r| r.get(0),
+        )?;
+        let failed: i64 = self.conn.query_row("SELECT COUNT(*) FROM outbox WHERE status='failed'", [], |r| r.get(0))?;
+        Ok((pending, failed))
+    }
+
+    pub fn account_id_for_article(&self, article_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT f.account_id FROM articles a JOIN feeds f ON f.id=a.feed_id WHERE a.id=?1 LIMIT 1",
+                params![article_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn update_fetch_error(&self, feed_id: i64, error_count: i64, last_error: &str, next_fetch_ms: i64, last_fetch_ms: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO feed_fetch_state(feed_id, error_count, last_error, next_fetch_ms, last_fetch_ms)
@@ -1086,6 +1227,27 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let hits = db.search("\"\"", 10).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn outbox_coalesce_and_ack() {
+        let db = Database::open_in_memory().unwrap();
+        db.enqueue_outbox("acc", "e1", "read", true).unwrap();
+        db.enqueue_outbox("acc", "e1", "read", false).unwrap();
+        let pending = db.outbox_pending("acc", 10, 10).unwrap();
+        assert_eq!(pending.len(), 1, "muss zu einer Zeile kondensieren");
+        assert!(!pending[0].desired);
+        assert_eq!(pending[0].revision, 2);
+        db.outbox_mark_inflight(&[pending[0].id]).unwrap();
+        assert!(db.outbox_pending("acc", 10, 10).unwrap().is_empty());
+        db.enqueue_outbox("acc", "e1", "read", true).unwrap();
+        db.outbox_ack(&[(pending[0].id, 2)]).unwrap();
+        let after = db.outbox_pending("acc", 10, 10).unwrap();
+        assert_eq!(after.len(), 1, "verspaetetes ACK darf neuere Mutation nicht loeschen");
+        assert_eq!(after[0].revision, 3);
+        db.outbox_ack(&[(after[0].id, 3)]).unwrap();
+        assert!(db.outbox_pending("acc", 10, 10).unwrap().is_empty());
+        assert!(db.outbox_has_pending("acc", "e1", "read").unwrap() == false);
     }
 
     #[test]

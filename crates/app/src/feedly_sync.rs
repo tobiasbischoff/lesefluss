@@ -188,6 +188,68 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
     });
 }
 
+pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: String) {
+    let tx = net.event_sender();
+    net.spawn(async move {
+        let client = pf::FeedlyClient::new(token);
+        let now = storage::now_ms();
+        let rows = db(&worker, {
+            let account_id = account_id.clone();
+            move |db2| db2.outbox_pending(&account_id, now, 100)
+        })
+        .await;
+        let Ok(rows) = rows else { return };
+        if rows.is_empty() {
+            return;
+        }
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        let _ = db(&worker, move |db2| db2.outbox_mark_inflight(&ids)).await;
+        let mut groups: std::collections::HashMap<(String, bool), Vec<(i64, i64, String)>> = std::collections::HashMap::new();
+        for r in &rows {
+            groups
+                .entry((r.field.clone(), r.desired))
+                .or_default()
+                .push((r.id, r.revision, r.entity_id.clone()));
+        }
+        for ((field, desired), entries) in groups {
+            let action = match (field.as_str(), desired) {
+                ("read", true) => "markAsRead",
+                ("read", false) => "keepUnread",
+                ("saved", true) => "markAsSaved",
+                _ => "markAsUnsaved",
+            };
+            let entry_ids: Vec<String> = entries.iter().map(|(_, _, e)| e.clone()).collect();
+            let sent: Vec<(i64, i64)> = entries.iter().map(|(id, rev, _)| (*id, *rev)).collect();
+            let all_ids: Vec<i64> = entries.iter().map(|(id, _, _)| *id).collect();
+            match client.markers_entries(action, &entry_ids).await {
+                Ok(()) => {
+                    let _ = db(&worker, move |db2| db2.outbox_ack(&sent)).await;
+                }
+                Err(pf::FeedlyError::Api { status: 404, .. }) => {
+                    let _ = db(&worker, move |db2| db2.outbox_ack(&sent)).await;
+                }
+                Err(pf::FeedlyError::Api { status: 429, .. }) => {
+                    let next = storage::now_ms() + 5 * 60_000;
+                    let _ = db(&worker, move |db2| db2.outbox_fail(&all_ids, next, false)).await;
+                }
+                Err(pf::FeedlyError::Api { status, message }) if status == 401 || status == 403 => {
+                    let next = storage::now_ms() + 15 * 60_000;
+                    let _ = db(&worker, move |db2| db2.outbox_fail(&all_ids, next, false)).await;
+                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        message: format!("Auth/Rechte ({status}): {message}"),
+                    });
+                }
+                Err(e) => {
+                    let next = storage::now_ms() + 60_000;
+                    let permanent = false;
+                    let _ = db(&worker, move |db2| db2.outbox_fail(&all_ids, next, permanent)).await;
+                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed { message: e.to_string() });
+                }
+            }
+        }
+    });
+}
+
 pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String, last_sync_ms: i64) {
     let tx = net.event_sender();
     net.spawn(async move {
@@ -196,6 +258,16 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
             let overlap = last_sync_ms - 5 * 60_000;
             if let Ok(reads) = client.markers_reads(overlap).await {
                 for m in reads.entries {
+                    let pending = db(&worker, {
+                        let account_id = account_id.clone();
+                        let id = m.id.clone();
+                        move |db2| db2.outbox_has_pending(&account_id, &id, "read")
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if pending {
+                        continue;
+                    }
                     let _ = db(&worker, move |db2| db2.set_read_by_article_id(&m.id, true)).await;
                 }
             }
@@ -236,15 +308,36 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
             let remote_set: std::collections::HashSet<&str> =
                 remote_saved.iter().map(|s| s.as_str()).collect();
             for id in &local_saved {
-                if !remote_set.contains(id.as_str()) {
-                    let _ = db(&worker, {
-                        let id = id.clone();
-                        move |db2| db2.set_saved_by_article_id(&id, false)
-                    })
-                    .await;
+                if remote_set.contains(id.as_str()) {
+                    continue;
                 }
+                let pending = db(&worker, {
+                    let account_id = account_id.clone();
+                    let id = id.clone();
+                    move |db2| db2.outbox_has_pending(&account_id, &id, "saved")
+                })
+                .await
+                .unwrap_or(false);
+                if pending {
+                    continue;
+                }
+                let _ = db(&worker, {
+                    let id = id.clone();
+                    move |db2| db2.set_saved_by_article_id(&id, false)
+                })
+                .await;
             }
             for id in &remote_saved {
+                let pending = db(&worker, {
+                    let account_id = account_id.clone();
+                    let id = id.clone();
+                    move |db2| db2.outbox_has_pending(&account_id, &id, "saved")
+                })
+                .await
+                .unwrap_or(false);
+                if pending {
+                    continue;
+                }
                 let _ = db(&worker, {
                     let id = id.clone();
                     move |db2| db2.set_saved_by_article_id(&id, true)
