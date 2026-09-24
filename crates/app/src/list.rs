@@ -112,6 +112,35 @@ pub fn unregister(row: &ListRow, widget: &gtk::Widget) {
     }
 }
 
+/// Wandelt eine `data:image/png;base64,…`-URI in ein Paintable.
+fn data_uri_texture(data: &str) -> Option<gtk::gdk::Texture> {
+    use base64::Engine;
+    let payload = data.strip_prefix("data:image/png;base64,")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+}
+
+fn initial_thumb(initial: &str, accent: &str) -> gtk::Widget {
+    let box_row = gtk::Box::builder()
+        .width_request(64)
+        .height_request(64)
+        .valign(gtk::Align::Start)
+        .halign(gtk::Align::End)
+        .css_classes(vec!["lf-thumb".to_string()])
+        .build();
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .label(&format!(
+            "<span size=\"18000\" weight=\"bold\" foreground=\"{accent}\">{}</span>",
+            glib::markup_escape_text(initial)
+        ))
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    box_row.append(&label);
+    box_row.upcast()
+}
+
 fn article_row(a: &ArticleRow, thumbs: bool) -> (gtk::Box, RowHandles) {
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -178,27 +207,30 @@ fn article_row(a: &ArticleRow, thumbs: bool) -> (gtk::Box, RowHandles) {
     root.append(&text_col);
 
     if thumbs {
-        let thumb = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
+        let thumb = gtk::Picture::builder()
             .width_request(64)
             .height_request(64)
             .halign(gtk::Align::End)
             .valign(gtk::Align::Start)
+            .content_fit(gtk::ContentFit::Cover)
             .css_classes(vec!["lf-thumb".to_string()])
             .build();
-        let initial = a.feed_title.chars().next().unwrap_or('?').to_string();
-        let thumb_label = gtk::Label::builder()
-            .use_markup(true)
-            .label(&format!(
-                "<span size=\"18000\" weight=\"bold\" foreground=\"{}\">{}</span>",
-                a.accent,
-                glib::markup_escape_text(&initial)
-            ))
-            .vexpand(true)
-            .hexpand(true)
-            .build();
-        thumb.append(&thumb_label);
-        root.append(&thumb);
+        match a.thumb.as_ref() {
+            Some(data) => {
+                // Vorschaubild liegt als kleines PNG (Daten-URI) vor.
+                if let Some(paintable) = data_uri_texture(data) {
+                    thumb.set_paintable(Some(&paintable));
+                    root.append(&thumb);
+                } else {
+                    let initial = a.feed_title.chars().next().unwrap_or('?').to_string();
+                    root.append(&initial_thumb(&initial, &a.accent));
+                }
+            }
+            None => {
+                let initial = a.feed_title.chars().next().unwrap_or('?').to_string();
+                root.append(&initial_thumb(&initial, &a.accent));
+            }
+        }
     }
 
     let handles = RowHandles {

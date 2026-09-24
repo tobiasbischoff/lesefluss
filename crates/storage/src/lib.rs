@@ -38,6 +38,8 @@ pub struct GroupRow {
 #[derive(Clone, Debug)]
 pub struct ArticleRow {
     pub id: String,
+    /// Optionale kleine Vorschau als Daten-URI (PNG, max. 128 px).
+    pub thumb: Option<String>,
     pub feed_id: i64,
     pub sort_ms: i64,
     pub feed_title: String,
@@ -329,6 +331,12 @@ CREATE TABLE account_status (
         11,
         r#"
 ALTER TABLE feeds ADD COLUMN user_title TEXT;
+"#,
+    ),
+    (
+        12,
+        r#"
+ALTER TABLE articles ADD COLUMN thumb TEXT;
 "#,
     ),
 ];
@@ -1044,7 +1052,7 @@ impl Database {
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
                     a.excerpt, a.unread, a.saved,
                     EXISTS(SELECT 1 FROM article_contents c WHERE c.feed_id=a.feed_id AND c.article_id=a.id),
-                    a.sort_ms
+                    a.sort_ms, a.thumb
              FROM articles a JOIN feeds f ON f.id=a.feed_id
              JOIN feed_groups fg ON fg.feed_id=a.feed_id",
         );
@@ -1115,6 +1123,7 @@ impl Database {
                     saved: r.get::<_, i64>(10)? == 1,
                     has_content: r.get::<_, i64>(11)? == 1,
                     sort_ms: r.get(12)?,
+                    thumb: r.get(13)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -1184,7 +1193,7 @@ impl Database {
         };
         let sql = format!(
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
-                          a.excerpt, a.unread, a.saved, (c.article_id IS NOT NULL), a.sort_ms
+                          a.excerpt, a.unread, a.saved, (c.article_id IS NOT NULL), a.sort_ms, a.thumb
                    FROM article_fts fts
                    JOIN articles a ON a.rowid = fts.rowid
                    JOIN feeds f ON f.id=a.feed_id
@@ -1213,6 +1222,7 @@ impl Database {
                     saved: r.get::<_, i64>(10)? == 1,
                     has_content: r.get::<_, i64>(11)? == 1,
                     sort_ms: r.get(12)?,
+                    thumb: r.get(13)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -1340,6 +1350,25 @@ impl Database {
         let rows = stmt
             .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Kleine Vorschau als Daten-URI (PNG, max. 128 px); `None` entfernt sie.
+    pub fn set_article_thumb(&self, feed_id: i64, article_id: &str, thumb: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE articles SET thumb=?3 WHERE feed_id=?1 AND id=?2",
+            params![feed_id, article_id, thumb],
+        )?;
+        Ok(())
+    }
+
+    pub fn article_media_urls(&self, feed_id: i64, article_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT url FROM article_media WHERE feed_id=?1 AND article_id=?2")?;
+        let rows = stmt
+            .query_map(params![feed_id, article_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(rows)
     }
 

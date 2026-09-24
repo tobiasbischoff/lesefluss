@@ -52,6 +52,30 @@ pub fn external_uri_allowed(raw: &str) -> bool {
 }
 
 /// Kontozustände nach §13.1 in lesbare Worte übersetzen.
+/// Erzeugt eine kleine PNG-Vorschau (max. 128 px) als Daten-URI.
+pub fn thumbnail_data_uri(bytes: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let loader = gtk::gdk::gdk_pixbuf::PixbufLoader::new();
+    loader.write(bytes).ok()?;
+    loader.close().ok();
+    let pixbuf = loader.pixbuf()?;
+    let scale = 128.0 / pixbuf.width().max(1) as f64;
+    let target = if scale < 1.0 {
+        pixbuf.scale_simple(
+            (pixbuf.width() as f64 * scale).round().max(1.0) as i32,
+            (pixbuf.height() as f64 * scale).round().max(1.0) as i32,
+            gtk::gdk::gdk_pixbuf::InterpType::Bilinear,
+        )?
+    } else {
+        pixbuf
+    };
+    let png = target.save_to_bufferv("png", &[]).ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    ))
+}
+
 /// Sortierrichtung aus den Einstellungen lesen (Fallback: neueste zuerst).
 fn self_newest_first(db: &storage::Database) -> bool {
     db.get_pref("newest_first")
@@ -203,6 +227,7 @@ mod router_tests {
             saved,
             has_content,
             sort_ms: 0,
+            thumb: None,
         }
     }
 
@@ -373,6 +398,7 @@ pub struct App {
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
     pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<((i64, String), u64, Vec<(String, String)>)>>>,
     pub strings: crate::strings::Strings,
+    pub focus_mode: Cell<bool>,
     pub bg_jobs_tx: std::sync::mpsc::Sender<Box<dyn FnOnce(&Rc<App>) + Send>>,
     pub bg_jobs_rx: std::sync::mpsc::Receiver<Box<dyn FnOnce(&Rc<App>) + Send>>,
     pub drain_active: Cell<bool>,
@@ -428,6 +454,7 @@ impl App {
         primary_menu.append(Some("OPML importieren …"), Some("win.import-opml"));
         primary_menu.append(Some("OPML exportieren …"), Some("win.export-opml"));
         primary_menu.append(Some("Backup erstellen …"), Some("win.backup"));
+        primary_menu.append(Some("Nur-Lesen-Ansicht (F9)"), Some("win.focus-mode"));
         primary_menu.append(Some("Aus Backup wiederherstellen …"), Some("win.restore"));
         let settings_section = gio::Menu::new();
         settings_section.append(Some("Einstellungen"), Some("win.settings"));
@@ -649,6 +676,7 @@ impl App {
             pending_db: RefCell::new(Vec::new()),
             pending_media: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             strings: crate::strings::Strings { lang: st.lang },
+            focus_mode: Cell::new(false),
             bg_jobs_tx: bg_jobs_tx.clone(),
             bg_jobs_rx,
             drain_active: Cell::new(false),
@@ -675,11 +703,21 @@ impl App {
         ];
 
         app.load_prefs();
+        app.apply_layout();
         app.apply_theme_now();
         app.start_theme_watch();
         app.start_frame_probe();
         app.install_letter_router();
         app.install_sidebar_context_menu();
+        {
+            let w = app.weak();
+            app.window.connect_close_request(move |window| {
+                if let Some(app) = w.upgrade() {
+                    app.save_layout();
+                }
+                glib::Propagation::Proceed
+            });
+        }
         app.wire(factory);
         app.register_actions(application);
         app.install_width_watcher();
@@ -1090,6 +1128,7 @@ impl App {
                 }
                 app.trim_rows();
                 app.sync_store(append);
+                app.request_thumbs();
                 app.update_list_empty_state();
                 app.offer_new_articles();
                 app.state.borrow_mut().loading_more = false;
@@ -1191,6 +1230,95 @@ impl App {
             }
         }
         self.sync_store(false);
+    }
+
+    /// Kleine Vorschauen für sichtbare Zeilen erzeugen (einmal pro Artikel,
+    /// im Worker, begrenzt auf 128 px) — nur aus bereits gecachten Bildern.
+    fn request_thumbs(&self) {
+        if !self.prefs.borrow().thumbs {
+            return;
+        }
+        let candidates: Vec<(i64, String)> = {
+            let st = self.state.borrow();
+            st.rows
+                .iter()
+                .take(40)
+                .filter_map(|r| r.article())
+                .filter(|a| a.thumb.is_none())
+                .map(|a| (a.feed_id, a.id.clone()))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let worker = self.worker.clone();
+        let media = std::sync::Arc::clone(&self.media);
+        for (feed_id, article_id) in candidates {
+            let worker2 = worker.clone();
+            let media2 = std::sync::Arc::clone(&media);
+            std::thread::Builder::new()
+                .name("lf-thumb".into())
+                .spawn(move || {
+                    let id_for_db = article_id.clone();
+                    let Ok(boxed) = worker2.send(move |db| db.article_media_urls(feed_id, &id_for_db)).recv() else {
+                        return;
+                    };
+                    let urls = match boxed
+                        .downcast::<storage::Result<Vec<String>>>()
+                        .map(|r| *r)
+                    {
+                        Ok(Ok(urls)) => urls,
+                        _ => return,
+                    };
+                    let Some(url) = urls.into_iter().find(|u| media2.path_for(u).exists()) else {
+                        return;
+                    };
+                    let Some((bytes, _mime)) = media2.get_cached(&url) else { return };
+                    let Some(data_uri) = thumbnail_data_uri(&bytes) else { return };
+                    let _ = worker2.send(move |db| db.set_article_thumb(feed_id, &article_id, Some(&data_uri)));
+                })
+                .ok();
+        }
+    }
+
+    /// „Nur lesen“ blendet beide Listen aus; als Anpassung an große Monitore (§4.5).
+    fn toggle_focus_mode(&self) {
+        let next = !self.focus_mode.get();
+        self.focus_mode.set(next);
+        if next {
+            self.outer.set_show_content(false);
+            self.inner.set_show_content(false);
+        } else {
+            self.outer.set_show_content(true);
+            self.inner.set_show_content(true);
+        }
+    }
+
+    /// Fenstergröße sichern (§4.3). Die Breiten der Navigations-Spalten
+    /// steuert libadwaita selbst; sie lassen sich in dieser API nicht lesen
+    /// und werden deshalb nicht gespeichert (dokumentierte Abweichung).
+    fn save_layout(&self) {
+        let width = self.window.width();
+        let height = self.window.height();
+        if width > 400 && height > 300 {
+            self.save_pref("layout", &format!("{width};{height}"));
+        }
+    }
+
+    fn apply_layout(&self) {
+        let raw = self.worker.read_layout();
+        if let Some(raw) = raw {
+            let parts: Vec<i64> = raw
+                .split(';')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            if parts.len() == 2
+                && (800..=8000).contains(&parts[0])
+                && (600..=8000).contains(&parts[1])
+            {
+                self.window.set_default_size(parts[0] as i32, parts[1] as i32);
+            }
+        }
     }
 
     /// Neue Artikel, die oberhalb des sichtbaren Bereichs liegen, werden
@@ -3832,6 +3960,7 @@ impl App {
         });
         win_action!("reader-retry", |a| a.reload_current(false));
         win_action!("toggle-sort-order", |a| a.toggle_sort_order());
+        win_action!("focus-mode", |a| a.toggle_focus_mode());
         win_action!("rename-feed", |a| a.rename_feed_dialog());
         win_action!("edit-feed-groups", |a| a.edit_feed_groups_dialog());
         win_action!("unsubscribe-feed", |a| a.unsubscribe_dialog());
@@ -3877,6 +4006,7 @@ impl App {
         application.set_accels_for_action("win.add-feed", &["<Control>n"]);
         application.set_accels_for_action("win.mark-scope-read", &["<Control><Shift>m"]);
         application.set_accels_for_action("win.toggle-sort-order", &["<Control><Shift>p"]);
+        application.set_accels_for_action("win.focus-mode", &["F9"]);
         application.set_accels_for_action("win.undo", &["<Control>z"]);
         application.set_accels_for_action("win.redo", &["<Control>y", "<Control><Shift>z"]);
         application.set_accels_for_action("win.zoom-in", &["<Control>plus", "<Control>equal", "<Control>KP_Add"]);

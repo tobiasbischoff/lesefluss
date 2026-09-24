@@ -1242,6 +1242,7 @@ dependencies = [
 name = "lesefluss-app"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "domain",
  "glib",
  "gtk4",

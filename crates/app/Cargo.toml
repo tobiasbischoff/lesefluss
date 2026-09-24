@@ -10,6 +10,7 @@ name = "lesefluss-probe"
 path = "src/probe.rs"
 
 [dependencies]
+base64 = { workspace = true }
 domain = { workspace = true }
 reader = { workspace = true }
 storage = { workspace = true }

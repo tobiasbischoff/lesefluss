@@ -50,6 +50,23 @@ impl DbWorker {
         Self { tx, failure }
     }
 
+    /// Kleiner, blockierender Lesezugriff nur für die Layoutwiederherstellung
+    /// beim Start; die Oberfläche wartet dabei nicht auf Datenbankarbeit.
+    pub fn read_layout(&self) -> Option<String> {
+        let w = self.clone();
+        std::thread::spawn(move || {
+            w.send(|db| db.get_pref("layout").ok().flatten())
+                .recv()
+                .ok()
+                .and_then(|b| b.downcast::<storage::Result<Option<String>>>().ok())
+                .map(|r| r.ok().flatten())
+                .unwrap_or(None)
+        })
+        .join()
+        .ok()
+        .flatten()
+    }
+
     pub fn send<F, R>(&self, f: F) -> Receiver<JobOut>
     where
         F: FnOnce(&Database) -> R + Send + 'static,
