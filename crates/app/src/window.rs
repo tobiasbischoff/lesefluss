@@ -288,7 +288,7 @@ pub fn data_dir() -> std::path::PathBuf {
 
 const JS_CAPTURE_POS: &str = "(()=>{const g=document.querySelector('meta[name=lf-doc]');const gen=g?g.content:'-1';const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return gen+':-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return gen+':'+idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return gen+':'+idx+':'+Math.round(off);})()";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TokenAction {
     StartFeedly,
     Refresh,
@@ -2072,15 +2072,16 @@ impl App {
                 }
             }
             TokenAction::QueuedSync => {
-                if let Some(account_id) = self
+                let account_id = self
                     .state
                     .borrow()
                     .accounts
                     .iter()
                     .find(|(_, k, _)| k == "feedly")
-                    .map(|(id, _, _)| id.clone())
-                {
-                    self.request_feedly_sync(account_id, token, false);
+                    .map(|(id, _, _)| id.clone());
+                match account_id {
+                    Some(id) => self.request_feedly_sync(id, token, false),
+                    None => dbg_log("Kein Feedly-Konto für den Sync vorhanden"),
                 }
             }
             TokenAction::MarkScopeServer => self.mark_scope_server_with(token),
@@ -2108,6 +2109,7 @@ impl App {
                 dbg_log("Feedly: Sync läuft bereits, weiterer Wunsch gemerkt");
                 return;
             }
+            dbg_log("Feedly: Zyklus wird gestartet");
             st.feedly_sync_running = true;
             if priority {
                 st.next_feedly_sync = 0;
@@ -2121,6 +2123,10 @@ impl App {
                 now_ms() - 30 * 86_400_000
             }
         };
+        dbg_log(&format!(
+            "Feedly: Delta-Sync ab {}",
+            last_sync
+        ));
         feedly_sync::delta_sync(self.worker.clone(), &self.net, token, account_id, last_sync);
     }
 
@@ -2250,6 +2256,7 @@ impl App {
                 }
             };
             if due {
+                dbg_log("Feedly-Scheduler: Zyklus fällig");
                 app.with_token(TokenAction::QueuedSync);
             }
             glib::ControlFlow::Continue
