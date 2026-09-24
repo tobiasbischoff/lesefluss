@@ -727,7 +727,7 @@ impl App {
         app
     }
 
-    fn weak(&self) -> Weak<App> {
+    pub fn weak(&self) -> Weak<App> {
         self.me.borrow().clone().expect("App-Selbstreferenz gesetzt")
     }
 
@@ -1028,7 +1028,7 @@ impl App {
         );
     }
 
-    fn run_retention(&self) {
+    pub fn run_retention(&self) {
         let media = std::sync::Arc::clone(&self.media);
         let retention = self.prefs.borrow().retention_days;
         self.db_query(
@@ -1051,7 +1051,7 @@ impl App {
         );
     }
 
-    fn load_page(&self, append: bool) {
+    pub fn load_page(&self, append: bool) {
         let (scope, filter, cursor, search) = {
             let st = self.state.borrow();
             let cur = if append { st.cursor.clone() } else { None };
@@ -1161,7 +1161,7 @@ impl App {
     /// Übernimmt nur die tatsächlichen Unterschiede in den Store: vorhandene
     /// Zeilen werden ersetzt statt neu aufgebaut, damit Auswahl und
     /// Scrollanker erhalten bleiben.
-    fn sync_store(&self, append: bool) {
+    pub fn sync_store(&self, append: bool) {
         let rows = self.state.borrow().rows.clone();
         self.suppress.set(true);
         let mut existing = self.list_store.n_items() as usize;
@@ -1366,7 +1366,7 @@ impl App {
             .map(|a| a.id)
     }
 
-    fn update_list_empty_state(&self) {
+    pub fn update_list_empty_state(&self) {
         let has = self.state.borrow().rows.iter().any(|r| matches!(r, ListRow::Item(_)));
         self.list_stack.set_visible_child_name(if has { "list" } else { "empty" });
     }
@@ -1747,7 +1747,7 @@ impl App {
         );
     }
 
-    fn refresh_sidebar(&self) {
+    pub fn refresh_sidebar(&self) {
         self.sidebar_title.set_subtitle(&self.account_label_for_scope());
         let state = self.state.borrow();
         let mut filters = self.sidebar_filters.borrow_mut();
@@ -2545,7 +2545,7 @@ impl App {
         self.reload_current(true);
     }
 
-    fn reload_current(&self, preserve: bool) {
+    pub fn reload_current(&self, preserve: bool) {
         let Some(id) = self.reader.current.borrow().clone() else { return };
         let Some(row) = self.state.borrow().article(&id) else { return };
         let w = self.weak();
@@ -2883,134 +2883,11 @@ impl App {
         });
     }
 
-    fn import_opml_dialog(&self) {
-        let dlg = gtk::FileDialog::builder().title("OPML-Datei wählen").build();
-        let w = self.weak();
-        glib::MainContext::default().spawn_local(async move {
-            let Ok(file) = dlg.open_future(None::<&gtk::Window>).await else { return };
-            let Some(path) = file.path() else { return };
-            let bytes = match std::fs::read(&path) {
-                Ok(b) if b.len() <= crate::opml::MAX_OPML_BYTES => b,
-                Ok(_) => {
-                    if let Some(app) = w.upgrade() {
-                        app.show_toast("OPML-Datei zu groß (Limit 20 MiB)");
-                    }
-                    return;
-                }
-                Err(e) => {
-                    if let Some(app) = w.upgrade() {
-                        app.show_toast(&format!("Lesefehler: {e}"));
-                    }
-                    return;
-                }
-            };
-            let Ok(xml) = String::from_utf8(bytes) else {
-                if let Some(app) = w.upgrade() {
-                    app.show_toast("OPML-Datei ist kein UTF-8");
-                }
-                return;
-            };
-            match crate::opml::parse_opml(&xml) {
-                Ok(draft) => {
-                    if let Some(app) = w.upgrade() {
-                        app.show_opml_preview(draft);
-                    }
-                }
-                Err(e) => {
-                    if let Some(app) = w.upgrade() {
-                        app.show_toast(&format!("OPML-Fehler: {e}"));
-                    }
-                }
-            }
-        });
-    }
 
-    fn show_opml_preview(&self, draft: crate::opml::OpmlDraft) {
-        let known: std::collections::HashSet<String> =
-            self.state.borrow().feeds.iter().map(|f| f.feed_url.clone()).collect();
-        let new: Vec<&crate::opml::OpmlFeed> = draft.feeds.iter().filter(|f| !known.contains(&f.xml_url)).collect();
-        let existing = draft.feeds.len() - new.len();
-        let listing: String = new
-            .iter()
-            .take(40)
-            .map(|f| format!("• {} — {}\n", f.title, f.xml_url))
-            .collect();
-        let body = format!(
-            "{} neue Feeds, {} bestehende (bleiben erhalten, Gruppen werden zusammengeführt).{}",
-            new.len(),
-            existing,
-            if draft.errors.is_empty() {
-                String::new()
-            } else {
-                format!(" {} ungültige Einträge übersprungen.", draft.errors.len())
-            }
-        );
-        let label = gtk::Label::builder()
-            .label(&listing)
-            .xalign(0.0)
-            .wrap(true)
-            .margin_start(12)
-            .margin_end(12)
-            .build();
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&label)
-            .max_content_height(280)
-            .min_content_height(80)
-            .build();
-        let dialog = adw::AlertDialog::builder()
-            .heading("OPML-Import")
-            .body(body)
-            .extra_child(&scroll)
-            .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("import", &format!("{} Feeds importieren", new.len()));
-        dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("import"));
-        dialog.set_close_response("cancel");
-        let w = self.weak();
-        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
-            let Some(app) = w.upgrade() else { return };
-            if resp == "import" {
-                app.import_opml(draft.clone());
-            }
-        });
-    }
 
-    fn import_opml(&self, draft: crate::opml::OpmlDraft) {
-        let w = self.weak();
-        let entries: Vec<(String, String, Option<String>, Vec<String>)> = draft
-            .feeds
-            .iter()
-            .map(|f| (f.title.clone(), f.xml_url.clone(), f.html_url.clone(), f.groups.clone()))
-            .collect();
-        let errors = draft.errors.len();
-        self.db_query(
-            move |db| {
-                db.ensure_local_account()?;
-                db.import_opml_entries("local", &entries)
-            },
-            move |app, res: storage::Result<(usize, usize)>| {
-                let Ok((new_feeds, merged)) = res else {
-                    if let Some(app) = w.upgrade() {
-                        app.show_toast("Import abgebrochen — es wurde nichts verändert");
-                    }
-                    return;
-                };
-                app.reload_meta_keep();
-                app.show_toast(&format!(
-                    "{new_feeds} Feeds importiert, {merged} zusammengeführt{}",
-                    if errors > 0 {
-                        format!(", {errors} Hinweise im Bericht")
-                    } else {
-                        String::new()
-                    }
-                ));
-            },
-        );
-    }
 
     /// Liest den gespeicherten Kontozustand (inkl. hängender Änderungen).
-    fn refresh_feedly_status(&self) {
+    pub fn refresh_feedly_status(&self) {
         let Some(account_id) = self
             .state
             .borrow()
@@ -3047,7 +2924,7 @@ impl App {
         );
     }
 
-    fn reload_meta_keep(&self) {
+    pub fn reload_meta_keep(&self) {
         let w = self.weak();
         self.db_query(
             |db| {
@@ -3079,37 +2956,6 @@ impl App {
         );
     }
 
-    fn export_opml(&self) {
-        let feeds: Vec<crate::opml::OpmlFeed> = {
-            let st = self.state.borrow();
-            st.feeds
-                .iter()
-                .map(|f| crate::opml::OpmlFeed {
-                    title: f.title.clone(),
-                    xml_url: f.feed_url.clone(),
-                    html_url: None,
-                    groups: f
-                        .groups
-                        .iter()
-                        .filter_map(|g| st.groups.iter().find(|x| x.id == *g).map(|x| x.name.clone()))
-                        .collect(),
-                })
-                .collect()
-        };
-        let dlg = gtk::FileDialog::builder().title("OPML-Export speichern unter").build();
-        dlg.set_initial_name(Some("lesefluss-abonnements.opml"));
-        let w = self.weak();
-        glib::MainContext::default().spawn_local(async move {
-            let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else { return };
-            let Some(path) = file.path() else { return };
-            let xml = crate::opml::build_opml(&feeds);
-            let tmp = path.with_extension("opml.tmp");
-            let ok = std::fs::write(&tmp, xml.as_bytes()).is_ok() && std::fs::rename(&tmp, &path).is_ok();
-            if let Some(app) = w.upgrade() {
-                app.show_toast(if ok { "OPML exportiert" } else { "Export fehlgeschlagen" });
-            }
-        });
-    }
 
     fn backup_dialog(&self) {
         let dlg = gtk::FileDialog::builder().title("Backup speichern unter").build();
@@ -3305,12 +3151,12 @@ impl App {
         self.reader.webview.set_background_color(&rgba);
     }
 
-    fn apply_theme(&self) {
+    pub fn apply_theme(&self) {
         self.apply_theme_now();
         self.reload_current(true);
     }
 
-    fn load_prefs(&self) {
+    pub fn load_prefs(&self) {
         let w = self.weak();
         self.db_query(
             |db| {
@@ -3352,7 +3198,7 @@ impl App {
         );
     }
 
-    fn apply_prefs_live(&self) {
+    pub fn apply_prefs_live(&self) {
         let p = self.prefs.borrow().clone();
         self.window.remove_css_class("lf-compact");
         if p.compact {
@@ -3425,218 +3271,12 @@ impl App {
         self.window.add_controller(ctrl);
     }
 
-    fn save_pref(&self, key: &str, value: &str) {
+    pub fn save_pref(&self, key: &str, value: &str) {
         let k = key.to_string();
         let v = value.to_string();
         self.worker.send(move |db| db.set_pref(&k, &v));
     }
 
-    fn settings_dialog(&self) {
-        let win = adw::PreferencesWindow::builder().modal(true).transient_for(&self.window).build();
-        let p = self.prefs.borrow().clone();
-
-        let page_read = adw::PreferencesPage::builder().title("Lesen").icon_name("text-x-generic-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Leseverhalten").build();
-        let auto = adw::SwitchRow::builder().title("Automatisch als gelesen markieren").subtitle("Nach 0,8 s sichtbarem Artikel").active(p.auto_read).build();
-        grp.add(&auto);
-        let font = adw::SpinRow::builder().title("Schriftgröße Reader").adjustment(&gtk::Adjustment::new(p.reader_font, 14.0, 28.0, 1.0, 2.0, 0.0)).build();
-        grp.add(&font);
-        let measure = adw::SpinRow::builder().title("Zeilenbreite (Zeichen)").adjustment(&gtk::Adjustment::new(p.reader_measure as f64, 55.0, 85.0, 1.0, 5.0, 0.0)).build();
-        grp.add(&measure);
-        let lh = adw::SpinRow::builder().title("Zeilenhöhe").adjustment(&gtk::Adjustment::new(p.reader_line_height, 1.4, 2.0, 0.05, 0.1, 0.0)).build();
-        grp.add(&lh);
-        page_read.add(&grp);
-        win.add(&page_read);
-
-        let page_view = adw::PreferencesPage::builder().title("Darstellung").icon_name("preferences-desktop-appearance-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Erscheinungsbild").build();
-        let theme = adw::ComboRow::builder().title("Theme").model(&gtk::StringList::new(&["system", "dark", "light", "omarchy"])).build();
-        let idx = match p.theme.as_str() {
-            "dark" => 1,
-            "light" => 2,
-            "omarchy" => 3,
-            _ => 0,
-        };
-        theme.set_selected(idx);
-        grp.add(&theme);
-        let compact = adw::SwitchRow::builder().title("Kompakte Liste").active(p.compact).build();
-        grp.add(&compact);
-        let thumbs = adw::SwitchRow::builder().title("Bildvorschauen in der Liste").active(p.thumbs).build();
-        grp.add(&thumbs);
-        let letters = adw::SwitchRow::builder().title("Buchstabenkürzel (j/k/n/p/m/s/o)").active(p.letter_shortcuts).build();
-        grp.add(&letters);
-        let order = adw::ComboRow::builder()
-            .title("Reihenfolge")
-            .subtitle("Gilt für alle Ansichten und Konten")
-            .model(&gtk::StringList::new(&["Neueste zuerst", "Älteste zuerst"]))
-            .selected(if p.newest_first { 0 } else { 1 })
-            .build();
-        grp.add(&order);
-        page_view.add(&grp);
-        win.add(&page_view);
-
-        let page_sync = adw::PreferencesPage::builder().title("Aktualisierung").icon_name("view-refresh-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Abruf").build();
-        let refresh = adw::SpinRow::builder().title("Intervall (Minuten)").adjustment(&gtk::Adjustment::new(p.refresh_min as f64, 5.0, 1440.0, 5.0, 30.0, 0.0)).build();
-        grp.add(&refresh);
-        page_sync.add(&grp);
-        win.add(&page_sync);
-
-        let page_store = adw::PreferencesPage::builder().title("Speicher & Datenschutz").icon_name("drive-harddisk-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Aufbewahrung").build();
-        let retention = adw::SpinRow::builder().title("Gelesene Inhalte behalten (Tage)").subtitle("Danach Bereinigung; Gespeicherte bleiben").adjustment(&gtk::Adjustment::new(p.retention_days as f64, 7.0, 3650.0, 1.0, 30.0, 0.0)).build();
-        grp.add(&retention);
-        let media = adw::SpinRow::builder().title("Bildcache (MiB)").adjustment(&gtk::Adjustment::new(p.media_mb as f64, 64.0, 4096.0, 64.0, 256.0, 0.0)).build();
-        grp.add(&media);
-        page_store.add(&grp);
-        win.add(&page_store);
-
-        let page_acc = adw::PreferencesPage::builder().title("Konten").icon_name("system-users-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Konten").build();
-        let local = adw::ActionRow::builder().title("Lokale Bibliothek").subtitle("Aktiv — Feeds, OPML, Suche, Offline").build();
-        grp.add(&local);
-        let feedly_state = {
-            let st = self.state.borrow();
-            let connected = st.accounts.iter().any(|(_, k, _)| k == "feedly");
-            if !connected {
-                "Nicht verbunden (Menü → Feedly verbinden …)".to_string()
-            } else {
-                let acc = st
-                    .accounts
-                    .iter()
-                    .find(|(_, k, _)| k == "feedly")
-                    .map(|(id, _, _)| id.clone())
-                    .unwrap_or_default();
-                match &st.feedly_status {
-                    Some((status, detail)) => {
-                        let base = status_label(status);
-                        match detail {
-                            Some(d) => format!("{base} — {d}"),
-                            None => base.to_string(),
-                        }
-                    }
-                    None => {
-                        let _ = acc;
-                        format!(
-                            "Verbunden · Delta-Sync alle {} min",
-                            self.prefs.borrow().refresh_min
-                        )
-                    }
-                }
-            }
-        };
-        let feedly = adw::ActionRow::builder().title("Feedly").subtitle(feedly_state).build();
-        grp.add(&feedly);
-        page_acc.add(&grp);
-        win.add(&page_acc);
-
-        let w = self.weak();
-        auto.connect_active_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().auto_read = row.is_active();
-                let v = if row.is_active() { "1" } else { "0" };
-                app.save_pref("auto_read", v);
-            }
-        });
-        let w = self.weak();
-        font.connect_value_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().reader_font = row.value();
-                app.save_pref("reader_font", &row.value().to_string());
-                app.reload_current(true);
-            }
-        });
-        let w = self.weak();
-        measure.connect_value_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().reader_measure = row.value() as u32;
-                app.save_pref("reader_measure", &(row.value() as u32).to_string());
-                app.reload_current(true);
-            }
-        });
-        let w = self.weak();
-        lh.connect_value_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().reader_line_height = row.value();
-                app.save_pref("reader_line_height", &row.value().to_string());
-                app.reload_current(true);
-            }
-        });
-        let w = self.weak();
-        theme.connect_selected_item_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                let mode = match row.selected() {
-                    1 => "dark",
-                    2 => "light",
-                    3 => "omarchy",
-                    _ => "system",
-                };
-                app.prefs.borrow_mut().theme = mode.to_string();
-                app.save_pref("theme", mode);
-                app.apply_theme();
-            }
-        });
-        let w = self.weak();
-        compact.connect_active_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().compact = row.is_active();
-                app.save_pref("compact", if row.is_active() { "1" } else { "0" });
-                app.apply_prefs_live();
-            }
-        });
-        let w = self.weak();
-        thumbs.connect_active_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().thumbs = row.is_active();
-                app.save_pref("thumbs", if row.is_active() { "1" } else { "0" });
-                app.apply_prefs_live();
-            }
-        });
-        let w = self.weak();
-        order.connect_selected_item_notify(move |row| {
-            let Some(app) = w.upgrade() else { return };
-            let newest = row.selected() == 0;
-            app.prefs.borrow_mut().newest_first = newest;
-            app.save_pref("newest_first", if newest { "1" } else { "0" });
-            app.load_page(false);
-        });
-
-        let w = self.weak();
-        letters.connect_active_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().letter_shortcuts = row.is_active();
-                app.save_pref("letter_shortcuts", if row.is_active() { "1" } else { "0" });
-            }
-        });
-        let w = self.weak();
-        refresh.connect_value_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                let minutes = row.value() as i64;
-                app.prefs.borrow_mut().refresh_min = minutes;
-                app.save_pref("refresh_min", &minutes.to_string());
-                app.net.set_refresh_minutes(minutes);
-                app.state.borrow_mut().next_feedly_sync = 0;
-            }
-        });
-        let w = self.weak();
-        retention.connect_value_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().retention_days = row.value() as i64;
-                app.save_pref("retention_days", &(row.value() as i64).to_string());
-                app.run_retention();
-            }
-        });
-        let w = self.weak();
-        media.connect_value_notify(move |row| {
-            if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().media_mb = row.value() as i64;
-                app.save_pref("media_mb", &(row.value() as i64).to_string());
-                app.media.set_max_bytes(row.value() as u64 * 1024 * 1024);
-            }
-        });
-
-        win.present();
-    }
 
     fn start_theme_watch(&self) {
         let Some(dir) = crate::theme_omarchy::watch_dir() else { return };

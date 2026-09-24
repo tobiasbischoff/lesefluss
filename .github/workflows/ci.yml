@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test und Clippy (Linux)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Abhängigkeiten
+        run: |
+          pacman -Syu --noconfirm --needed git
+          sed -i 's/^#\?\(MAKEFLAGS\).*/\1="-j$(nproc)"/' /etc/makepkg.conf
+      - name: Rust-Werkzeuge
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Bauen
+        run: cargo build --workspace --locked
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Formatierung
+        run: cargo fmt --all -- --check
