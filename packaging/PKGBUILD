@@ -1,23 +1,40 @@
-# Maintainer: Lesefluss Projekt <dev@example.org>
+# Maintainer: Lesefluss contributors
 pkgname=lesefluss-git
 pkgver=0.1.0
-pkgrel=1
-pkgdesc="Nativer GTK-4-RSS-Reader (Wayland) mit lokaler Bibliothek und Feedly-Sync"
+pkgrel=2
+pkgdesc="Nativer GTK-4-RSS-Reader für Wayland mit lokaler Bibliothek und Feedly-Sync"
 arch=('x86_64')
 url="https://example.org/lesefluss"
 license=('MIT' 'Apache-2.0')
-depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'sqlite' 'libsecret' 'xdg-desktop-portal' 'hicolor-icon-theme')
-makedepends=('cargo' 'git')
-source=("git+file://${srcdir}/../" )
-sha256sums=('SKIP')
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'sqlite' 'libsecret' 'xdg-desktop-portal')
+makedepends=('cargo' 'rust')
+provides=('lesefluss')
+conflicts=()
+source=()
+sha256sums=()
+
+# Aus dem Repository-Verzeichnis bauen:
+#   cd .. && makepkg -f packaging/PKGBUILD
+_srcdir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 build() {
-  cd "$srcdir"/*
+  cd "$_srcdir"
+  # makepkg setzt LTO per LTOFLAGS; die statisch gebauten C-Abhängigkeiten
+  # (libsqlite3-sys, aws-lc-sys) vertragen gemischtes LTO nicht zuverlässig.
+  export CARGO_PROFILE_RELEASE_LTO=false
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+  export LTOFLAGS=""
+  export CFLAGS="${CFLAGS//-flto=auto/}"
   cargo build --release --locked --bin lesefluss-app
 }
 
+check() {
+  cd "$_srcdir"
+  cargo test --workspace --locked
+}
+
 package() {
-  cd "$srcdir"/*
+  cd "$_srcdir"
   install -Dm755 target/release/lesefluss-app "$pkgdir/usr/bin/lesefluss"
   install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.desktop \
     "$pkgdir/usr/share/applications/io.github.PROJEKTINHABER.Lesefluss.desktop"
@@ -25,4 +42,8 @@ package() {
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.PROJEKTINHABER.Lesefluss.svg"
   install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.appdata.xml \
     "$pkgdir/usr/share/metainfo/io.github.PROJEKTINHABER.Lesefluss.appdata.xml"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/abnahme-protokoll.md "$pkgdir/usr/share/doc/$pkgname/abnahme-protokoll.md"
 }

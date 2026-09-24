@@ -56,7 +56,8 @@ Details und Rohwerte: `docs/perf-report.md`.
 | Orca/AT-SPI | Namen, Rollen, Status | zugängliche Namen für Icon-Knöpfe gesetzt; Durchgang nicht erfolgt | **offen** |
 | WebKit-Absturz | App bleibt lauffähig | Fehlerseite wird geschaltet (`web_process_terminated`) | teilweise (kein Absturztest) |
 | Voller Datenträger | verständlicher Fehler, Daten bleiben | Validierung und Meldungen vorhanden, kein Fülltest | teilweise |
-| `makepkg -si` auf frischem System | Installation ohne Entwicklerwerkzeuge | PKGBUILD vorhanden, nicht durchlaufen | **offen** |
+| `makepkg` Paketbau | Paket entsteht mit Desktop, Icon, Metadaten, Lizenzen | `makepkg -f` erfolgreich, 5,2 MiB, `appstreamcli validate` erfolgreich | erfüllt |
+| Installation ohne Entwicklerwerkzeuge | `pacman -U` auf frischem System | Paket gebaut und geprüft; Installation hier mangels `sudo` nicht ausgeführt | teilweise |
 | Tastatur/Fokus am Gerät | alle Aktionen erreichbar | Unit-Tests der Route, physische Prüfung ausstehend | **offen** |
 | Touchpad-Gefühl | natürlich, keine Doppelträgheit | nicht geprüft | **offen** |
 
@@ -73,7 +74,7 @@ Details und Rohwerte: `docs/perf-report.md`.
 
 ## Nächste Schritte für die Veröffentlichung
 
-1. `makepkg -si` auf einem frischen System durchlaufen.
+1. `sudo pacman -U packaging/lesefluss-git-*.pkg.tar.zst` auf einem frischen System (Paket ist gebaut und geprüft).
 2. App-ID und Namen finalisieren (Desktop-Datei, AppStream, Icon, `application_id` gemeinsam).
 3. Orca-, Skalierungs- und `sysprof`-Abnahme sowie Tastaturprüfung am Gerät.
 4. `cargo audit` auf einer Maschine mit Netzzugang; Befund dokumentieren.

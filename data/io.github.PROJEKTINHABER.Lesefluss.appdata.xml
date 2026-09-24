@@ -3,6 +3,9 @@
   <id>io.github.PROJEKTINHABER.Lesefluss</id>
   <name>Lesefluss</name>
   <summary>Ruhiger, nativer RSS-Reader für Wayland (lokal + Feedly)</summary>
+  <url type="homepage">https://example.org/lesefluss</url>
+  <url type="bugtracker">https://example.org/lesefluss/issues</url>
+  <developer_name>Lesefluss contributors</developer_name>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <description>
