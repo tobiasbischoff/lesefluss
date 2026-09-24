@@ -49,6 +49,18 @@
   175 Artikel geladen, Reader rendert echte Inhalte, Auto-gelesen senkt Zähler,
   Zeile bleibt bis Auswahlwechsel stehen und graut aus.
 
+## Leselogik (nach Nutzerfeedback, Reeder-Parität)
+
+- **Scope × Filter:** Linke Spalte wählt die Quelle (Ungelesen global / Gruppe / Feed),
+  die Segmentleiste **unter der Artikelliste** (★ / ✉ / ≡) wählt den Filter
+  (Gespeichert / Ungelesen / Alle). Beide kombinieren sich; Zustand pro
+  (Scope, Filter) wird für Auswahl-Wiederherstellung gemerkt.
+- **Ungelesen-Snapshot:** Gelesene Artikel grauen aus, bleiben aber bis zum
+  nächsten Betreten der Ansicht in der Liste; Zähler sinken sofort.
+- **Cursor:** Listenauswahl folgt immer dem rechts angezeigten Artikel;
+  kein automatisches Scrollen beim Öffnen per Klick/Maus — nur Tastatur-
+  Navigation (j/k/n/p/Pfeile) scrollt den Cursor sichtbar mit.
+
 ## Bekannt/offen (bewusst verschoben)
 
 - OPML, Aufbewahrung/Backup, Mediencache: M3.
