@@ -82,12 +82,12 @@ impl UiState {
     pub fn build_rows(&mut self, articles: Vec<ArticleRow>) {
         self.rows.clear();
         self.push_rows(articles);
-        self.cursor = self.last_item().map(|a| (a.published_ms, a.id.clone()));
+        self.cursor = self.last_item().map(|a| (a.sort_ms, a.id.clone()));
     }
 
     pub fn append_rows(&mut self, articles: Vec<ArticleRow>) {
         self.push_rows(articles);
-        self.cursor = self.last_item().map(|a| (a.published_ms, a.id.clone()));
+        self.cursor = self.last_item().map(|a| (a.sort_ms, a.id.clone()));
     }
 
     pub fn last_item(&self) -> Option<ArticleRow> {

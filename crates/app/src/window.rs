@@ -883,7 +883,9 @@ impl App {
         let gen = self.load_gen.get();
         self.db_query(
             move |db| match &search {
-                Some(q) if !q.is_empty() => db.search(q, 200),
+                Some(q) if !q.is_empty() => {
+                    db.search(q, &scope, filter, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200)
+                }
                 _ => db.query_articles(&scope, filter, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200),
             },
             move |app, res: storage::Result<Vec<ArticleRow>>| {
@@ -897,7 +899,12 @@ impl App {
                 } else {
                     dbg_log(&format!("load_page gen={gen} rows=0"));
                 }
-                let had_full_page = rows.len() >= 200;
+                let has_more = rows.len() > 200;
+                let mut rows = rows;
+                if has_more {
+                    rows.truncate(200);
+                }
+                let had_full_page = has_more;
                 let keep_sel = app.state.borrow().selected.clone();
                 let current = app.state.borrow().rows.clone();
                 let feeds = app.state.borrow().feeds.clone();

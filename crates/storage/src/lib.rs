@@ -39,6 +39,7 @@ pub struct GroupRow {
 pub struct ArticleRow {
     pub id: String,
     pub feed_id: i64,
+    pub sort_ms: i64,
     pub feed_title: String,
     pub accent: String,
     pub title: String,
@@ -824,7 +825,8 @@ impl Database {
         let mut sql = String::from(
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
                     a.excerpt, a.unread, a.saved,
-                    EXISTS(SELECT 1 FROM article_contents c WHERE c.feed_id=a.feed_id AND c.article_id=a.id)
+                    EXISTS(SELECT 1 FROM article_contents c WHERE c.feed_id=a.feed_id AND c.article_id=a.id),
+                    a.sort_ms
              FROM articles a JOIN feeds f ON f.id=a.feed_id
              JOIN feed_groups fg ON fg.feed_id=a.feed_id",
         );
@@ -886,29 +888,70 @@ impl Database {
                     unread: r.get::<_, i64>(9)? == 1,
                     saved: r.get::<_, i64>(10)? == 1,
                     has_content: r.get::<_, i64>(11)? == 1,
+                    sort_ms: r.get(12)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
 
-    pub fn search(&self, query: &str, limit: u32) -> Result<Vec<ArticleRow>> {
+    pub fn search(
+        &self,
+        query: &str,
+        scope: &Scope,
+        filter: Filter,
+        before: Option<(i64, &str)>,
+        limit: u32,
+    ) -> Result<Vec<ArticleRow>> {
         let fts = build_fts_query(query);
         if fts.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
-                          a.excerpt, a.unread, a.saved, (c.article_id IS NOT NULL)
+        let mut where_clauses = vec!["article_fts MATCH ?1".to_string()];
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(fts)];
+        match filter {
+            Filter::Unread => where_clauses.push("a.unread=1".into()),
+            Filter::Saved => where_clauses.push("a.saved=1".into()),
+            Filter::All => {}
+        }
+        match scope {
+            Scope::Global => {}
+            Scope::Feed(id) => {
+                where_clauses.push("a.feed_id=?".into());
+                args.push(Box::new(*id));
+            }
+            Scope::Account(acc) => {
+                where_clauses.push("f.account_id=?".into());
+                args.push(Box::new(acc.clone()));
+            }
+            Scope::Group(g) => {
+                where_clauses.push("a.feed_id IN (SELECT feed_id FROM feed_groups WHERE group_id=?)".into());
+                args.push(Box::new(*g));
+            }
+        }
+        if let Some((sort_ms, id)) = before {
+            where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
+            args.push(Box::new(sort_ms));
+            args.push(Box::new(sort_ms));
+            args.push(Box::new(id.to_string()));
+        }
+        let sql = format!(
+            "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
+                          a.excerpt, a.unread, a.saved, (c.article_id IS NOT NULL), a.sort_ms
                    FROM article_fts fts
                    JOIN articles a ON a.rowid = fts.rowid
                    JOIN feeds f ON f.id=a.feed_id
                    LEFT JOIN article_contents c ON c.feed_id=a.feed_id AND c.article_id=a.id
-                   WHERE article_fts MATCH ?1
-                   ORDER BY rank
-                   LIMIT ?2";
-        let mut stmt = self.conn.prepare(sql)?;
+                   WHERE {}
+                   ORDER BY a.sort_ms DESC, a.id DESC
+                   LIMIT {}",
+            where_clauses.join(" AND "),
+            (limit as i64) + 1
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|v| v.as_ref()).collect();
         let rows = stmt
-            .query_map(params![fts, limit as i64], |r| {
+            .query_map(rusqlite::params_from_iter(refs), |r| {
                 Ok(ArticleRow {
                     id: r.get(0)?,
                     feed_id: r.get(1)?,
@@ -922,6 +965,7 @@ impl Database {
                     unread: r.get::<_, i64>(9)? == 1,
                     saved: r.get::<_, i64>(10)? == 1,
                     has_content: r.get::<_, i64>(11)? == 1,
+                    sort_ms: r.get(12)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -1695,11 +1739,11 @@ mod tests {
         let now = now_ms();
         db.upsert_article(feed, "s1", "Grüße aus München", None, None, now, "Straße und Café", Some("<p>Straße und <b>Café</b></p>"), now).unwrap();
         db.upsert_article(feed, "s2", "Other", None, None, now, "nothing", Some("<p>nothing</p>"), now).unwrap();
-        let hits = db.search("cafe", 10).unwrap();
+        let hits = db.search("cafe", &Scope::Global, Filter::All, None, 10).unwrap();
         assert_eq!(hits.len(), 1, "remove_diacritics sollte Café finden");
-        let hits = db.search("münchen", 10).unwrap();
+        let hits = db.search("münchen", &Scope::Global, Filter::All, None, 10).unwrap();
         assert_eq!(hits.len(), 1);
-        let hits = db.search("\"\"", 10).unwrap();
+        let hits = db.search("\"\"", &Scope::Global, Filter::All, None, 10).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -1779,6 +1823,86 @@ mod tests {
             )
             .unwrap();
         "feedly-1".to_string()
+    }
+
+    #[test]
+    fn keyset_cursor_uses_sort_key_and_never_repeats() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "a", "A", None, None, now - 1000, "e", None, now).unwrap();
+        db.upsert_article(feed, "b", "B", None, None, now - 1000, "e", None, now).unwrap();
+        db.upsert_article(feed, "c", "C", None, None, now - 1000, "e", None, now).unwrap();
+        let first = db.query_articles(&Scope::Global, Filter::All, None, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = (first.last().unwrap().sort_ms, first.last().unwrap().id.as_str());
+        let second = db
+            .query_articles(&Scope::Global, Filter::All, Some(cursor), 2)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        let ids: std::collections::HashSet<&str> = first
+            .iter()
+            .map(|r| r.id.as_str())
+            .chain(second.iter().map(|r| r.id.as_str()))
+            .collect();
+        assert_eq!(ids.len(), 3, "keine doppelten Zeilen trotz gleicher Zeit");
+    }
+
+    #[test]
+    fn future_timestamps_are_clamped_without_breaking_the_cursor() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "future", "Zukunft", None, None, now + 10_000_000_000, "e", None, now).unwrap();
+        db.upsert_article(feed, "normal", "Normal", None, None, now - 500, "e", None, now).unwrap();
+        let first = db.query_articles(&Scope::Global, Filter::All, None, 1).unwrap();
+        let cursor = (first[0].sort_ms, first[0].id.as_str());
+        assert!(cursor.0 <= now, "Sortierschlüssel ist begrenzt: {}", cursor.0);
+        let second = db
+            .query_articles(&Scope::Global, Filter::All, Some(cursor), 1)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].id, first[0].id, "derselbe Artikel darf nicht erneut erscheinen");
+    }
+
+    #[test]
+    fn search_respects_scope_filter_and_cursor() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let f1 = db.add_feed(&acc, "u1", "F1", None, "#111111").unwrap();
+        let f2 = db.add_feed(&acc, "u2", "F2", None, "#222222").unwrap();
+        let now = now_ms();
+        for i in 0..5 {
+            db.upsert_article(f1, &format!("a{i}"), "Suchtreffer A", None, None, now - i * 1000, "e", Some("<p>zielwort</p>"), now).unwrap();
+            db.upsert_article(f2, &format!("b{i}"), "Suchtreffer B", None, None, now - i * 1000, "e", Some("<p>zielwort</p>"), now).unwrap();
+        }
+        db.set_status(f1, "a1", Some(true), None).unwrap();
+        let scoped = db
+            .search("zielwort", &Scope::Feed(f2), Filter::All, None, 100)
+            .unwrap();
+        assert!(scoped.iter().all(|r| r.feed_id == f2), "Feed-Filter");
+        let unread = db
+            .search("zielwort", &Scope::Global, Filter::Unread, None, 100)
+            .unwrap();
+        assert!(unread.iter().all(|r| r.unread), "Ungelesen-Filter");
+        let page1 = db
+            .search("zielwort", &Scope::Global, Filter::All, None, 4)
+            .unwrap();
+        assert_eq!(page1.len(), 5, "4 Treffer plus eine Extrazeile signalisiert weitere");
+        let cursor = (page1[3].sort_ms, page1[3].id.as_str());
+        let page2 = db
+            .search("zielwort", &Scope::Global, Filter::All, Some(cursor), 4)
+            .unwrap();
+        assert!(!page2.iter().any(|r| r.id == page1[3].id), "kein doppelter Treffer");
+        let seen: std::collections::HashSet<&str> = page1
+            .iter()
+            .take(4)
+            .map(|r| r.id.as_str())
+            .chain(page2.iter().map(|r| r.id.as_str()))
+            .collect();
+        assert_eq!(seen.len(), 9, "4 + 5 der 10 Treffer, überschneidungsfrei");
     }
 
     #[test]
@@ -2030,7 +2154,7 @@ mod tests {
         let remote_row = rows.iter().find(|r| r.id == "old-remote").expect("Zeile bleibt in der Liste");
         assert!(!local_row.has_content, "Inhalt des lokalen Altartikels wurde bereinigt");
         assert!(remote_row.has_content, "Artikel mit ausstehender Mutation bleibt vollständig");
-        assert!(db.search("alt", 10).unwrap().iter().any(|r| r.id == "old-remote"));
+        assert!(db.search("alt", &Scope::Global, Filter::All, None, 10).unwrap().iter().any(|r| r.id == "old-remote"));
     }
 
     #[test]
@@ -2040,12 +2164,12 @@ mod tests {
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
         db.upsert_article(feed, "gone", "Verschwindet", None, None, now, "e", Some("<p>oldsecretword</p>"), now).unwrap();
-        assert_eq!(db.search("oldsecretword", 10).unwrap().len(), 1);
+        assert_eq!(db.search("oldsecretword", &Scope::Global, Filter::All, None, 10).unwrap().len(), 1);
         db.conn.execute("DELETE FROM articles WHERE feed_id=?1 AND id='gone'", params![feed]).unwrap();
         db.conn.execute("DELETE FROM article_contents WHERE feed_id=?1 AND article_id='gone'", params![feed]).unwrap();
         db.upsert_article(feed, "neu", "Neuer Artikel", None, None, now, "e", Some("<p>anderes wort</p>"), now).unwrap();
-        assert!(db.search("oldsecretword", 10).unwrap().is_empty(), "verwaiste FTS-Zeile darf nicht treffen");
-        assert_eq!(db.search("anderes", 10).unwrap().len(), 1);
+        assert!(db.search("oldsecretword", &Scope::Global, Filter::All, None, 10).unwrap().is_empty(), "verwaiste FTS-Zeile darf nicht treffen");
+        assert_eq!(db.search("anderes", &Scope::Global, Filter::All, None, 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -2055,7 +2179,7 @@ mod tests {
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
         db.upsert_article(feed, "a", "Sondertitel Quaternionen", Some("Autorin"), None, now, "e", None, now).unwrap();
-        let hits = db.search("sondertitel", 10).unwrap();
+        let hits = db.search("sondertitel", &Scope::Global, Filter::All, None, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].has_content, "kein Inhalt, aber Treffer");
     }
