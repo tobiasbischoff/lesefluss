@@ -1,4 +1,5 @@
 pub mod media;
+pub mod netpolicy;
 
 use thiserror::Error;
 
@@ -8,8 +9,10 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     #[error("parse: {0}")]
     Parse(String),
-    #[error("zu groß: {0} Bytes (Limit 10 MiB)")]
+    #[error("zu groß: {0} Bytes")]
     TooLarge(usize),
+    #[error("Ziel abgelehnt: {0}")]
+    Blocked(String),
     #[error("kein Feed gefunden")]
     NoFeed,
 }
@@ -17,10 +20,59 @@ pub enum ProviderError {
 pub type Result<T> = std::result::Result<T, ProviderError>;
 
 pub const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_DISCOVERY_BYTES: usize = 4 * 1024 * 1024;
+
+pub async fn read_bounded(
+    resp: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > limit {
+            return Err(ProviderError::TooLarge(len as usize));
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut stream = resp;
+    while let Some(chunk) = stream.chunk().await? {
+        if out.len() + chunk.len() > limit {
+            return Err(ProviderError::TooLarge(out.len() + chunk.len()));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
 
 #[derive(Clone, Debug)]
 pub struct HttpClient {
     inner: reqwest::Client,
+    trusted_origins: Vec<String>,
+    allow_private_hosts: bool,
+}
+
+impl HttpClient {
+    /// Nur für Tests und bewusst freigegebene Intranet-Feeds.
+    pub fn with_private_hosts(mut self, allow: bool) -> Self {
+        self.allow_private_hosts = allow;
+        self
+    }
+
+    pub fn with_trusted_origin(mut self, origin: &str) -> Self {
+        self.trusted_origins.push(origin.to_string());
+        self
+    }
+
+    fn guard(&self, url: &str) -> Result<url::Url> {
+        if self.allow_private_hosts {
+            let parsed =
+                url::Url::parse(url).map_err(|_| ProviderError::Blocked(url.to_string()))?;
+            if !netpolicy::scheme_allowed(&parsed) {
+                return Err(ProviderError::Blocked(parsed.scheme().to_string()));
+            }
+            return Ok(parsed);
+        }
+        netpolicy::check_url(url, &self.trusted_origins)
+            .map_err(|e| ProviderError::Blocked(e.to_string()))
+    }
 }
 
 impl Default for HttpClient {
@@ -38,7 +90,7 @@ impl HttpClient {
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .expect("reqwest client");
-        Self { inner }
+        Self { inner, trusted_origins: Vec::new(), allow_private_hosts: false }
     }
 
     pub async fn fetch_feed(
@@ -47,6 +99,7 @@ impl HttpClient {
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<FetchOutcome> {
+        self.guard(url)?;
         let mut req = self.inner.get(url);
         if let Some(e) = etag {
             req = req.header("If-None-Match", e);
@@ -67,29 +120,38 @@ impl HttpClient {
             .get("last-modified")
             .and_then(|v| v.to_str().ok().map(str::to_string));
         let final_url = resp.url().to_string();
-        let bytes = resp.bytes().await?;
-        if bytes.len() > MAX_FEED_BYTES {
-            return Err(ProviderError::TooLarge(bytes.len()));
-        }
+        self.guard(&final_url)?;
+        let bytes = read_bounded(resp, MAX_FEED_BYTES).await?;
         Ok(FetchOutcome::Fetched {
-            bytes: bytes.to_vec(),
+            bytes,
             etag: new_etag,
             last_modified: new_lm,
             final_url,
         })
     }
 
-    pub async fn fetch_raw(&self, url: &str) -> Result<(String, Vec<u8>)> {
+    pub async fn fetch_image(&self, url: &str) -> Result<(String, Vec<u8>)> {
+        self.guard(url)?;
         let resp = self.inner.get(url).send().await?;
         if !resp.status().is_success() {
             return Err(ProviderError::Parse(format!("HTTP {}", resp.status())));
         }
         let final_url = resp.url().to_string();
-        let bytes = resp.bytes().await?;
-        if bytes.len() > MAX_FEED_BYTES {
-            return Err(ProviderError::TooLarge(bytes.len()));
+        self.guard(&final_url)?;
+        let bytes = read_bounded(resp, media::MAX_IMAGE_BYTES).await?;
+        Ok((final_url, bytes))
+    }
+
+    pub async fn fetch_raw(&self, url: &str) -> Result<(String, Vec<u8>)> {
+        self.guard(url)?;
+        let resp = self.inner.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Parse(format!("HTTP {}", resp.status())));
         }
-        Ok((final_url, bytes.to_vec()))
+        let final_url = resp.url().to_string();
+        self.guard(&final_url)?;
+        let bytes = read_bounded(resp, MAX_DISCOVERY_BYTES).await?;
+        Ok((final_url, bytes))
     }
 }
 
@@ -395,6 +457,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_chunked_body_is_aborted_before_full_allocation() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = s.write_all(head.as_bytes());
+                let block = vec![b'a'; 64 * 1024];
+                for _ in 0..400 {
+                    if s.write_all(format!("{:x}\r\n", block.len()).as_bytes()).is_err() {
+                        return;
+                    }
+                    if s.write_all(&block).is_err() {
+                        return;
+                    }
+                    if s.write_all(b"\r\n").is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let client = HttpClient::new().with_private_hosts(true);
+        let url = format!("http://{addr}/feed.xml");
+        match client.fetch_feed(&url, None, None).await {
+            Err(ProviderError::TooLarge(_)) => {}
+            Err(ProviderError::Http(_)) => {}
+            other => panic!("erwartete Größen- oder Abbruchfehler, bekam {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_targets_are_rejected_before_any_request() {
+        let client = HttpClient::new();
+        assert!(matches!(
+            client.fetch_feed("http://127.0.0.1:9/feed.xml", None, None).await,
+            Err(ProviderError::Blocked(_))
+        ));
+        assert!(matches!(
+            client.fetch_raw("http://169.254.169.254/latest").await,
+            Err(ProviderError::Blocked(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn fetch_etag_304() {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -425,7 +536,7 @@ mod tests {
                 }
             }
         });
-        let client = HttpClient::new();
+        let client = HttpClient::new().with_private_hosts(true);
         let url = format!("http://{addr}/feed.xml");
         match client.fetch_feed(&url, None, None).await.unwrap() {
             FetchOutcome::Fetched { etag, .. } => assert_eq!(etag.as_deref(), Some(r#""v1""#)),

@@ -9,6 +9,8 @@ pub enum FeedlyError {
     Api { status: u16, message: String },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Antwort zu groß: {got} Bytes (Limit {limit})")]
+    TooLarge { got: usize, limit: usize },
 }
 
 pub type Result<T> = std::result::Result<T, FeedlyError>;
@@ -173,10 +175,9 @@ impl FeedlyClient {
 
     async fn json<T: for<'de> Deserialize<'de>>(&self, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
-        let bytes = resp.bytes().await?;
+        let bytes = read_bounded(resp, MAX_JSON_BYTES).await?;
         if !status.is_success() {
-            let message = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-            return Err(FeedlyError::Api { status: status.as_u16(), message });
+            return Err(api_error(status, &bytes));
         }
         Ok(serde_json::from_slice(&bytes)?)
     }
@@ -264,10 +265,9 @@ impl FeedlyClient {
             .send()
             .await?;
         let status = resp.status();
-        let bytes = resp.bytes().await?;
+        let bytes = read_bounded(resp, MAX_JSON_BYTES).await?;
         if !status.is_success() {
-            let message = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-            return Err(FeedlyError::Api { status: status.as_u16(), message });
+            return Err(api_error(status, &bytes));
         }
         Ok(())
     }
@@ -281,10 +281,9 @@ impl FeedlyClient {
             .send()
             .await?;
         let status = resp.status();
-        let bytes = resp.bytes().await?;
+        let bytes = read_bounded(resp, MAX_JSON_BYTES).await?;
         if !status.is_success() {
-            let message = String::from_utf8_lossy(&bytes).chars().take(300).collect();
-            return Err(FeedlyError::Api { status: status.as_u16(), message });
+            return Err(api_error(status, &bytes));
         }
         Ok(())
     }
@@ -299,6 +298,36 @@ fn encode(q: &[(String, String)]) -> String {
         .map(|(k, v)| format!("{k}={}", url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>()))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+pub const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
+
+async fn read_bounded(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > limit {
+            return Err(FeedlyError::TooLarge { got: len as usize, limit });
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await? {
+        if out.len() + chunk.len() > limit {
+            return Err(FeedlyError::TooLarge { got: out.len() + chunk.len(), limit });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// Redigiert Serverantworten: nur Fehlertext, keine vollständigen Nutzdaten.
+fn api_error(status: reqwest::StatusCode, body: &[u8]) -> FeedlyError {
+    let text = String::from_utf8_lossy(body);
+    let message = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>();
+    FeedlyError::Api { status: status.as_u16(), message }
 }
 
 pub fn global_all_stream(user_id: &str) -> String {
