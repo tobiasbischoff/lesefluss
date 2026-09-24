@@ -417,7 +417,9 @@ impl Database {
             "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
              WHERE f.account_id=?1 AND a.saved=1",
         )?;
-        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        let rows = stmt
+            .query_map(params![account_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
 
@@ -1331,5 +1333,21 @@ mod tests {
         assert_eq!(c.per_group, vec![(g, 2)]);
         let rows = db.query_articles(&Scope::Group(g), Filter::Unread, None, 10).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn saved_ids_scoped_to_account() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        db.conn.execute("INSERT INTO accounts(id,kind,name,created_ms) VALUES ('feedly-1','feedly','Feedly',0)", []).unwrap();
+        let f_local = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
+        let f_remote = db.add_feed("feedly-1", "u2", "Feedly", None, "#222222").unwrap();
+        let now = now_ms();
+        db.upsert_article(f_local, "a", "A", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f_remote, "b", "B", None, None, now, "e", None, now).unwrap();
+        db.set_saved_by_article_id("a", true).unwrap();
+        db.set_saved_by_article_id("b", true).unwrap();
+        assert_eq!(db.saved_ids_for_account(&acc).unwrap(), vec!["a".to_string()]);
+        assert_eq!(db.saved_ids_for_account("feedly-1").unwrap(), vec!["b".to_string()]);
     }
 }

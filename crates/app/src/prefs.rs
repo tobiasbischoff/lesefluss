@@ -24,7 +24,7 @@ impl Default for Prefs {
             reader_line_height: 1.6,
             theme: "system".to_string(),
             letter_shortcuts: true,
-            refresh_min: 30,
+            refresh_min: 15,
             retention_days: 90,
             media_mb: 512,
         }

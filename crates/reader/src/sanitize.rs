@@ -133,10 +133,8 @@ pub fn image_sources(html: &str) -> Vec<String> {
         for el in doc.select(&sel) {
             if let Some(src) = el.value().attr("src") {
                 let s = src.to_string();
-                if s.starts_with("http://") || s.starts_with("https://") {
-                    if !out.contains(&s) {
-                        out.push(s);
-                    }
+                if (s.starts_with("http://") || s.starts_with("https://")) && !out.contains(&s) {
+                    out.push(s);
                 }
             }
         }

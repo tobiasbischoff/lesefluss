@@ -22,6 +22,7 @@ thread_local! {
 }
 
 fn main() -> gtk::glib::ExitCode {
+    let t0 = std::time::Instant::now();
     let dir = window::data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let db_path = dir.join("library.db");
@@ -42,9 +43,17 @@ fn main() -> gtk::glib::ExitCode {
     let worker2 = worker.clone();
     let net2 = Rc::clone(&net);
     app.connect_activate(move |a| {
+        let t0 = t0;
         INSTANCE.with(|slot| {
             if slot.borrow().is_none() {
                 let instance = window::App::new(a, worker2.clone(), Rc::clone(&net2));
+                glib::idle_add_local(move || {
+                    window::dbg_log(&format!(
+                        "startup-ready {} ms",
+                        t0.elapsed().as_millis()
+                    ));
+                    glib::ControlFlow::Break
+                });
                 *slot.borrow_mut() = Some(instance);
             } else if let Some(existing) = slot.borrow().as_ref() {
                 existing.window.present();

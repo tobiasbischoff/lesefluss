@@ -339,6 +339,7 @@ impl App {
         app.load_prefs();
         app.apply_theme_now();
         app.start_theme_watch();
+        app.start_frame_probe();
         app.wire(factory);
         app.register_actions(application);
         app.install_width_watcher();
@@ -495,6 +496,66 @@ impl App {
 
     // ── Start ──
 
+    fn start_frame_probe(&self) {
+        let mode = std::env::var("LF_FRAMECHECK").unwrap_or_default();
+        if mode.is_empty() {
+            return;
+        }
+        let w = self.weak();
+        if mode.contains("stress") {
+            glib::timeout_add_local(Duration::from_millis(350), move || {
+                match w.upgrade() {
+                    Some(app) => {
+                        let _ = gtk::prelude::WidgetExt::activate_action(
+                            &app.window,
+                            "win.next-article",
+                            None,
+                        );
+                        glib::ControlFlow::Continue
+                    }
+                    None => glib::ControlFlow::Break,
+                }
+            });
+        }
+        let samples: Rc<std::cell::RefCell<Vec<f64>>> = Rc::new(std::cell::RefCell::new(Vec::with_capacity(4096)));
+        let last = Rc::new(std::cell::Cell::new(0i64));
+        let s2 = samples.clone();
+        let l2 = last.clone();
+        self.window.add_tick_callback(move |_w, clock| {
+            let now = clock.frame_time();
+            let prev = l2.replace(now);
+            if prev > 0 {
+                let dt = (now - prev) as f64 / 1000.0;
+                if dt > 0.0 && dt < 2000.0 {
+                    let mut v = s2.borrow_mut();
+                    v.push(dt);
+                    if v.len() >= 3600 {
+                        drop(v);
+                        let mut v = std::mem::take(&mut *s2.borrow_mut());
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let n = v.len();
+                        let at = |q: f64| v[((n as f64 - 1.0) * q).round() as usize];
+                        let over = |lim: f64| {
+                            v.iter().filter(|x| **x > lim).count() as f64 / n as f64 * 100.0
+                        };
+                        eprintln!(
+                            "[lf] frames mode={mode} n={n} p50={:.2} p95={:.2} p99={:.2} max={:.2} >16.7={:.1}% >8.3={:.1}% >50={:.1}%",
+                            at(0.5),
+                            at(0.95),
+                            at(0.99),
+                            v[n - 1],
+                            over(16.7),
+                            over(8.3),
+                            over(50.0)
+                        );
+                        return glib::ControlFlow::Break;
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     fn bootstrap(&self) {
         let seed = std::env::var("LF_SEED").is_ok();
         let w = self.weak();
@@ -545,27 +606,7 @@ impl App {
                 if let Some(ms) = last {
                     app.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(ms)));
                 }
-                let w2 = app.worker.clone();
-                let media = std::sync::Arc::clone(&app.media);
-                app.db_query(
-                    move |db| {
-                        let pinned = db.pinned_media_urls()?;
-                        let now = storage::now_ms();
-                        let pruned = db.prune_old_read(now, 90)?;
-                        Ok::<_, storage::StorageError>((pinned, pruned))
-                    },
-                    move |_app, res: storage::Result<(Vec<String>, usize)>| {
-                        if let Ok((pinned, pruned)) = res {
-                            if pruned > 0 {
-                                dbg_log(&format!("Aufbewahrung: {pruned} alte gelesene Artikel bereinigt"));
-                            }
-                            let keys: std::collections::HashSet<String> =
-                                pinned.iter().map(|u| provider_local::media::key_of(u)).collect();
-                            media.prune(&keys);
-                        }
-                        let _ = w2;
-                    },
-                );
+                app.run_retention();
                 app.refresh_sidebar();
                 app.load_page(false);
                 if let Ok(list) = std::env::var("LF_SUBSCRIBE") {
@@ -579,6 +620,29 @@ impl App {
                     }
                 }
                 let _ = w;
+            },
+        );
+    }
+
+    fn run_retention(&self) {
+        let media = std::sync::Arc::clone(&self.media);
+        let retention = self.prefs.borrow().retention_days;
+        self.db_query(
+            move |db| {
+                let pinned = db.pinned_media_urls()?;
+                let now = storage::now_ms();
+                let pruned = db.prune_old_read(now, retention)?;
+                Ok::<_, storage::StorageError>((pinned, pruned))
+            },
+            move |_app, res: storage::Result<(Vec<String>, usize)>| {
+                if let Ok((pinned, pruned)) = res {
+                    if pruned > 0 {
+                        dbg_log(&format!("Aufbewahrung: {pruned} alte gelesene Artikel bereinigt"));
+                    }
+                    let keys: std::collections::HashSet<String> =
+                        pinned.iter().map(|u| provider_local::media::key_of(u)).collect();
+                    media.prune(&keys);
+                }
             },
         );
     }
@@ -1378,7 +1442,7 @@ impl App {
             for (u, alt) in imgs {
                 match media.get_or_fetch(&http, &u).await {
                     Some((bytes, mime)) => {
-                        reps.push((u, provider_local::media::data_uri(&bytes, &mime)));
+                        reps.push((u, provider_local::media::data_uri(&bytes, mime)));
                     }
                     None => {
                         reps.push((u, provider_local::media::placeholder_data_uri(&alt)));
@@ -1637,9 +1701,10 @@ impl App {
         glib::timeout_add_local(Duration::from_secs(60), move || {
             let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
             let due = {
+                let interval = app.prefs.borrow().refresh_min.clamp(5, 1440);
                 let mut st = app.state.borrow_mut();
                 if st.accounts.iter().any(|(_, k, _)| k == "feedly") && now_ms() >= st.next_feedly_sync {
-                    st.next_feedly_sync = now_ms() + 15 * 60_000;
+                    st.next_feedly_sync = now_ms() + interval * 60_000;
                     true
                 } else {
                     false
@@ -2176,11 +2241,14 @@ impl App {
         let local = adw::ActionRow::builder().title("Lokale Bibliothek").subtitle("Aktiv — Feeds, OPML, Suche, Offline").build();
         grp.add(&local);
         let feedly_state = {
-            let st = self.state.borrow();
-            if st.accounts.iter().any(|(_, k, _)| k == "feedly") {
-                "Verbunden (Delta-Sync alle 15 min)"
+            let connected = self.state.borrow().accounts.iter().any(|(_, k, _)| k == "feedly");
+            if connected {
+                format!(
+                    "Verbunden (Delta-Sync alle {} min)",
+                    self.prefs.borrow().refresh_min
+                )
             } else {
-                "Nicht verbunden (Zahnrad → Feedly verbinden)"
+                "Nicht verbunden (Zahnrad → Feedly verbinden)".to_string()
             }
         };
         let feedly = adw::ActionRow::builder().title("Feedly").subtitle(feedly_state).build();
@@ -2270,6 +2338,7 @@ impl App {
             if let Some(app) = w.upgrade() {
                 app.prefs.borrow_mut().retention_days = row.value() as i64;
                 app.save_pref("retention_days", &(row.value() as i64).to_string());
+                app.run_retention();
             }
         });
         let w = self.weak();

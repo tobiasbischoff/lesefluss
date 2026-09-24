@@ -22,7 +22,7 @@ pub struct OpmlDraft {
 fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.local_name().as_ref() == name {
-            return a.unescape_value().ok().map(|v| v.to_string());
+            return a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.to_string());
         }
     }
     None

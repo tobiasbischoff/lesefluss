@@ -403,29 +403,25 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { continue };
-                loop {
-                    let mut buf = [0u8; 4096];
-                    let n = match s.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = std::fs::write("/tmp/mock-req.log", raw.clone());
-                    let req = raw.to_lowercase();
-                    let body = RSS.as_bytes();
-                    if req.contains("if-none-match:") {
-                        let resp = "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        let _ = s.write_all(resp.as_bytes());
-                        break;
-                    } else {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = s.write_all(resp.as_bytes());
-                        let _ = s.write_all(body);
-                        break;
-                    }
+                let mut buf = [0u8; 4096];
+                let n = match s.read(&mut buf) {
+                    Err(_) => continue,
+                    Ok(n) => n,
+                };
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = std::fs::write("/tmp/mock-req.log", raw.clone());
+                let req = raw.to_lowercase();
+                let body = RSS.as_bytes();
+                if req.contains("if-none-match:") {
+                    let resp = "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = s.write_all(resp.as_bytes());
+                } else {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.write_all(body);
                 }
             }
         });
