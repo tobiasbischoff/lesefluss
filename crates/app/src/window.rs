@@ -2206,57 +2206,33 @@ impl App {
 
     fn import_opml(&self, draft: crate::opml::OpmlDraft) {
         let w = self.weak();
+        let entries: Vec<(String, String, Option<String>, Vec<String>)> = draft
+            .feeds
+            .iter()
+            .map(|f| (f.title.clone(), f.xml_url.clone(), f.html_url.clone(), f.groups.clone()))
+            .collect();
+        let errors = draft.errors.len();
         self.db_query(
             move |db| {
                 db.ensure_local_account()?;
-                let groups = db.list_groups()?;
-                let mut group_ids: std::collections::HashMap<String, i64> =
-                    groups.into_iter().map(|g| (g.name, g.id)).collect();
-                let mut new_feeds: Vec<(i64, String)> = Vec::new();
-                let mut merged = 0usize;
-                for f in &draft.feeds {
-                    let mut gids: Vec<i64> = Vec::new();
-                    for gname in &f.groups {
-                        let gid = match group_ids.get(gname) {
-                            Some(g) => *g,
-                            None => {
-                                let g = db.add_group("local", gname, None)?;
-                                group_ids.insert(gname.clone(), g);
-                                g
-                            }
-                        };
-                        gids.push(gid);
-                    }
-                    match db.feed_id_by_url(&f.xml_url)? {
-                        Some(fid) => {
-                            let existing = db.list_feeds()?.into_iter().find(|x| x.id == fid);
-                            let mut all = existing.map(|x| x.groups).unwrap_or_default();
-                            for g in gids {
-                                if !all.contains(&g) {
-                                    all.push(g);
-                                }
-                            }
-                            db.set_feed_groups(fid, &all)?;
-                            merged += 1;
-                        }
-                        None => {
-                            let accent = crate::window::ACCENTS[f.xml_url.len() % crate::window::ACCENTS.len()];
-                            let fid = db.add_feed("local", &f.xml_url, &f.title, f.html_url.as_deref(), accent)?;
-                            db.set_feed_groups(fid, &gids)?;
-                            new_feeds.push((fid, f.xml_url.clone()));
-                        }
-                    }
-                }
-                Ok::<_, storage::StorageError>((new_feeds, merged))
+                db.import_opml_entries("local", &entries)
             },
-            move |app, res: storage::Result<(Vec<(i64, String)>, usize)>| {
-                let Ok((new_feeds, merged)) = res else { return };
-                for (fid, url) in &new_feeds {
-                    app.net.fetch_feed(app.worker.clone(), *fid, url.clone(), true);
-                }
+            move |app, res: storage::Result<(usize, usize)>| {
+                let Ok((new_feeds, merged)) = res else {
+                    if let Some(app) = w.upgrade() {
+                        app.show_toast("Import abgebrochen — es wurde nichts verändert");
+                    }
+                    return;
+                };
                 app.reload_meta_keep();
-                app.show_toast(&format!("{} Feeds importiert, {} zusammengeführt", new_feeds.len(), merged));
-                let _ = w;
+                app.show_toast(&format!(
+                    "{new_feeds} Feeds importiert, {merged} zusammengeführt{}",
+                    if errors > 0 {
+                        format!(", {errors} Hinweise im Bericht")
+                    } else {
+                        String::new()
+                    }
+                ));
             },
         );
     }

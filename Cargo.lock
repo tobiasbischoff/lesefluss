@@ -1746,6 +1746,7 @@ dependencies = [
  "feed-rs",
  "reader",
  "reqwest",
+ "scraper",
  "thiserror",
  "tokio",
  "url",

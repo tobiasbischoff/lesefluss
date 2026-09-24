@@ -35,6 +35,7 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut group_stack: Vec<String> = Vec::new();
+    let mut open_groups: Vec<bool> = Vec::new();
     let mut draft = OpmlDraft::default();
     let mut outlines = 0usize;
     let mut buf = Vec::new();
@@ -50,13 +51,19 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
                 match attr(&e, "xmlUrl") {
                     Some(url) if !url.trim().is_empty() => {
                         draft.feeds.push(make_feed(text, url, &e, &group_stack));
+                        open_groups.push(false);
                     }
                     _ => {
-                        if !text.is_empty() && group_stack.len() < MAX_DEPTH {
-                            group_stack.push(text);
-                        } else if group_stack.len() >= MAX_DEPTH {
-                            draft.errors.push(format!("Zu tiefe Verschachtelung bei Outline {outlines}"));
+                        if group_stack.len() >= MAX_DEPTH {
+                            return Err(format!(
+                                "Verschachtelung tiefer als {MAX_DEPTH} bei Outline {outlines}"
+                            ));
                         }
+                        if text.is_empty() {
+                            draft.errors.push(format!("Outline {outlines} ohne Namen"));
+                        }
+                        group_stack.push(text);
+                        open_groups.push(true);
                     }
                 }
             }
@@ -73,12 +80,23 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
                 }
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == "outline" => {
-                group_stack.pop();
+                match open_groups.pop() {
+                    Some(true) => {
+                        group_stack.pop();
+                    }
+                    Some(false) => {}
+                    None => {
+                        return Err("Unbalancedes Outline: schließendes Element ohne Öffnung".into())
+                    }
+                }
             }
             Err(err) => return Err(format!("XML-Fehler: {err}")),
             _ => {}
         }
         buf.clear();
+    }
+    if !open_groups.is_empty() {
+        return Err(format!("Datei endet mit {} offenen Outline-Elementen", open_groups.len()));
     }
     if draft.feeds.is_empty() && draft.errors.is_empty() {
         return Err("Keine Feed-Outlines gefunden".into());
@@ -184,6 +202,64 @@ mod tests {
         let xml = build_opml(&d.feeds);
         let d2 = parse_opml(&xml).unwrap();
         assert_eq!(d.feeds, d2.feeds);
+    }
+
+    #[test]
+    fn group_after_feed_outline_stays_open() {
+        let xml = r#"<opml version="2.0"><body>
+            <outline type="rss" text="Erster Feed" xmlUrl="https://a.example/feed.xml"></outline>
+            <outline text="Gruppe">
+                <outline type="rss" text="Feed in Gruppe" xmlUrl="https://b.example/feed.xml"></outline>
+            </outline>
+        </body></opml>"#;
+        let draft = parse_opml(&xml).expect("parse");
+        assert_eq!(draft.feeds.len(), 2);
+        assert!(draft.feeds[0].groups.is_empty(), "Feed vor der Gruppe bleibt ohne Gruppe");
+        assert_eq!(draft.feeds[1].groups, vec!["Gruppe".to_string()]);
+    }
+
+    #[test]
+    fn self_closing_feed_outline_does_not_break_the_stack() {
+        let xml = r#"<opml version="2.0"><body>
+            <outline text="Leere Gruppe"/>
+            <outline type="rss" text="Feed" xmlUrl="https://a.example/feed.xml"/>
+            <outline text="Gruppe">
+                <outline type="rss" text="Zweiter" xmlUrl="https://b.example/feed.xml"/>
+            </outline>
+        </body></opml>"#;
+        let draft = parse_opml(&xml).expect("parse");
+        assert_eq!(draft.feeds.len(), 2);
+        assert!(draft.feeds[0].groups.is_empty(), "leere Gruppe hat keine Kinder");
+        assert_eq!(draft.feeds[1].groups, vec!["Gruppe".to_string()]);
+    }
+
+    #[test]
+    fn unbalanced_and_too_deep_documents_are_rejected() {
+        let deep: String = (0..40)
+            .map(|i| format!("<outline text=\"E{i}\">"))
+            .collect::<String>()
+            + &"<outline type=\"rss\" text=\"F\" xmlUrl=\"https://x.example/f.xml\"/>".to_string()
+            + &"</outline>".repeat(40);
+        let xml = format!("<opml version=\"2.0\"><body>{deep}</body></opml>");
+        let err = parse_opml(&xml).unwrap_err();
+        assert!(err.contains("Verschachtelung"), "{err}");
+
+        let broken = "<opml version=\"2.0\"><body><outline text=\"G\">";
+        let err = parse_opml(broken).unwrap_err();
+        assert!(err.contains("offenen") || err.contains("Unbalanced"), "{err}");
+    }
+
+    #[test]
+    fn feed_without_name_falls_back_to_host_and_unnamed_group_is_reported() {
+        let xml = r#"<opml version="2.0"><body><outline xmlUrl="https://a.example/feed.xml"/></body></opml>"#;
+        let draft = parse_opml(&xml).expect("parse");
+        assert_eq!(draft.feeds.len(), 1);
+        assert_eq!(draft.feeds[0].title, "a.example");
+        assert!(draft.errors.is_empty(), "Feed ohne Namen ist erlaubt: {:?}", draft.errors);
+
+        let xml = r#"<opml version="2.0"><body><outline><outline type="rss" text="F" xmlUrl="https://a.example/f.xml"/></outline></body></opml>"#;
+        let draft = parse_opml(&xml).expect("parse");
+        assert!(draft.errors.iter().any(|e| e.contains("ohne Namen")), "{:?}", draft.errors);
     }
 
     #[test]

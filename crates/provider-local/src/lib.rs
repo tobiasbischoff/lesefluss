@@ -1,6 +1,8 @@
 pub mod media;
 pub mod netpolicy;
 
+use std::collections::HashSet;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -328,36 +330,52 @@ fn host_of(url: &str) -> String {
 }
 
 fn looks_like_feed(bytes: &[u8]) -> bool {
-    let head: String = bytes.iter().take(512).map(|b| *b as char).collect();
-    let head = head.to_lowercase();
-    head.contains("<rss") || head.contains("<feed") || head.contains("rdf:rdf") || head.contains("<?xml")
+    // ASCII-Kleinschreibung ist längenstabil; Unicode-Kleinschreibung ist es nicht.
+    let head: Vec<u8> = bytes.iter().take(2048).map(|b| b.to_ascii_lowercase()).collect();
+    let head = String::from_utf8_lossy(&head);
+    head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf")
 }
 
 fn extract_alternate_links(html: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let lower = html.to_lowercase();
-    let mut pos = 0;
-    while let Some(idx) = lower[pos..].find("<link").map(|i| i + pos) {
-        let end = match lower[idx..].find('>') {
-            Some(e) => idx + e,
-            None => break,
-        };
-        let tag = &html[idx..end];
-        pos = end + 1;
-        let tag_lower = tag.to_lowercase();
-        if !tag_lower.contains("rel=\"alternate\"") && !tag_lower.contains("rel='alternate'") {
+    let document = scraper::Html::parse_document(html);
+    let Ok(selector) = scraper::Selector::parse("link[rel][type][href]") else {
+        return out;
+    };
+    let mut seen = HashSet::new();
+    for element in document.select(&selector) {
+        let value = element.value();
+        let rel = value.attr("rel").unwrap_or_default().to_ascii_lowercase();
+        let mime = value.attr("type").unwrap_or_default().to_ascii_lowercase();
+        if !rel.split_whitespace().any(|r| r == "alternate") {
             continue;
         }
-        let is_feed_type = ["application/rss+xml", "application/atom+xml", "application/xml", "text/xml"]
-            .iter()
-            .any(|t| tag_lower.contains(&format!("type=\"{t}\"")) || tag_lower.contains(&format!("type='{t}'")));
-        if !is_feed_type {
+        if !matches!(
+            mime.trim(),
+            "application/rss+xml"
+                | "application/atom+xml"
+                | "application/feed+json"
+                | "application/xml"
+                | "text/xml"
+        ) {
             continue;
         }
-        if let Some(href) = attr(tag, "href") {
-            let title = attr(tag, "title").unwrap_or_else(|| "Feed".into());
-            out.push((href, title));
+        let Some(href) = value.attr("href") else { continue };
+        let href = href.trim();
+        if href.is_empty() {
+            continue;
         }
+        match url::Url::parse(href) {
+            Ok(parsed) if netpolicy::scheme_allowed(&parsed) => {}
+            Ok(_) => continue,
+            Err(_) if href.starts_with("//") => continue,
+            Err(_) => {}
+        }
+        if !seen.insert(href.to_string()) {
+            continue;
+        }
+        let title = value.attr("title").unwrap_or("Feed").to_string();
+        out.push((href.to_string(), title));
     }
     out
 }
@@ -454,6 +472,21 @@ mod tests {
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].0, "/feed.xml");
         assert_eq!(cands[0].1, "Blog Feed");
+    }
+
+    #[test]
+    fn discovery_ignores_dangerous_schemes_and_unicode_traps() {
+        let html = "<html><head>\
+<link rel=\"alternate\" type=\"application/rss+xml\" href=\"javascript:alert(1)\">\
+<link rel=\"alternate\" type=\"application/rss+xml\" href=\"file:///etc/passwd\">\
+<link rel=\"alternate\" type=\"application/rss+xml\" href=\"https://ok.example/f.xml\">\
+</head><body>İİİ</body></html>";
+        let cands = extract_alternate_links(html);
+        assert_eq!(cands.len(), 1, "nur https bleibt: {cands:?}");
+        assert_eq!(cands[0].0, "https://ok.example/f.xml");
+        assert!(!looks_like_feed(b"<?xml version=\"1.0\"?><html><body>kein Feed</body></html>"));
+        assert!(looks_like_feed(b"<?xml version=\"1.0\"?><rss version=\"2.0\"></rss>"));
+        assert!(looks_like_feed("<feed xmlns=\"http://www.w3.org/2005/Atom\">".as_bytes()));
     }
 
     #[tokio::test]

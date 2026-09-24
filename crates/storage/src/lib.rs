@@ -354,6 +354,21 @@ fn bump_outbox(
     Ok(revision)
 }
 
+fn path_key(key: &(Option<i64>, String)) -> String {
+    format!("{}::{}", key.0.map(|v| v.to_string()).unwrap_or_default(), key.1)
+}
+
+fn accent_for(url: &str) -> String {
+    const ACCENTS: [&str; 8] = [
+        "#4F8A8B", "#B36A5E", "#6A7BBE", "#8A7A4F", "#7B5EA7", "#5E8A6A", "#A76B8A", "#6B6E7B",
+    ];
+    let mut hash: u64 = 0;
+    for b in url.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as u64);
+    }
+    ACCENTS[(hash as usize) % ACCENTS.len()].to_string()
+}
+
 fn clamp_future(ms: i64, now: i64) -> i64 {
     ms.min(now)
 }
@@ -578,6 +593,108 @@ impl Database {
             f.groups = pairs.iter().filter(|(fid, _)| *fid == f.id).map(|(_, g)| *g).collect();
         }
         Ok(feeds)
+    }
+
+    /// Importiert ein OPML-Draft transaktional in das Zielkonto.
+    /// Bestehende Feeds werden nie ersetzt, nur Gruppenzuordnungen ergänzt.
+    pub fn import_opml_entries(
+        &self,
+        account_id: &str,
+        entries: &[(String, String, Option<String>, Vec<String>)],
+    ) -> Result<(usize, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut group_ids: std::collections::HashMap<(Option<i64>, String), i64> =
+            std::collections::HashMap::new();
+        let mut group_path: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut new_feeds = 0usize;
+        let mut merged = 0usize;
+        for (title, url, website, groups) in entries {
+            let mut gids: Vec<i64> = Vec::new();
+            let mut parent: Option<i64> = None;
+            for name in groups {
+                let key = (parent, name.clone());
+                let gid = match group_path.get(&path_key(&key)) {
+                    Some(g) => *g,
+                    None => {
+                        let existing: Option<i64> = tx
+                            .query_row(
+                                "SELECT id FROM groups WHERE account_id=?1 AND name=?2
+                                 AND COALESCE(parent_id,-1)=COALESCE(?3,-1)",
+                                params![account_id, name, parent],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        let gid = match existing {
+                            Some(g) => g,
+                            None => {
+                                tx.execute(
+                                    "INSERT INTO groups(account_id, name, parent_id) VALUES (?1,?2,?3)",
+                                    params![account_id, name, parent],
+                                )?;
+                                tx.last_insert_rowid()
+                            }
+                        };
+                        group_path.insert(path_key(&key), gid);
+                        group_ids.insert(key, gid);
+                        gid
+                    }
+                };
+                gids.push(gid);
+                parent = Some(gid);
+            }
+            let existing_feed: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM feeds WHERE account_id=?1 AND feed_url=?2",
+                    params![account_id, url],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing_feed {
+                Some(fid) => {
+                    let mut all: Vec<i64> = {
+                        let mut stmt = tx.prepare("SELECT group_id FROM feed_groups WHERE feed_id=?1")?;
+                        let rows = stmt
+                            .query_map(params![fid], |r| r.get(0))?
+                            .collect::<std::result::Result<Vec<i64>, _>>()?;
+                        rows
+                    };
+                    for g in gids {
+                        if !all.contains(&g) {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO feed_groups(feed_id, group_id) VALUES (?1,?2)",
+                                params![fid, g],
+                            )?;
+                            all.push(g);
+                        }
+                    }
+                    merged += 1;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO feeds(account_id, feed_url, title, website, accent, added_ms)
+                         VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            account_id,
+                            url,
+                            title,
+                            website,
+                            &accent_for(url),
+                            now_ms()
+                        ],
+                    )?;
+                    let fid = tx.last_insert_rowid();
+                    for g in gids {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO feed_groups(feed_id, group_id) VALUES (?1,?2)",
+                            params![fid, g],
+                        )?;
+                    }
+                    new_feeds += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((new_feeds, merged))
     }
 
     pub fn add_group(&self, account_id: &str, name: &str, parent_id: Option<i64>) -> Result<i64> {
@@ -1823,6 +1940,48 @@ mod tests {
             )
             .unwrap();
         "feedly-1".to_string()
+    }
+
+    #[test]
+    fn opml_import_is_transactional_and_scope_aware() {
+        let db = Database::open_in_memory().unwrap();
+        let local = db.ensure_local_account().unwrap();
+        let remote = remote_account(&db);
+        let entries = vec![
+            (
+                "F1".to_string(),
+                "https://a.example/f.xml".to_string(),
+                Some("https://a.example".to_string()),
+                vec!["Technik".to_string(), "Rust".to_string()],
+            ),
+            (
+                "F1".to_string(),
+                "https://a.example/f.xml".to_string(),
+                None,
+                vec!["Technik".to_string()],
+            ),
+        ];
+        let (new, merged) = db.import_opml_entries(&local, &entries).unwrap();
+        assert_eq!((new, merged), (1, 1), "zweiter Durchlauf führt nicht zu einem Duplikat");
+        let feeds = db.list_feeds().unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].groups.len(), 2, "verschachtelte Gruppen bleiben erhalten");
+        let groups = db.list_groups().unwrap();
+        assert_eq!(groups.len(), 2);
+        let child = groups.iter().find(|g| g.name == "Rust").unwrap();
+        let parent = groups.iter().find(|g| g.name == "Technik").unwrap();
+        assert_eq!(child.parent_id, Some(parent.id), "echte Parent-Gruppe");
+
+        let (new_remote, _) = db.import_opml_entries(&remote, &entries).unwrap();
+        assert_eq!(new_remote, 1, "anderes Konto erhält eigene Feeds");
+        assert_eq!(db.list_feeds().unwrap().len(), 2);
+        let remote_groups: Vec<_> = db
+            .list_groups()
+            .unwrap()
+            .into_iter()
+            .filter(|g| g.account_id == "feedly-1")
+            .collect();
+        assert_eq!(remote_groups.len(), 2, "Gruppen werden nicht kontoübergreifend wiederverwendet");
     }
 
     #[test]
