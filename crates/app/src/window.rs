@@ -156,6 +156,7 @@ mod router_tests {
             unread,
             saved,
             has_content,
+            sort_ms: 0,
         }
     }
 

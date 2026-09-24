@@ -114,7 +114,9 @@ fn main() {
     let mut search_times = Vec::new();
     for _ in 0..50 {
         let t = Instant::now();
-        let rows = db.search("testwort", 100).expect("search");
+        let rows = db
+            .search("testwort", &Scope::Global, Filter::All, None, 100)
+            .expect("search");
         assert!(!rows.is_empty());
         search_times.push(t.elapsed().as_micros());
     }
