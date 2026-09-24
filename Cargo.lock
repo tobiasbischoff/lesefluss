@@ -1249,6 +1249,7 @@ dependencies = [
  "provider-local",
  "quick-xml 0.42.0",
  "reader",
+ "scraper",
  "storage",
  "tokio",
  "url",

@@ -1182,7 +1182,31 @@ impl App {
     }
 
     fn load_reader_html(&self, row: ArticleRow, html: String) {
-        let imgs: Vec<String> = reader::sanitize::image_sources(&html).into_iter().take(25).collect();
+        let imgs: Vec<(String, String)> = {
+            let srcs = reader::sanitize::image_sources(&html);
+            if let Ok(sel) = scraper::Selector::parse("img[src]") {
+                let doc = scraper::Html::parse_fragment(&html);
+                srcs
+                    .into_iter()
+                    .take(25)
+                    .map(|u| {
+                        let alt = doc
+                            .select(&sel)
+                            .find_map(|el| {
+                                if el.value().attr("src") == Some(u.as_str()) {
+                                    Some(el.value().attr("alt").unwrap_or("Bild").to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| "Bild".to_string());
+                        (u, alt)
+                    })
+                    .collect()
+            } else {
+                srcs.into_iter().take(25).map(|u| (u, "Bild".to_string())).collect()
+            }
+        };
         if imgs.is_empty() {
             let doc = self.reader_doc(&row, &html);
             self.reader.load_html_doc(&doc);
@@ -1193,9 +1217,14 @@ impl App {
         let queue = self.pending_media.clone();
         self.net.spawn(async move {
             let mut reps: Vec<(String, String)> = Vec::new();
-            for u in imgs {
-                if let Some((bytes, mime)) = media.get_or_fetch(&http, &u).await {
-                    reps.push((u, provider_local::media::data_uri(&bytes, &mime)));
+            for (u, alt) in imgs {
+                match media.get_or_fetch(&http, &u).await {
+                    Some((bytes, mime)) => {
+                        reps.push((u, provider_local::media::data_uri(&bytes, &mime)));
+                    }
+                    None => {
+                        reps.push((u, provider_local::media::placeholder_data_uri(&alt)));
+                    }
                 }
             }
             if let Ok(mut q) = queue.lock() {
