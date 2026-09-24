@@ -4,6 +4,13 @@
 
 ## Inhalt
 
+> **Stand nach dem Review vom 24.09.2026:** Die ursprüngliche Einschätzung dieses Dokuments
+> („Kern und Sicherheitsrahmen erreicht“) war zu weitgehend. Das technische Review
+> (`docs/review-fertigstellungsplan.md`) fand P0-Fehler in Datenintegrität, Restore und
+> Netzwerkgrenzen; diese sind inzwischen behoben und durch Regressionstests abgesichert.
+> Verbindlich sind heute `docs/review-fertigstellungsplan.md` und `docs/abnahme-protokoll.md`.
+> Die untenstehende DoD-Tabelle ist eine Momentaufnahme vor diesem Review.
+
 - **Performancebericht** (`docs/perf-report.md`): Startzeit, DB-Latenzen bei 100 000 Artikeln,
   Idle-CPU, Speicher, Frame-Pacing — mit Methode, Werkzeug und Rohwerten.
 - **Datenschutzhinweise** (`docs/privacy.md`): Datenorte, Netzwerkzugriffe, Feedly-Datenfluss,
