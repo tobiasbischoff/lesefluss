@@ -325,6 +325,12 @@ CREATE TABLE account_status (
 );
 "#,
     ),
+    (
+        11,
+        r#"
+ALTER TABLE feeds ADD COLUMN user_title TEXT;
+"#,
+    ),
 ];
 
 pub struct Database {
@@ -572,6 +578,74 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Vom Nutzer gesetzter Titel bleibt erhalten, wenn der Feed sie später
+    /// erneut liefert (Publisher-Titel und Nutzertitel sind getrennt).
+    pub fn set_user_title(&self, feed_id: i64, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE feeds SET user_title=?2 WHERE id=?1",
+            params![feed_id, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn display_title(&self, feed_id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(user_title, title) FROM feeds WHERE id=?1",
+                params![feed_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Abbestellen: Feed stilllegen, Inhalte und gemerkte Artikel behalten.
+    pub fn deactivate_feed(&self, feed_id: i64) -> Result<usize> {
+        self.conn
+            .execute("UPDATE feeds SET active=0 WHERE id=?1", params![feed_id])?;
+        let saved: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM articles WHERE feed_id=?1 AND saved=1",
+            params![feed_id],
+            |r| r.get(0),
+        )?;
+        Ok(saved as usize)
+    }
+
+    pub fn group_by_name(&self, account_id: &str, name: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM groups WHERE account_id=?1 AND name=?2",
+                params![account_id, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_feed_read(&self, feed_id: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE articles SET unread=0 WHERE feed_id=?1",
+            params![feed_id],
+        )?)
+    }
+
+    pub fn set_feed_active(&self, feed_id: i64, active: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE feeds SET active=?2 WHERE id=?1",
+            params![feed_id, if active { 1 } else { 0 }],
+        )?;
+        Ok(())
+    }
+
+    pub fn feed_is_active(&self, feed_id: i64) -> Result<bool> {
+        let v: i64 = self.conn.query_row(
+            "SELECT COALESCE(active,1) FROM feeds WHERE id=?1",
+            params![feed_id],
+            |r| r.get(0),
+        )?;
+        Ok(v != 0)
+    }
+
     pub fn update_feed_title(&self, feed_id: i64, title: &str, website: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE feeds SET title=?2, website=COALESCE(?3, website) WHERE id=?1",
@@ -582,7 +656,8 @@ impl Database {
 
     pub fn list_feeds(&self) -> Result<Vec<FeedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, account_id, remote_id, feed_url, title, website, accent FROM feeds ORDER BY lower(title)",
+            "SELECT id, account_id, remote_id, feed_url, COALESCE(user_title, title), website, accent
+             FROM feeds WHERE COALESCE(active,1)=1 ORDER BY lower(COALESCE(user_title, title))",
         )?;
         let mut feeds: Vec<FeedRow> = stmt
             .query_map([], |r| {
@@ -2001,6 +2076,39 @@ mod tests {
             )
             .unwrap();
         "feedly-1".to_string()
+    }
+
+    #[test]
+    fn user_title_survives_publisher_updates() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "https://a.example/f.xml", "Original", None, "#111111").unwrap();
+        db.set_user_title(feed, "Mein Titel").unwrap();
+        db.update_feed_title(feed, "Neuer Publisher-Titel", None).unwrap();
+        assert_eq!(db.display_title(feed).unwrap().as_deref(), Some("Mein Titel"));
+        let feeds = db.list_feeds().unwrap();
+        assert_eq!(feeds[0].title, "Mein Titel");
+    }
+
+    #[test]
+    fn unsubscribing_keeps_saved_articles_and_stops_fetching() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "https://a.example/f.xml", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "kept", "Wichtig", None, None, now, "e", Some("<p>x</p>"), now).unwrap();
+        db.upsert_article(feed, "plain", "Normal", None, None, now, "e", Some("<p>y</p>"), now).unwrap();
+        db.set_saved_by_article_id("kept", true).unwrap();
+        assert!(db.feed_is_active(feed).unwrap());
+        let kept = db.deactivate_feed(feed).unwrap();
+        assert_eq!(kept, 1, "ein gespeicherter Artikel bleibt erhalten");
+        assert!(!db.feed_is_active(feed).unwrap());
+        assert!(db.due_feeds(now).unwrap().is_empty(), "keine Abrufe mehr für stillgelegte Feeds");
+        let articles = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
+        assert_eq!(articles.len(), 2, "Inhalte bleiben lesbar");
+        assert!(articles.iter().any(|a| a.saved));
+        db.set_feed_active(feed, true).unwrap();
+        assert_eq!(db.due_feeds(now).unwrap().len(), 1, "Reabo holt den Bestand wieder");
     }
 
     #[test]

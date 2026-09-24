@@ -637,6 +637,7 @@ impl App {
         app.start_theme_watch();
         app.start_frame_probe();
         app.install_letter_router();
+        app.install_sidebar_context_menu();
         app.wire(factory);
         app.register_actions(application);
         app.install_width_watcher();
@@ -1281,6 +1282,290 @@ impl App {
         }
     }
 
+    /// Kontextmenü für eine Quelle: erreichbar per Rechtsklick, Menütaste
+    /// und `Shift+F10` (§5.1).
+    fn source_context_menu(&self, source: Scope, anchor: &gtk::Widget) {
+        let menu = gio::Menu::new();
+        match source {
+            Scope::Feed(feed_id) => {
+                menu.append(Some("Umbenennen …"), Some("win.rename-feed"));
+                menu.append(Some("Gruppen …"), Some("win.edit-feed-groups"));
+                menu.append(Some("Als gelesen markieren"), Some("win.mark-source-read"));
+                menu.append(Some("Abbestellen …"), Some("win.unsubscribe-feed"));
+            }
+            Scope::Group(group_id) => {
+                menu.append(Some("Gruppe umbenennen …"), Some("win.rename-group"));
+                menu.append(Some("Alle als gelesen markieren"), Some("win.mark-scope-read"));
+                let _ = group_id;
+            }
+            Scope::Account(_) => {
+                menu.append(Some("Aktualisieren"), Some("win.refresh"));
+            }
+            Scope::Global => {
+                menu.append(Some("Aktualisieren"), Some("win.refresh"));
+                menu.append(Some("Alle als gelesen markieren …"), Some("win.mark-scope-read"));
+            }
+        }
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(anchor);
+        popover.set_has_arrow(false);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+            0,
+            0,
+            0,
+            0,
+        )));
+        self.state.borrow_mut().menu_source = Some(source);
+        popover.show();
+    }
+
+    /// Rechtsklick, Menütaste und `Shift+F10` öffnen dasselbe Menü (§5.1).
+    fn install_sidebar_context_menu(&self) {
+        let w = self.weak();
+        let click = gtk::GestureClick::new();
+        click.set_button(3);
+        click.connect_pressed(move |gesture, n_press, x, y| {
+            let Some(app) = w.upgrade() else { return };
+            if n_press != 1 {
+                return;
+            }
+            if let Some(row) = gesture.widget().and_then(|w| w.parent()).and_then(|w| w.parent()) {
+                if let Ok(list_row) = row.clone().downcast::<gtk::ListBoxRow>() {
+                    let index = list_row.index() as usize;
+                    if let Some(Some(source)) = app.sidebar_filters.borrow().get(index).cloned() {
+                        app.sidebar_list.select_row(Some(&list_row));
+                        app.show_feed_menu(source);
+                    }
+                }
+            }
+            let _ = (x, y);
+        });
+        self.sidebar_list.add_controller(click);
+
+        let w = self.weak();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, keyval, _, state| {
+            let Some(app) = w.upgrade() else { return glib::Propagation::Proceed };
+            let menu_key = keyval == gtk::gdk::Key::Menu;
+            let shift_f10 = keyval == gtk::gdk::Key::F10
+                && state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            if !menu_key && !shift_f10 {
+                return glib::Propagation::Proceed;
+            }
+            let Some(row) = app.sidebar_list.selected_row() else {
+                return glib::Propagation::Proceed;
+            };
+            let index = row.index() as usize;
+            let source = app.sidebar_filters.borrow().get(index).cloned().flatten();
+            match source {
+                Some(source) => {
+                    app.show_feed_menu(source);
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
+            }
+        });
+        self.sidebar_list.add_controller(keys);
+    }
+
+    fn show_feed_menu(&self, source: Scope) {
+        let anchor = self.window.clone();
+        self.source_context_menu(source, anchor.upcast_ref());
+    }
+
+    fn current_menu_source(&self) -> Option<Scope> {
+        self.state.borrow().menu_source.clone()
+    }
+
+    fn rename_feed_dialog(&self) {
+        let Some(Scope::Feed(feed_id)) = self.current_menu_source() else { return };
+        let current = self
+            .state
+            .borrow()
+            .feeds
+            .iter()
+            .find(|f| f.id == feed_id)
+            .map(|f| f.title.clone())
+            .unwrap_or_default();
+        let entry = gtk::Entry::builder().text(&current).activates_default(true).build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Feed umbenennen")
+            .body("Der Name wird lokal gespeichert und nicht beim nächsten Abruf überschrieben.")
+            .extra_child(&entry)
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("ok", "Speichern");
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            if resp != "ok" {
+                return;
+            }
+            let Some(app) = w.upgrade() else { return };
+            let title = entry.text().trim().to_string();
+            if title.is_empty() {
+                return;
+            }
+            let worker = app.worker.clone();
+            let w2 = w.clone();
+            app.db_query(
+                move |db| db.set_user_title(feed_id, &title),
+                move |app, _res| {
+                    app.reload_meta_keep();
+                    let _ = w2;
+                },
+            );
+            let _ = worker;
+        });
+    }
+
+    fn edit_feed_groups_dialog(&self) {
+        let Some(Scope::Feed(feed_id)) = self.current_menu_source() else { return };
+        let st = self.state.borrow();
+        let groups: Vec<(i64, String)> = st
+            .groups
+            .iter()
+            .filter(|g| g.account_id == "local")
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+        let current: Vec<i64> = st
+            .feeds
+            .iter()
+            .find(|f| f.id == feed_id)
+            .map(|f| f.groups.clone())
+            .unwrap_or_default();
+        drop(st);
+        let checks: Vec<(i64, gtk::CheckButton)> = groups
+            .iter()
+            .map(|(id, name)| {
+                let check = gtk::CheckButton::builder()
+                    .label(name)
+                    .active(current.contains(id))
+                    .build();
+                (*id, check)
+            })
+            .collect();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        for (_, check) in &checks {
+            list.append(check);
+        }
+        let new_name = gtk::Entry::builder().placeholder_text("Neue Gruppe").build();
+        list.append(&new_name);
+        let dialog = adw::AlertDialog::builder()
+            .heading("Gruppen wählen")
+            .body("Ein Feed darf mehreren Gruppen angehören. Die lokale Bibliothek unterstützt verschachtelte Gruppen.")
+            .extra_child(&list)
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("ok", "Übernehmen");
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            if resp != "ok" {
+                return;
+            }
+            let Some(app) = w.upgrade() else { return };
+            let selected: Vec<i64> = checks
+                .iter()
+                .filter(|(_, c)| c.is_active())
+                .map(|(id, _)| *id)
+                .collect();
+            let wanted = new_name.text().trim().to_string();
+            app.worker.send(move |db| {
+                db.ensure_local_account()?;
+                if !wanted.is_empty() {
+                    if let Some(existing) = db.group_by_name("local", &wanted)? {
+                        db.set_feed_groups(feed_id, &[existing])?;
+                        let mut all = selected.clone();
+                        if !all.contains(&existing) {
+                            all.push(existing);
+                        }
+                        db.set_feed_groups(feed_id, &all)?;
+                    } else {
+                        let gid = db.add_group("local", &wanted, None)?;
+                        let mut all = selected.clone();
+                        all.push(gid);
+                        db.set_feed_groups(feed_id, &all)?;
+                    }
+                } else {
+                    db.set_feed_groups(feed_id, &selected)?;
+                }
+                Ok::<_, storage::StorageError>(())
+            });
+            let w2 = w.clone();
+            app.db_query(
+                |_| Ok::<_, storage::StorageError>(()),
+                move |app, _res| {
+                    app.reload_meta_keep();
+                    let _ = w2;
+                },
+            );
+        });
+    }
+
+    fn unsubscribe_dialog(&self) {
+        let Some(Scope::Feed(feed_id)) = self.current_menu_source() else { return };
+        let title = self
+            .state
+            .borrow()
+            .feeds
+            .iter()
+            .find(|f| f.id == feed_id)
+            .map(|f| f.title.clone())
+            .unwrap_or_else(|| "dieser Feed".into());
+        let dialog = adw::AlertDialog::builder()
+            .heading("Feed abbestellen?")
+            .body(format!(
+                "{title} wird nicht mehr abgerufen. Gespeicherte und ausdrücklich aufbewahrte Artikel bleiben erhalten; ein späteres Wiederabonnieren übernimmt den bisherigen Status."
+            ))
+            .build();
+        dialog.add_response("cancel", "Behalten");
+        dialog.add_response("ok", "Abbestellen");
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            if resp != "ok" {
+                return;
+            }
+            let Some(app) = w.upgrade() else { return };
+            let w2 = w.clone();
+            app.db_query(
+                move |db| {
+                    let saved = db.deactivate_feed(feed_id)?;
+                    Ok::<_, storage::StorageError>(saved)
+                },
+                move |app, res| {
+                    if let Ok(saved) = res {
+                        let msg = if saved > 0 {
+                            format!("Feed abbestellt — {saved} gespeicherte Artikel bleiben erhalten")
+                        } else {
+                            "Feed abbestellt".to_string()
+                        };
+                        app.show_toast(&msg);
+                    }
+                    app.reload_meta_keep();
+                    let _ = w2;
+                },
+            );
+        });
+    }
+
+    fn mark_source_read(&self) {
+        let Some(Scope::Feed(feed_id)) = self.current_menu_source() else { return };
+        self.db_query(
+            move |db| db.mark_feed_read(feed_id),
+            move |app, _res| {
+                app.reload_meta_keep();
+                app.reload_counts();
+            },
+        );
+    }
+
     fn refresh_sidebar(&self) {
         self.sidebar_title.set_subtitle(&self.account_label_for_scope());
         let state = self.state.borrow();
@@ -1294,6 +1579,7 @@ impl App {
         });
         sidebar::rebuild(&self.sidebar_list, &state, &mut filters, &cb);
         self.suppress.set(false);
+        drop(state);
     }
 
     fn toggle_group(&self, gid: i64) {
@@ -3470,6 +3756,10 @@ impl App {
             a.search_entry.grab_focus();
         });
         win_action!("reader-retry", |a| a.reload_current(false));
+        win_action!("rename-feed", |a| a.rename_feed_dialog());
+        win_action!("edit-feed-groups", |a| a.edit_feed_groups_dialog());
+        win_action!("unsubscribe-feed", |a| a.unsubscribe_dialog());
+        win_action!("mark-source-read", |a| a.mark_source_read());
         win_action!("undo", |a| a.undo());
         win_action!("redo", |a| a.redo());
         win_action!("close", |a| a.window.close());
