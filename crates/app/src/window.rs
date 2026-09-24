@@ -657,6 +657,25 @@ impl App {
                 self.show_toast(&format!("Kein Feed gefunden: {message}"));
             }
             NetEvent::FeedlySyncDone { added } => {
+                let queued = {
+                    let mut st = self.state.borrow_mut();
+                    st.feedly_sync_running = false;
+                    std::mem::take(&mut st.feedly_sync_queued)
+                };
+                if queued {
+                    if let Some(token) = feedly_sync::token_from_disk() {
+                        if let Some(account_id) = self
+                            .state
+                            .borrow()
+                            .accounts
+                            .iter()
+                            .find(|(_, k, _)| k == "feedly")
+                            .map(|(id, _, _)| id.clone())
+                        {
+                            self.request_feedly_sync(account_id, token, false);
+                        }
+                    }
+                }
                 let w = self.weak();
                 self.db_query(
                     |db| {
@@ -679,6 +698,7 @@ impl App {
                 }
             }
             NetEvent::FeedlySyncFailed { message } => {
+                self.state.borrow_mut().feedly_sync_running = false;
                 self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
             }
         }
@@ -1897,15 +1917,74 @@ impl App {
     // ── Konto ──
 
     fn do_refresh(&self) {
-        let feeds: Vec<(i64, String)> = self.state.borrow().feeds.iter().map(|f| (f.id, f.feed_url.clone())).collect();
+        let (feeds, feedly_account, scope) = {
+            let st = self.state.borrow();
+            let ids: Vec<i64> = match &st.scope {
+                Scope::Feed(f) => vec![*f],
+                Scope::Group(g) => st.feeds.iter().filter(|f| f.groups.contains(g)).map(|f| f.id).collect(),
+                Scope::Account(a) => st.feeds.iter().filter(|f| &f.account_id == a).map(|f| f.id).collect(),
+                Scope::Global => st.feeds.iter().map(|f| f.id).collect(),
+            };
+            let urls: Vec<(i64, String)> = st
+                .feeds
+                .iter()
+                .filter(|f| f.account_id == "local" && ids.contains(&f.id))
+                .map(|f| (f.id, f.feed_url.clone()))
+                .collect();
+            let feedly = st
+                .accounts
+                .iter()
+                .find(|(_, k, _)| k == "feedly")
+                .map(|(id, _, _)| id.clone());
+            (urls, feedly, st.scope.clone())
+        };
+        if let Some(account_id) = feedly_account {
+            let scope_is_feedly = match &scope {
+                Scope::Account(a) => *a == account_id,
+                _ => true,
+            };
+            if scope_is_feedly {
+                if let Some(token) = feedly_sync::token_from_disk() {
+                    self.request_feedly_sync(account_id, token, true);
+                    self.show_toast("Feedly: Delta-Sync angefordert");
+                    return;
+                }
+            }
+        }
         if feeds.is_empty() {
-            self.show_toast("Noch keine Feeds abonniert (Strg+N)");
+            self.show_toast("Keine lokalen Feeds im aktuellen Bereich (Strg+N)");
             return;
         }
         for (feed_id, url) in feeds {
             self.net.fetch_feed(self.worker.clone(), feed_id, url, true);
         }
         self.show_toast(&format!("Aktualisiere {} Feeds…", self.state.borrow().feeds.len()));
+    }
+
+    /// Startet höchstens einen Feedly-Zyklus; ein laufender wird nicht verdoppelt,
+    /// ein weiterer Wunsch wird für den nächsten Zyklus vermerkt.
+    fn request_feedly_sync(&self, account_id: String, token: String, priority: bool) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st.feedly_sync_running {
+                st.feedly_sync_queued = true;
+                dbg_log("Feedly: Sync läuft bereits, weiterer Wunsch gemerkt");
+                return;
+            }
+            st.feedly_sync_running = true;
+            if priority {
+                st.next_feedly_sync = 0;
+            }
+        }
+        let last_sync = {
+            let st = self.state.borrow();
+            if st.feedly_last_sync > 0 {
+                st.feedly_last_sync
+            } else {
+                now_ms() - 30 * 86_400_000
+            }
+        };
+        feedly_sync::delta_sync(self.worker.clone(), &self.net, token, account_id, last_sync);
     }
 
     fn connect_feedly_dialog(&self) {
@@ -2008,18 +2087,15 @@ impl App {
             };
             if due {
                 if let Some(token) = feedly_sync::token_from_disk() {
-                    let (account_id, last_sync) = {
-                        let st = app.state.borrow();
-                        let acc = st.accounts.iter().find(|(_, k, _)| k == "feedly").map(|(id, _, _)| id.clone());
-                        let ls = if st.feedly_last_sync > 0 {
-                            st.feedly_last_sync
-                        } else {
-                            now_ms() - 30 * 86_400_000
-                        };
-                        (acc, ls)
-                    };
+                    let account_id = app
+                        .state
+                        .borrow()
+                        .accounts
+                        .iter()
+                        .find(|(_, k, _)| k == "feedly")
+                        .map(|(id, _, _)| id.clone());
                     if let Some(account_id) = account_id {
-                        feedly_sync::delta_sync(app.worker.clone(), &app.net, token, account_id, last_sync);
+                        app.request_feedly_sync(account_id, token, false);
                     }
                 }
             }
@@ -2180,14 +2256,27 @@ impl App {
     fn reload_meta_keep(&self) {
         let w = self.weak();
         self.db_query(
-            |db| Ok::<_, storage::StorageError>((db.list_feeds()?, db.list_groups()?, db.counts()?)),
-            move |app, res: storage::Result<(Vec<storage::FeedRow>, Vec<storage::GroupRow>, storage::Counts)>| {
-                let Ok((feeds, groups, counts)) = res else { return };
+            |db| {
+                Ok::<_, storage::StorageError>((
+                    db.list_feeds()?,
+                    db.list_groups()?,
+                    db.counts()?,
+                    db.list_accounts()?,
+                ))
+            },
+            move |app, res: storage::Result<(
+                Vec<storage::FeedRow>,
+                Vec<storage::GroupRow>,
+                storage::Counts,
+                Vec<(String, String, String)>,
+            )>| {
+                let Ok((feeds, groups, counts, accounts)) = res else { return };
                 {
                     let mut st = app.state.borrow_mut();
                     st.feeds = feeds;
                     st.groups = groups;
                     st.counts = counts;
+                    st.accounts = accounts;
                 }
                 app.refresh_sidebar();
                 app.load_page(false);
@@ -2464,6 +2553,7 @@ impl App {
         style.line_height = p.reader_line_height;
         drop(style);
         self.media.set_max_bytes((p.media_mb as u64) * 1024 * 1024);
+        self.net.set_refresh_minutes(p.refresh_min);
         self.sync_store(false);
     }
 
@@ -2675,8 +2765,11 @@ impl App {
         let w = self.weak();
         refresh.connect_value_notify(move |row| {
             if let Some(app) = w.upgrade() {
-                app.prefs.borrow_mut().refresh_min = row.value() as i64;
-                app.save_pref("refresh_min", &(row.value() as i64).to_string());
+                let minutes = row.value() as i64;
+                app.prefs.borrow_mut().refresh_min = minutes;
+                app.save_pref("refresh_min", &minutes.to_string());
+                app.net.set_refresh_minutes(minutes);
+                app.state.borrow_mut().next_feedly_sync = 0;
             }
         });
         let w = self.weak();

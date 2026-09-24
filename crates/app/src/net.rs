@@ -7,6 +7,13 @@ use storage::{FetchState, NewArticle};
 use tokio::sync::Semaphore;
 
 pub const BASE_INTERVAL_MS: i64 = 30 * 60 * 1000;
+pub const MIN_INTERVAL_MS: i64 = 5 * 60 * 1000;
+pub const MAX_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Intervall in Millisekunden, begrenzt auf 5 Minuten … 24 Stunden.
+pub fn interval_from_minutes(minutes: i64) -> i64 {
+    minutes.clamp(5, 1440) * 60 * 1000
+}
 
 #[derive(Clone, Debug)]
 pub enum NetEvent {
@@ -44,6 +51,7 @@ pub struct Net {
     tx: std::sync::mpsc::Sender<NetEvent>,
     rt: tokio::runtime::Runtime,
     http: HttpClient,
+    interval_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 fn global_sem() -> &'static Semaphore {
@@ -75,9 +83,10 @@ pub fn content_hash_hex(text: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-pub fn backoff_ms(error_count: i64) -> i64 {
+pub fn backoff_ms(base: i64, error_count: i64) -> i64 {
+    let base = base.max(MIN_INTERVAL_MS);
     let shift = error_count.clamp(0, 4);
-    (BASE_INTERVAL_MS << shift).min(24 * 60 * 60 * 1000)
+    (base.saturating_mul(1 << shift)).min(MAX_INTERVAL_MS)
 }
 
 impl Net {
@@ -89,12 +98,21 @@ impl Net {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        Self { events, tx, rt, http: HttpClient::new() }
+        Self {
+            events,
+            tx,
+            rt,
+            http: HttpClient::new(),
+            interval_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+                interval_from_minutes(30),
+            )),
+        }
     }
 
     pub fn spawn_scheduler(&self, worker: DbWorker) {
         let net_self = NetHandle {
             tx: self.tx.clone(),
+            interval_ms: self.interval_ms.clone(),
             rt_handle: self.rt.handle().clone(),
             http: self.http.clone(),
         };
@@ -123,8 +141,10 @@ impl Net {
         let http = self.http.clone();
         let tx = self.tx.clone();
         let handle = self.rt.handle().clone();
+        let interval = self.interval_ms.clone();
         handle.spawn(async move {
-            fetch_and_store(worker, http, tx, feed_id, url, force).await;
+            let base = interval.load(std::sync::atomic::Ordering::Relaxed);
+            fetch_and_store(worker, http, tx, feed_id, url, force, base).await;
         });
     }
 
@@ -138,6 +158,11 @@ impl Net {
 
     pub fn http(&self) -> HttpClient {
         self.http.clone()
+    }
+
+    pub fn set_refresh_minutes(&self, minutes: i64) {
+        self.interval_ms
+            .store(interval_from_minutes(minutes), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn spawn<F>(&self, fut: F)
@@ -167,6 +192,7 @@ impl Net {
 #[derive(Clone)]
 struct NetHandle {
     tx: std::sync::mpsc::Sender<NetEvent>,
+    interval_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
     rt_handle: tokio::runtime::Handle,
     http: HttpClient,
 }
@@ -176,8 +202,10 @@ impl NetHandle {
         let http = self.http.clone();
         let tx = self.tx.clone();
         let handle = self.rt_handle.clone();
+        let interval = self.interval_ms.clone();
         handle.spawn(async move {
-            fetch_and_store(worker, http, tx, feed_id, url, force).await;
+            let base = interval.load(std::sync::atomic::Ordering::Relaxed);
+            fetch_and_store(worker, http, tx, feed_id, url, force, base).await;
         });
     }
 }
@@ -193,6 +221,7 @@ where
         .ok()?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_store(
     worker: DbWorker,
     http: HttpClient,
@@ -200,6 +229,7 @@ async fn fetch_and_store(
     feed_id: i64,
     url: String,
     force: bool,
+    base_interval_ms: i64,
 ) {
     let _ = tx.send(NetEvent::FetchStarted(feed_id));
     let host = url::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
@@ -226,11 +256,13 @@ async fn fetch_and_store(
         }
     }
 
+    let requested_url = url.clone();
     let outcome = http.fetch_feed(&url, st.etag.as_deref(), st.last_modified.as_deref()).await;
     let now = storage::now_ms();
+    let interval_ms = if force { MIN_INTERVAL_MS } else { base_interval_ms };
     match outcome {
         Ok(FetchOutcome::NotModified) => {
-            let next = now + jitter(BASE_INTERVAL_MS);
+            let next = now + jitter(interval_ms);
             let keep = st.clone();
             let _ = db_call(&worker, move |db| {
                 db.set_fetch_state(
@@ -249,6 +281,12 @@ async fn fetch_and_store(
             let _ = tx.send(NetEvent::FetchNotModified(feed_id));
         }
         Ok(FetchOutcome::Fetched { bytes, etag, last_modified, final_url }) => {
+            let _ = db_call(&worker, {
+                let requested = requested_url.clone();
+                let final_for_alias = final_url.clone();
+                move |db| db.record_feed_alias(feed_id, &requested, &final_for_alias)
+            })
+            .await;
             let parsed = tokio::task::spawn_blocking(move || provider_local::parse_feed(&bytes)).await;
             match parsed {
                 Ok(Ok(pf)) => {
@@ -298,7 +336,7 @@ async fn fetch_and_store(
                                 etag,
                                 last_modified,
                                 last_fetch_ms: Some(now),
-                                next_fetch_ms: Some(now + jitter(BASE_INTERVAL_MS)),
+                                next_fetch_ms: Some(now + jitter(interval_ms)),
                                 error_count: 0,
                                 last_error: None,
                             },
@@ -335,7 +373,7 @@ async fn fail(
     now: i64,
 ) {
     let errors = prev_errors + 1;
-    let next = now + jitter(backoff_ms(errors));
+    let next = now + jitter(backoff_ms(interval_from_minutes(30), errors));
     let msg2 = message.clone();
     let _ = db_call(worker, move |db| db.update_fetch_error(feed_id, errors, &msg2, next, now)).await;
     let _ = tx.send(NetEvent::FetchFailed { feed_id, message });

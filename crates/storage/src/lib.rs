@@ -299,6 +299,18 @@ UPDATE articles SET unsynced=1 WHERE EXISTS (
     SELECT 1 FROM outbox o WHERE o.entity_id=articles.id AND o.status='failed');
 "#,
     ),
+    (
+        9,
+        r#"
+CREATE TABLE IF NOT EXISTS feed_aliases (
+    feed_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    final_url TEXT NOT NULL,
+    seen_ms INTEGER NOT NULL,
+    PRIMARY KEY (feed_id, url)
+);
+"#,
+    ),
 ];
 
 pub struct Database {
@@ -981,6 +993,29 @@ impl Database {
             )
             .optional()?;
         Ok(row.unwrap_or_default())
+    }
+
+    pub fn record_feed_alias(&self, feed_id: i64, url: &str, final_url: &str) -> Result<()> {
+        if url == final_url {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO feed_aliases(feed_id, url, final_url, seen_ms) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(feed_id, url) DO UPDATE SET final_url=excluded.final_url, seen_ms=excluded.seen_ms",
+            params![feed_id, url, final_url, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn feed_alias(&self, feed_id: i64, url: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT final_url FROM feed_aliases WHERE feed_id=?1 AND url=?2",
+                params![feed_id, url],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn set_fetch_state(&self, feed_id: i64, st: &FetchState) -> Result<()> {

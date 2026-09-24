@@ -24,6 +24,8 @@ pub struct UiState {
     pub unread_guard: HashSet<String>,
     pub last_opened: HashMap<(Scope, Filter), (i64, String)>,
     pub fetching: HashSet<i64>,
+    pub feedly_sync_running: bool,
+    pub feedly_sync_queued: bool,
 }
 
 impl Default for UiState {
@@ -47,6 +49,8 @@ impl Default for UiState {
             unread_guard: HashSet::new(),
             last_opened: HashMap::new(),
             fetching: HashSet::new(),
+            feedly_sync_running: false,
+            feedly_sync_queued: false,
         }
     }
 }
