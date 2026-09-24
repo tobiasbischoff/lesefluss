@@ -32,7 +32,7 @@ webkit6 = "0.6"
 
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
 feed-rs = "2.4.0"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "json"] }
 url = "2"
 ammonia = "4.2"
 scraper = "0.27"

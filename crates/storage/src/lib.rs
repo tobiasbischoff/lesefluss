@@ -29,6 +29,7 @@ pub struct GroupRow {
     pub id: i64,
     pub name: String,
     pub parent_id: Option<i64>,
+    pub remote_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +55,7 @@ pub struct Counts {
     pub total: i64,
     pub per_feed: Vec<(i64, i64)>,
     pub per_group: Vec<(i64, i64)>,
+    pub per_account: Vec<(String, i64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,6 +63,7 @@ pub enum Scope {
     Global,
     Feed(i64),
     Group(i64),
+    Account(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -195,6 +198,13 @@ CREATE TABLE read_positions (
 );
 "#,
     ),
+    (
+        3,
+        r#"
+ALTER TABLE feeds ADD COLUMN remote_id TEXT;
+ALTER TABLE groups ADD COLUMN remote_id TEXT;
+"#,
+    ),
 ];
 
 pub struct Database {
@@ -252,6 +262,122 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    pub fn upsert_account(&self, id: &str, kind: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO accounts(id, kind, name, created_ms) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            params![id, kind, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, kind, name FROM accounts ORDER BY kind, name")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn upsert_feed_remote(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+        feed_url: &str,
+        title: &str,
+        website: Option<&str>,
+    ) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM feeds WHERE account_id=?1 AND remote_id=?2",
+                params![account_id, remote_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE feeds SET title=?2, website=COALESCE(?3, website), feed_url=?4 WHERE id=?1",
+                params![id, title, website, feed_url],
+            )?;
+            return Ok(id);
+        }
+        let existing_url: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM feeds WHERE account_id=?1 AND feed_url=?2",
+                params![account_id, feed_url],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing_url {
+            self.conn.execute(
+                "UPDATE feeds SET remote_id=?2, title=?3 WHERE id=?1",
+                params![id, remote_id, title],
+            )?;
+            return Ok(id);
+        }
+        self.conn.execute(
+            "INSERT INTO feeds(account_id, remote_id, feed_url, title, website, added_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![account_id, remote_id, feed_url, title, website, now_ms()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn upsert_group_remote(&self, account_id: &str, remote_id: &str, name: &str) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM groups WHERE account_id=?1 AND remote_id=?2",
+                params![account_id, remote_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            self.conn.execute("UPDATE groups SET name=?2 WHERE id=?1", params![id, name])?;
+            return Ok(id);
+        }
+        self.conn.execute(
+            "INSERT INTO groups(account_id, remote_id, name) VALUES (?1,?2,?3)",
+            params![account_id, remote_id, name],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn feed_id_by_remote(&self, account_id: &str, remote_id: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM feeds WHERE account_id=?1 AND remote_id=?2",
+                params![account_id, remote_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_read_by_article_id(&self, article_id: &str, read: bool) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE articles SET unread=?2 WHERE id=?1",
+            params![article_id, if read { 0 } else { 1 }],
+        )?)
+    }
+
+    pub fn set_saved_by_article_id(&self, article_id: &str, saved: bool) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE articles SET saved=?2 WHERE id=?1",
+            params![article_id, if saved { 1 } else { 0 }],
+        )?)
+    }
+
+    pub fn saved_ids_for_account(&self, account_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
+             WHERE f.account_id=?1 AND a.saved=1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
     pub fn ensure_local_account(&self) -> Result<String> {
@@ -316,9 +442,11 @@ impl Database {
     }
 
     pub fn list_groups(&self) -> Result<Vec<GroupRow>> {
-        let mut stmt = self.conn.prepare("SELECT id, name, parent_id FROM groups ORDER BY name")?;
+        let mut stmt = self.conn.prepare("SELECT id, name, parent_id, remote_id FROM groups ORDER BY name")?;
         let rows = stmt
-            .query_map([], |r| Ok(GroupRow { id: r.get(0)?, name: r.get(1)?, parent_id: r.get(2)? }))?
+            .query_map([], |r| {
+                Ok(GroupRow { id: r.get(0)?, name: r.get(1)?, parent_id: r.get(2)?, remote_id: r.get(3)? })
+            })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
@@ -533,6 +661,10 @@ impl Database {
                 where_clauses.push("a.feed_id=?".into());
                 args.push(Box::new(*id));
             }
+            Scope::Account(acc) => {
+                where_clauses.push("f.account_id=?".into());
+                args.push(Box::new(acc.clone()));
+            }
             Scope::Group(_) => {}
         }
         let join_groups = matches!(scope, Scope::Group(_));
@@ -627,6 +759,11 @@ impl Database {
              JOIN feed_groups fg ON fg.feed_id=a.feed_id WHERE a.unread=1 GROUP BY fg.group_id",
         )?;
         c.per_group = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT f.account_id, COUNT(*) FROM articles a JOIN feeds f ON f.id=a.feed_id
+             WHERE a.unread=1 AND f.account_id != 'local' GROUP BY f.account_id",
+        )?;
+        c.per_account = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         Ok(c)
     }
 

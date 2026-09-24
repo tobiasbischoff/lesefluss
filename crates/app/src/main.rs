@@ -2,6 +2,7 @@ mod dbworker;
 mod fixtures;
 mod list;
 mod model;
+mod feedly_sync;
 mod net;
 mod opml;
 mod reader;

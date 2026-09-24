@@ -1246,6 +1246,7 @@ dependencies = [
  "glib",
  "gtk4",
  "libadwaita",
+ "provider-feedly",
  "provider-local",
  "quick-xml 0.42.0",
  "reader",
@@ -1725,6 +1726,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "provider-feedly"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "provider-local"
 version = "0.1.0"
 dependencies = [
@@ -1737,10 +1750,6 @@ dependencies = [
  "tokio",
  "url",
 ]
-
-[[package]]
-name = "provider_feedly"
-version = "0.1.0"
 
 [[package]]
 name = "quick-xml"
@@ -1946,6 +1955,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

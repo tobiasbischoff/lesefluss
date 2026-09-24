@@ -14,6 +14,7 @@ domain = { workspace = true }
 reader = { workspace = true }
 storage = { workspace = true }
 provider-local = { workspace = true }
+provider-feedly = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 quick-xml = { workspace = true }

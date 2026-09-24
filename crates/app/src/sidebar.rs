@@ -16,6 +16,16 @@ pub fn rebuild(
 
     add_section(list, filters_out, "Bibliothek");
     add_smart_row(list, filters_out, "mail-unread-symbolic", "Ungelesen", state.counts.unread, true, Source::Global);
+    for (id, kind, name) in &state.accounts {
+        if kind != "feedly" {
+            continue;
+        }
+        let unread = state.counts.per_account.iter().find(|(a, _)| a == id).map(|(_, c)| *c).unwrap_or(0);
+        let w = icon_text_badge(Some("cloud-fill-symbolic"), name, unread, true);
+        let row = gtk::ListBoxRow::builder().child(&w).css_classes(vec!["lf-sidebar-row".to_string()]).build();
+        list.append(&row);
+        filters_out.push(Some(Source::Account(id.clone())));
+    }
 
     add_section(list, filters_out, "Abonnements");
     let mut grouped: Vec<i64> = Vec::new();

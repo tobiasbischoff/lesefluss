@@ -31,6 +31,12 @@ pub enum NetEvent {
         input: String,
         message: String,
     },
+    FeedlySyncDone {
+        added: usize,
+    },
+    FeedlySyncFailed {
+        message: String,
+    },
 }
 
 pub struct Net {
@@ -120,6 +126,14 @@ impl Net {
         handle.spawn(async move {
             fetch_and_store(worker, http, tx, feed_id, url, force).await;
         });
+    }
+
+    pub fn event(&self, ev: NetEvent) {
+        let _ = self.tx.send(ev);
+    }
+
+    pub fn event_sender(&self) -> std::sync::mpsc::Sender<NetEvent> {
+        self.tx.clone()
     }
 
     pub fn http(&self) -> HttpClient {

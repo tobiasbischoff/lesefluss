@@ -12,6 +12,8 @@ pub struct UiState {
     pub rows: Vec<ListRow>,
     pub feeds: Vec<FeedRow>,
     pub groups: Vec<GroupRow>,
+    pub accounts: Vec<(String, String, String)>,
+    pub next_feedly_sync: i64,
     pub counts: Counts,
     pub selected: Option<(i64, String)>,
     pub collapsed: HashSet<i64>,
@@ -32,6 +34,8 @@ impl Default for UiState {
             rows: Vec::new(),
             feeds: Vec::new(),
             groups: Vec::new(),
+            accounts: Vec::new(),
+            next_feedly_sync: 0,
             counts: Counts::default(),
             selected: None,
             collapsed: HashSet::new(),
@@ -108,6 +112,10 @@ impl UiState {
                 }
             }
         }
+    }
+
+    pub fn last_sync_for_feedly(&self) -> i64 {
+        self.last_sync.unwrap_or(storage::now_ms() - 30 * 86_400_000)
     }
 
     pub fn feed_unread(&self, feed_id: i64) -> i64 {

@@ -1,4 +1,5 @@
 use crate::dbworker::{DbWorker, JobOut};
+use crate::feedly_sync;
 use crate::list;
 use crate::model::{ListRow, UiState};
 use crate::net::{Net, NetEvent};
@@ -14,6 +15,10 @@ use std::rc::{Rc, Weak};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use storage::{ArticleRow, Counts, FeedRow, GroupRow, Filter, Scope};
+
+fn now_ms_stub() -> i64 {
+    storage::now_ms()
+}
 
 pub fn dbg_log(msg: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -139,6 +144,7 @@ impl App {
             .action_name("win.add-feed")
             .build();
         let library_menu = gio::Menu::new();
+        library_menu.append(Some("Feedly verbinden …"), Some("win.connect-feedly"));
         library_menu.append(Some("OPML importieren …"), Some("win.import-opml"));
         library_menu.append(Some("OPML exportieren …"), Some("win.export-opml"));
         library_menu.append(Some("Backup erstellen …"), Some("win.backup"));
@@ -445,6 +451,15 @@ impl App {
             NetEvent::DiscoveryFailed { message, .. } => {
                 self.show_toast(&format!("Kein Feed gefunden: {message}"));
             }
+            NetEvent::FeedlySyncDone { added } => {
+                self.reload_meta_keep();
+                if added > 0 {
+                    self.show_toast(&format!("Feedly: {added} neue Artikel"));
+                }
+            }
+            NetEvent::FeedlySyncFailed { message } => {
+                self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
+            }
         }
     }
 
@@ -473,16 +488,25 @@ impl App {
                 let groups = db.list_groups()?;
                 let counts = db.counts()?;
                 let last = db.last_sync("local")?;
-                Ok::<_, storage::StorageError>((feeds, groups, counts, last))
+                let accounts = db.list_accounts()?;
+                Ok::<_, storage::StorageError>((feeds, groups, counts, last, accounts))
             },
-            move |app, res: storage::Result<(Vec<FeedRow>, Vec<GroupRow>, Counts, Option<i64>)>| {
-                let Ok((feeds, groups, counts, last)) = res else { return };
+            move |app, res: storage::Result<(Vec<FeedRow>, Vec<GroupRow>, Counts, Option<i64>, Vec<(String, String, String)>)>| {
+                let Ok((feeds, groups, counts, last, accounts)) = res else { return };
+                let has_feedly_account = accounts.iter().any(|(_, k, _)| k == "feedly");
                 {
                     let mut st = app.state.borrow_mut();
                     st.feeds = feeds;
                     st.groups = groups;
                     st.counts = counts;
                     st.last_sync = last;
+                    st.accounts = accounts;
+                }
+                app.start_feedly_scheduler();
+                if std::env::var("LF_FEEDLY_CONNECT").is_ok() && !has_feedly_account {
+                    if let Some(token) = feedly_sync::token_from_disk() {
+                        app.start_feedly(token);
+                    }
                 }
                 if let Some(ms) = last {
                     app.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(ms)));
@@ -757,6 +781,12 @@ impl App {
         }
         match &st.scope {
             Scope::Global => "Ungelesen".into(),
+            Scope::Account(a) => st
+                .accounts
+                .iter()
+                .find(|(id, _, _)| id == a)
+                .map(|(_, _, n)| n.clone())
+                .unwrap_or_else(|| "Konto".into()),
             Scope::Group(g) => st.groups.iter().find(|x| &x.id == g).map(|x| x.name.clone()).unwrap_or_else(|| "Gruppe".into()),
             Scope::Feed(f) => st.feed_title(*f),
         }
@@ -1151,6 +1181,7 @@ impl App {
         let label = self.scope_label_now();
         let unread = match &st.scope {
             Scope::Global => st.counts.unread,
+            Scope::Account(a) => st.counts.per_account.iter().find(|(id, _)| id == a).map(|(_, c)| *c).unwrap_or(0),
             Scope::Feed(f) => st.feed_unread(*f),
             Scope::Group(g) => st.group_unread(*g),
         };
@@ -1388,6 +1419,86 @@ impl App {
             self.net.fetch_feed(self.worker.clone(), feed_id, url, true);
         }
         self.show_toast(&format!("Aktualisiere {} Feeds…", self.state.borrow().feeds.len()));
+    }
+
+    fn connect_feedly_dialog(&self) {
+        match feedly_sync::token_from_disk() {
+            Some(token) => self.start_feedly(token),
+            None => {
+                let entry = gtk::Entry::builder()
+                    .placeholder_text("Feedly Developer Token einfügen")
+                    .visibility(false)
+                    .build();
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Feedly verbinden")
+                    .body("Privater Testzugang: Token unter feedly.com/v3/auth/dev bzw. via PKCE-Flow erzeugen und hier einfügen. Speicherung lokal (chmod 600); Schlüsselbund-Integration folgt.")
+                    .extra_child(&entry)
+                    .build();
+                dialog.add_response("cancel", "Abbrechen");
+                dialog.add_response("ok", "Verbinden");
+                dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("ok"));
+                dialog.set_close_response("cancel");
+                let w = self.weak();
+                dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+                    let Some(app) = w.upgrade() else { return };
+                    if resp != "ok" {
+                        return;
+                    }
+                    let token = entry.text().trim().to_string();
+                    if token.is_empty() {
+                        return;
+                    }
+                    if feedly_sync::save_token(&token).is_ok() {
+                        app.start_feedly(token);
+                    }
+                });
+            }
+        }
+    }
+
+    fn start_feedly(&self, token: String) {
+        self.show_toast("Feedly: Erst-Sync gestartet …");
+        feedly_sync::initial_sync(self.worker.clone(), &self.net, token);
+    }
+
+    fn start_feedly_scheduler(&self) {
+        let has_feedly = self.state.borrow().accounts.iter().any(|(_, k, _)| k == "feedly");
+        if !has_feedly {
+            return;
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            if st.next_feedly_sync == 0 {
+                st.next_feedly_sync = now_ms() + 60_000;
+            }
+        }
+        let w = self.weak();
+        glib::timeout_add_local(Duration::from_secs(60), move || {
+            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
+            let due = {
+                let mut st = app.state.borrow_mut();
+                if st.accounts.iter().any(|(_, k, _)| k == "feedly") && now_ms() >= st.next_feedly_sync {
+                    st.next_feedly_sync = now_ms() + 15 * 60_000;
+                    true
+                } else {
+                    false
+                }
+            };
+            if due {
+                if let Some(token) = feedly_sync::token_from_disk() {
+                    let (account_id, last_sync) = {
+                        let st = app.state.borrow();
+                        let acc = st.accounts.iter().find(|(_, k, _)| k == "feedly").map(|(id, _, _)| id.clone());
+                        (acc, st.last_sync_for_feedly())
+                    };
+                    if let Some(account_id) = account_id {
+                        feedly_sync::delta_sync(app.worker.clone(), &app.net, token, account_id, last_sync);
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     fn import_opml_dialog(&self) {
@@ -2000,6 +2111,7 @@ impl App {
         win_action!("back", |a| a.back());
         win_action!("refresh", |a| a.do_refresh());
         win_action!("add-feed", |a| a.add_feed_dialog());
+        win_action!("connect-feedly", |a| a.connect_feedly_dialog());
         win_action!("import-opml", |a| a.import_opml_dialog());
         win_action!("export-opml", |a| a.export_opml());
         win_action!("backup", |a| a.backup_dialog());
