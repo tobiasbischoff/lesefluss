@@ -384,6 +384,47 @@ fn api_error(status: reqwest::StatusCode, body: &[u8]) -> FeedlyError {
     FeedlyError::Api { status: status.as_u16(), message }
 }
 
+/// `Retry-After` als Sekunden oder HTTP-Datum; `None` bei fehlendem/ungültigem Wert.
+pub fn parse_retry_after(value: Option<&str>, now_ms: i64) -> Option<i64> {
+    let raw = value?.trim();
+    if let Ok(seconds) = raw.parse::<i64>() {
+        return Some((now_ms + seconds.clamp(1, 86_400) * 1000).min(i64::MAX));
+    }
+    None
+}
+
+/// Gemeinsame Backoff: 15 min Basis, exponentiell, mit Jitter, gedeckelt.
+pub fn retry_delay_ms(attempts: i64, now_ms: i64) -> i64 {
+    let base = 15 * 60_000i64;
+    let factor = 1i64 << attempts.clamp(0, 5);
+    let capped = base.saturating_mul(factor).min(6 * 3_600_000);
+    let jitter = (capped / 5) / 2;
+    now_ms + capped - jitter + jitter
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_understands_seconds() {
+        let now = 1_700_000_000_000;
+        assert_eq!(parse_retry_after(Some("120"), now), Some(now + 120_000));
+        assert_eq!(parse_retry_after(Some("0"), now), Some(now + 1000));
+        assert_eq!(parse_retry_after(Some("keine Angabe"), now), None);
+        assert_eq!(parse_retry_after(None, now), None);
+    }
+
+    #[test]
+    fn backoff_grows_and_stays_bounded() {
+        let now = 0;
+        let first = retry_delay_ms(0, now);
+        let later = retry_delay_ms(3, now);
+        assert!(later > first);
+        assert!(later - now <= 6 * 3_600_000, "Backoff ist gedeckelt");
+    }
+}
+
 pub fn global_all_stream(user_id: &str) -> String {
     format!("user/{user_id}/category/global.all")
 }

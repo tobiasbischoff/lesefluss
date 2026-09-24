@@ -51,6 +51,20 @@ pub fn external_uri_allowed(raw: &str) -> bool {
     }
 }
 
+/// Kontozustände nach §13.1 in lesbare Worte übersetzen.
+pub fn status_label(status: &str) -> &'static str {
+    match status {
+        "initial_sync" => "Erstsynchronisation läuft",
+        "syncing" => "Synchronisation läuft",
+        "ready" => "Verbunden und aktuell",
+        "offline" => "Offline — lokale Daten nutzbar",
+        "rate_limited" => "Drosselung durch Feedly, späterer Versuch",
+        "auth_required" => "Erneute Anmeldung erforderlich",
+        "degraded" => "Eingeschränkt synchronisiert",
+        _ => "Getrennt",
+    }
+}
+
 pub fn read_intent(was_unread: bool) -> bool {
     was_unread
 }
@@ -181,6 +195,15 @@ mod router_tests {
             has_content,
             sort_ms: 0,
         }
+    }
+
+    #[test]
+    fn account_states_are_translated() {
+        assert_eq!(status_label("ready"), "Verbunden und aktuell");
+        assert_eq!(status_label("auth_required"), "Erneute Anmeldung erforderlich");
+        assert_eq!(status_label("rate_limited"), "Drosselung durch Feedly, späterer Versuch");
+        assert_eq!(status_label("offline"), "Offline — lokale Daten nutzbar");
+        assert_eq!(status_label("unbekannt"), "Getrennt");
     }
 
     #[test]
@@ -721,6 +744,7 @@ impl App {
                 self.show_toast(&format!("Kein Feed gefunden: {message}"));
             }
             NetEvent::FeedlySyncDone { added } => {
+                self.refresh_feedly_status();
                 let queued = {
                     let mut st = self.state.borrow_mut();
                     st.feedly_sync_running = false;
@@ -760,6 +784,7 @@ impl App {
                 }
             }
             NetEvent::FeedlySyncFailed { message } => {
+                self.refresh_feedly_status();
                 self.state.borrow_mut().feedly_sync_running = false;
                 self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
             }
@@ -2389,6 +2414,44 @@ impl App {
         );
     }
 
+    /// Liest den gespeicherten Kontozustand (inkl. hängender Änderungen).
+    fn refresh_feedly_status(&self) {
+        let Some(account_id) = self
+            .state
+            .borrow()
+            .accounts
+            .iter()
+            .find(|(_, k, _)| k == "feedly")
+            .map(|(id, _, _)| id.clone())
+        else {
+            return;
+        };
+        self.db_query(
+            move |db| {
+                let status = db.account_status(&account_id)?;
+                let stuck = db.stuck_changes(&account_id)?;
+                Ok::<_, storage::StorageError>((status, stuck))
+            },
+            move |app, res| {
+                let Ok((status, stuck)) = res else { return };
+                let mut entry = status.map(|(s, d)| (s, d));
+                if let Some((s, d)) = entry.as_mut() {
+                    if stuck > 0 && *s == "ready" {
+                        *s = "degraded".to_string();
+                        *d = Some(format!("{stuck} Änderung(en) nicht bestätigt"));
+                    }
+                }
+                let label = entry
+                    .as_ref()
+                    .map(|(s, _)| status_label(s))
+                    .unwrap_or("Verbunden");
+                let text = format!("Feedly: {label}");
+                app.last_sync_label.set_label(&text);
+                app.state.borrow_mut().feedly_status = entry;
+            },
+        );
+    }
+
     fn reload_meta_keep(&self) {
         let w = self.weak();
         self.db_query(
@@ -2825,14 +2888,33 @@ impl App {
         let local = adw::ActionRow::builder().title("Lokale Bibliothek").subtitle("Aktiv — Feeds, OPML, Suche, Offline").build();
         grp.add(&local);
         let feedly_state = {
-            let connected = self.state.borrow().accounts.iter().any(|(_, k, _)| k == "feedly");
-            if connected {
-                format!(
-                    "Verbunden (Delta-Sync alle {} min)",
-                    self.prefs.borrow().refresh_min
-                )
+            let st = self.state.borrow();
+            let connected = st.accounts.iter().any(|(_, k, _)| k == "feedly");
+            if !connected {
+                "Nicht verbunden (Menü → Feedly verbinden …)".to_string()
             } else {
-                "Nicht verbunden (Zahnrad → Feedly verbinden)".to_string()
+                let acc = st
+                    .accounts
+                    .iter()
+                    .find(|(_, k, _)| k == "feedly")
+                    .map(|(id, _, _)| id.clone())
+                    .unwrap_or_default();
+                match &st.feedly_status {
+                    Some((status, detail)) => {
+                        let base = status_label(status);
+                        match detail {
+                            Some(d) => format!("{base} — {d}"),
+                            None => base.to_string(),
+                        }
+                    }
+                    None => {
+                        let _ = acc;
+                        format!(
+                            "Verbunden · Delta-Sync alle {} min",
+                            self.prefs.borrow().refresh_min
+                        )
+                    }
+                }
             }
         };
         let feedly = adw::ActionRow::builder().title("Feedly").subtitle(feedly_state).build();

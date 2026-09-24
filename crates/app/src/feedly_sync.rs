@@ -271,6 +271,8 @@ async fn ingest_entries(
 
 pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
     let tx = net.event_sender();
+    set_status(&worker, "initial_sync", None);
+    let status_account = String::new();
     net.spawn(async move {
         let client = pf::FeedlyClient::new(token);
         let res: storage::Result<usize> = async {
@@ -345,10 +347,15 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
         .await;
         match res {
             Ok(added) => {
+                set_status(&worker, "ready", Some(&status_account));
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added });
             }
             Err(e) => {
-                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed { message: e.to_string() });
+                let (status, detail) = classify_storage(&e);
+                set_status(&worker, status, Some(&status_account));
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                    message: detail.unwrap_or_else(|| e.to_string()),
+                });
             }
         }
     });
@@ -432,8 +439,25 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
     });
 }
 
+fn set_status(worker: &DbWorker, status: &str, account_id: Option<&str>) {
+    let worker = worker.clone();
+    let value = status.to_string();
+    let acc = account_id.map(str::to_string);
+    std::thread::spawn(move || {
+        let _ = worker.send(move |db| {
+            if let Some(acc) = &acc {
+                db.set_account_status(acc, &value, None)?;
+            }
+            Ok::<_, storage::StorageError>(())
+        });
+    });
+}
+
 pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String, last_sync_ms: i64) {
     let tx = net.event_sender();
+    set_status(&worker, "syncing", Some(&account_id));
+    let status_account = account_id.clone();
+    let _ = &status_account;
     net.spawn(async move {
         let client = pf::FeedlyClient::new(token);
         let res: storage::Result<usize> = async {
@@ -522,13 +546,47 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
         .await;
         match res {
             Ok(added) => {
+                set_status(&worker, "ready", Some(&status_account));
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added });
             }
             Err(e) => {
-                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed { message: e.to_string() });
+                let (status, detail) = classify_storage(&e);
+                set_status(&worker, status, Some(&status_account));
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                    message: detail.unwrap_or_else(|| e.to_string()),
+                });
             }
         }
     });
+}
+
+/// Fehlerklasse nach §13.1: 401/403 → auth_required, 429 → rate_limited,
+/// Netzwerk/5xx → offline, 404 → degraded, sonst degraded.
+pub fn classify_storage(error: &storage::StorageError) -> (&'static str, Option<String>) {
+    match error {
+        storage::StorageError::Schema(msg) if msg.contains("429") => ("rate_limited", None),
+        storage::StorageError::Schema(msg) if msg.contains("api 401") || msg.contains("api 403") => {
+            ("auth_required", Some("Anmeldung erforderlich — bitte neu verbinden".into()))
+        }
+        storage::StorageError::Io(_) => ("offline", None),
+        _ => ("degraded", None),
+    }
+}
+
+pub fn classify(error: &pf::FeedlyError) -> (&'static str, Option<String>) {
+    match error {
+        pf::FeedlyError::Api { status: 401, .. } | pf::FeedlyError::Api { status: 403, .. } => {
+            ("auth_required", Some("Anmeldung erforderlich — bitte neu verbinden".into()))
+        }
+        pf::FeedlyError::Api { status: 429, message } => {
+            ("rate_limited", Some(format!("Drosselung durch Feedly: {message}")))
+        }
+        pf::FeedlyError::Api { status: 404, .. } => {
+            ("degraded", Some("Einige Objekte sind nicht mehr verfügbar".into()))
+        }
+        pf::FeedlyError::Http(_) => ("offline", None),
+        _ => ("degraded", None),
+    }
 }
 
 fn string_err(e: String) -> storage::StorageError {

@@ -312,6 +312,19 @@ CREATE TABLE IF NOT EXISTS feed_aliases (
 );
 "#,
     ),
+    (
+        10,
+        r#"
+CREATE TABLE account_status (
+    account_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    detail TEXT,
+    last_success_ms INTEGER,
+    last_error_ms INTEGER,
+    pending_changes INTEGER NOT NULL DEFAULT 0
+);
+"#,
+    ),
 ];
 
 pub struct Database {
@@ -1431,6 +1444,54 @@ impl Database {
              WHERE id=?1 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?4)",
             params![article_id, if saved { 1 } else { 0 }, now_ms(), account_id],
         ).map_err(Into::into)
+    }
+
+    /// Kontozustand nach §13.1: disconnected, initial_sync, ready, syncing,
+    /// offline, rate_limited, auth_required, degraded.
+    pub fn set_account_status(
+        &self,
+        account_id: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let now = now_ms();
+        let success = if status == "ready" { Some(now) } else { None };
+        let error = if matches!(status, "rate_limited" | "auth_required" | "degraded") {
+            Some(now)
+        } else {
+            None
+        };
+        self.conn.execute(
+            "INSERT INTO account_status(account_id, status, detail, last_success_ms, last_error_ms)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(account_id) DO UPDATE SET
+               status=excluded.status,
+               detail=excluded.detail,
+               last_success_ms=COALESCE(?4, account_status.last_success_ms),
+               last_error_ms=COALESCE(?5, account_status.last_error_ms)",
+            params![account_id, status, detail, success, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn account_status(&self, account_id: &str) -> Result<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT status, detail FROM account_status WHERE account_id=?1",
+                params![account_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn stuck_changes(&self, account_id: &str) -> Result<i64> {
+        let v: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND status='failed'",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        Ok(v)
     }
 
     pub fn pull_generation(&self, account_id: &str) -> Result<i64> {
