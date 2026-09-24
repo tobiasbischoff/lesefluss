@@ -1,3 +1,5 @@
+pub mod media;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

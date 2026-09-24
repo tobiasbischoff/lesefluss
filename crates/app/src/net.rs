@@ -61,6 +61,14 @@ fn jitter(ms: i64) -> i64 {
     (ms as f64 * factor) as i64
 }
 
+pub fn content_hash_hex(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 pub fn backoff_ms(error_count: i64) -> i64 {
     let shift = error_count.clamp(0, 4);
     (BASE_INTERVAL_MS << shift).min(24 * 60 * 60 * 1000)
@@ -112,6 +120,17 @@ impl Net {
         handle.spawn(async move {
             fetch_and_store(worker, http, tx, feed_id, url, force).await;
         });
+    }
+
+    pub fn http(&self) -> HttpClient {
+        self.http.clone()
+    }
+
+    pub fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.rt.spawn(fut);
     }
 
     pub fn discover(&self, input: String) {
@@ -219,17 +238,32 @@ async fn fetch_and_store(
             let parsed = tokio::task::spawn_blocking(move || provider_local::parse_feed(&bytes)).await;
             match parsed {
                 Ok(Ok(pf)) => {
+                    let site = pf.website.clone();
+                    let mut media_map: Vec<(String, Vec<String>)> = Vec::new();
                     let items: Vec<NewArticle> = pf
                         .items
                         .into_iter()
-                        .map(|i| NewArticle {
-                            id: i.identity,
-                            title: i.title,
-                            author: i.author,
-                            url: i.url,
-                            published_ms: i.published_ms.unwrap_or(now),
-                            excerpt: i.excerpt,
-                            html: i.content_html,
+                        .map(|i| {
+                            let (html, imgs) = match i.content_html {
+                                Some(h) => {
+                                    let base = i.url.clone().or_else(|| site.clone());
+                                    let cr = reader::sanitize::sanitize(&h, base.as_deref());
+                                    (Some(cr.html), cr.images)
+                                }
+                                None => (None, Vec::new()),
+                            };
+                            let content_hash = html.as_deref().map(content_hash_hex);
+                            media_map.push((i.identity.clone(), imgs));
+                            NewArticle {
+                                id: i.identity,
+                                title: i.title,
+                                author: i.author,
+                                url: i.url,
+                                published_ms: i.published_ms.unwrap_or(now),
+                                excerpt: i.excerpt,
+                                html,
+                                content_hash,
+                            }
                         })
                         .collect();
                     let title = pf.title.clone();
@@ -237,6 +271,9 @@ async fn fetch_and_store(
                     let final_url2 = final_url.clone();
                     let res = db_call(&worker, move |db| {
                         let up = db.upsert_articles(feed_id, &items, now)?;
+                        for (id, imgs) in &media_map {
+                            db.set_article_media(feed_id, id, imgs)?;
+                        }
                         if let Some(t) = pf.title.as_deref() {
                             db.update_feed_title(feed_id, t, pf.website.as_deref())?;
                         }

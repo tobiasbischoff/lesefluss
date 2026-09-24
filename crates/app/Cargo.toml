@@ -16,6 +16,7 @@ storage = { workspace = true }
 provider-local = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+quick-xml = { workspace = true }
 glib = { workspace = true }
 gtk = { workspace = true }
 adw = { workspace = true }

@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+ammonia = { workspace = true }
+scraper = { workspace = true }
+html5ever = { workspace = true }
+markup5ever_rcdom = { workspace = true }
+url = { workspace = true }

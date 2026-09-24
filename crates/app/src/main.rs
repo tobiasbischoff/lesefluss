@@ -3,6 +3,7 @@ mod fixtures;
 mod list;
 mod model;
 mod net;
+mod opml;
 mod reader;
 mod seed;
 mod sidebar;
@@ -17,20 +18,17 @@ thread_local! {
     static INSTANCE: std::cell::RefCell<Option<Rc<window::App>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn data_dir() -> std::path::PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(home).join(".local/share")
-        });
-    base.join("lesefluss")
-}
-
 fn main() -> gtk::glib::ExitCode {
-    let dir = data_dir();
+    let dir = window::data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let db_path = dir.join("library.db");
+    let pending = dir.join("restore.pending");
+    if pending.exists() {
+        let _ = std::fs::remove_file(dir.join("library.db-wal"));
+        let _ = std::fs::remove_file(dir.join("library.db-shm"));
+        let _ = std::fs::copy(&pending, &db_path);
+        let _ = std::fs::remove_file(&pending);
+    }
     let worker = dbworker::DbWorker::start(db_path);
     let net = Rc::new(net::Net::start());
     net.spawn_scheduler(worker.clone());

@@ -1,3 +1,4 @@
+pub mod sanitize;
 pub mod tokens;
 
 use tokens::Tokens;

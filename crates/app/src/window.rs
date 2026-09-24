@@ -26,6 +26,18 @@ pub fn now_ms() -> i64 {
     storage::now_ms()
 }
 
+pub fn data_dir() -> std::path::PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(home).join(".local/share")
+        });
+    base.join("lesefluss")
+}
+
+const JS_CAPTURE_POS: &str = "(()=>{const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return '-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return idx+':'+Math.round(off);})()";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SelectionCause {
     Unknown,
@@ -62,7 +74,9 @@ pub struct App {
     pub state: RefCell<UiState>,
     pub worker: DbWorker,
     pub net: Rc<Net>,
+    pub media: std::sync::Arc<provider_local::media::MediaCache>,
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
+    pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<(ArticleRow, String, Vec<(String, String)>)>>>,
     pub drain_active: Cell<bool>,
     pub preview_timer: RefCell<Option<glib::SourceId>>,
     pub search_timer: RefCell<Option<glib::SourceId>>,
@@ -124,10 +138,21 @@ impl App {
             .tooltip_text("Feed hinzufügen (Strg+N)")
             .action_name("win.add-feed")
             .build();
+        let library_menu = gio::Menu::new();
+        library_menu.append(Some("OPML importieren …"), Some("win.import-opml"));
+        library_menu.append(Some("OPML exportieren …"), Some("win.export-opml"));
+        library_menu.append(Some("Backup erstellen …"), Some("win.backup"));
+        library_menu.append(Some("Aus Backup wiederherstellen …"), Some("win.restore"));
+        let btn_library = gtk::MenuButton::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Bibliothek: OPML, Backup")
+            .menu_model(&library_menu)
+            .build();
         let sidebar_header = adw::HeaderBar::builder()
             .title_widget(&adw::WindowTitle::new("Lesefluss", "Lokale Bibliothek"))
             .build();
         sidebar_header.pack_start(&btn_hamburger);
+        sidebar_header.pack_end(&btn_library);
         sidebar_header.pack_end(&btn_refresh);
         sidebar_header.pack_end(&btn_add);
 
@@ -269,7 +294,15 @@ impl App {
             state: RefCell::new(UiState::default()),
             worker,
             net,
+            media: std::sync::Arc::new(
+                provider_local::media::MediaCache::new(
+                    provider_local::media::cache_dir(),
+                    512 * 1024 * 1024,
+                )
+                .expect("Mediencache-Verzeichnis"),
+            ),
             pending_db: RefCell::new(Vec::new()),
+            pending_media: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             drain_active: Cell::new(false),
             preview_timer: RefCell::new(None),
             search_timer: RefCell::new(None),
@@ -335,6 +368,21 @@ impl App {
     }
 
     fn drain_once(&self) {
+        if let Ok(mut q) = self.pending_media.lock() {
+            let jobs: Vec<_> = q.drain(..).collect();
+            drop(q);
+            for (row, mut html, reps) in jobs {
+                let current = self.reader.current.borrow().clone();
+                if current.as_deref() != Some(row.id.as_str()) {
+                    continue;
+                }
+                for (u, d) in &reps {
+                    html = html.replace(u, d).replace(&u.replace('&', "&amp;"), d);
+                }
+                let doc = self.reader_doc(&row, &html);
+                self.reader.load_html_doc(&doc);
+            }
+        }
         loop {
             let net_event = self.net.events.try_recv().ok();
             if let Some(ev) = net_event {
@@ -439,6 +487,27 @@ impl App {
                 if let Some(ms) = last {
                     app.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(ms)));
                 }
+                let w2 = app.worker.clone();
+                let media = std::sync::Arc::clone(&app.media);
+                app.db_query(
+                    move |db| {
+                        let pinned = db.pinned_media_urls()?;
+                        let now = storage::now_ms();
+                        let pruned = db.prune_old_read(now, 90)?;
+                        Ok::<_, storage::StorageError>((pinned, pruned))
+                    },
+                    move |_app, res: storage::Result<(Vec<String>, usize)>| {
+                        if let Ok((pinned, pruned)) = res {
+                            if pruned > 0 {
+                                dbg_log(&format!("Aufbewahrung: {pruned} alte gelesene Artikel bereinigt"));
+                            }
+                            let keys: std::collections::HashSet<String> =
+                                pinned.iter().map(|u| provider_local::media::key_of(u)).collect();
+                            media.prune(&keys);
+                        }
+                        let _ = w2;
+                    },
+                );
                 app.refresh_sidebar();
                 app.load_page(false);
                 if let Ok(list) = std::env::var("LF_SUBSCRIBE") {
@@ -718,6 +787,12 @@ impl App {
         self.reader.title.set_title(&row.title);
         self.reader.title.set_subtitle(&row.feed_title);
         self.update_reader_buttons(&row);
+        let prev = self.reader.current.borrow().clone();
+        if let Some(prev) = prev {
+            if prev != id {
+                self.capture_position(&prev);
+            }
+        }
         *self.reader.current.borrow_mut() = Some(id.clone());
         self.reader.show_loading();
 
@@ -732,25 +807,7 @@ impl App {
                     return;
                 }
                 match res {
-                    Ok(Some(html)) => {
-                        let style = app.reader.style.borrow();
-                        let rs = reader::ReaderStyle {
-                            font_size: style.font_size,
-                            measure_ch: style.measure_ch,
-                            line_height: style.line_height,
-                        };
-                        let tokens = *app.tokens.borrow();
-                        let doc = reader::ReaderDocument {
-                            kicker: &row.feed_title,
-                            title: &row.title,
-                            author: row.author.as_deref(),
-                            source: "",
-                            published: &fmt_full(row.published_ms),
-                            content_html: &html,
-                        };
-                        let html_doc = reader::render_document(&doc, &tokens, &rs);
-                        app.reader.load_html_doc(&html_doc);
-                    }
+                    Ok(Some(html)) => app.load_reader_html(row, html),
                     _ => app.reader.show_error(),
                 }
                 let _ = w;
@@ -1104,6 +1161,120 @@ impl App {
         self.reader.title.set_subtitle("");
     }
 
+    fn reader_doc(&self, row: &ArticleRow, html: &str) -> String {
+        let style = self.reader.style.borrow();
+        let rs = reader::ReaderStyle {
+            font_size: style.font_size,
+            measure_ch: style.measure_ch,
+            line_height: style.line_height,
+        };
+        let tokens = *self.tokens.borrow();
+        let published = fmt_full(row.published_ms);
+        let doc = reader::ReaderDocument {
+            kicker: &row.feed_title,
+            title: &row.title,
+            author: row.author.as_deref(),
+            source: "",
+            published: &published,
+            content_html: html,
+        };
+        reader::render_document(&doc, &tokens, &rs)
+    }
+
+    fn load_reader_html(&self, row: ArticleRow, html: String) {
+        let imgs: Vec<String> = reader::sanitize::image_sources(&html).into_iter().take(25).collect();
+        if imgs.is_empty() {
+            let doc = self.reader_doc(&row, &html);
+            self.reader.load_html_doc(&doc);
+            return;
+        }
+        let media = std::sync::Arc::clone(&self.media);
+        let http = self.net.http();
+        let queue = self.pending_media.clone();
+        self.net.spawn(async move {
+            let mut reps: Vec<(String, String)> = Vec::new();
+            for u in imgs {
+                if let Some((bytes, mime)) = media.get_or_fetch(&http, &u).await {
+                    reps.push((u, provider_local::media::data_uri(&bytes, &mime)));
+                }
+            }
+            if let Ok(mut q) = queue.lock() {
+                q.push((row, html, reps));
+            }
+        });
+    }
+
+    fn capture_position(&self, id: &str) {
+        let Some(row) = self.state.borrow().article(id) else { return };
+        let w = self.weak();
+        let id2 = id.to_string();
+        let row_db = row.clone();
+        self.db_query(
+            move |db| db.content_hash(row_db.feed_id, &row_db.id),
+            move |app, res: storage::Result<Option<String>>| {
+                let hash = res.ok().flatten();
+                let w2 = w.clone();
+                let id3 = id2.clone();
+                app.reader.webview.evaluate_javascript(
+                    JS_CAPTURE_POS,
+                    None,
+                    None,
+                    None::<&gio::Cancellable>,
+                    move |res| {
+                        let Ok(v) = res else { return };
+                        let s = v.to_string();
+                        let mut parts = s.split(':');
+                        let idx: i64 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                        let off: i64 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                        if idx < 0 {
+                            return;
+                        }
+                        if let Some(app) = w2.upgrade() {
+                            if let Some(r) = app.state.borrow().article(&id3) {
+                                let _ = app.worker.send(move |db| {
+                                    db.save_read_position(r.feed_id, &r.id, hash.as_deref(), idx, off)
+                                });
+                            }
+                        }
+                    },
+                );
+                let _ = w;
+            },
+        );
+    }
+
+    fn after_load_finished(&self) {
+        if self.reader.pending_scroll.get() >= 0.0 {
+            self.reader.restore_scroll();
+            return;
+        }
+        let Some(id) = self.reader.current.borrow().clone() else { return };
+        let Some(row) = self.state.borrow().article(&id) else { return };
+        let w = self.weak();
+        self.db_query(
+            move |db| {
+                let pos = db.read_position(row.feed_id, &row.id)?;
+                let hash = db.content_hash(row.feed_id, &row.id)?;
+                Ok::<_, storage::StorageError>((pos, hash))
+            },
+            move |app, res: storage::Result<(Option<(Option<String>, i64, i64)>, Option<String>)>| {
+                let Ok((pos, hash)) = res else { return };
+                let Some((saved_hash, idx, off)) = pos else { return };
+                if saved_hash.is_some() && saved_hash != hash {
+                    return;
+                }
+                if idx == 0 && off == 0 {
+                    return;
+                }
+                let js = format!(
+                    "(()=>{{const els=document.querySelectorAll('article.lf-body > *');const el=els[{idx}];if(el){{window.scrollTo(0, el.getBoundingClientRect().top+window.scrollY+{off});}}}})()"
+                );
+                app.reader.webview.evaluate_javascript(&js, None, None, None::<&gio::Cancellable>, |_| {});
+                let _ = w;
+            },
+        );
+    }
+
     fn zoom(&self, delta: f64) {
         {
             let mut s = self.reader.style.borrow_mut();
@@ -1121,30 +1292,17 @@ impl App {
         let Some(id) = self.reader.current.borrow().clone() else { return };
         let Some(row) = self.state.borrow().article(&id) else { return };
         let w = self.weak();
+        let fid = row.feed_id;
+        let rid = row.id.clone();
         self.db_query(
-            move |db| db.content_html(row.feed_id, &row.id),
+            move |db| db.content_html(fid, &rid),
             move |app, res: storage::Result<Option<String>>| {
                 let Ok(Some(html)) = res else { return };
-                let style = app.reader.style.borrow();
-                let rs = reader::ReaderStyle {
-                    font_size: style.font_size,
-                    measure_ch: style.measure_ch,
-                    line_height: style.line_height,
-                };
-                let tokens = *app.tokens.borrow();
-                let published = fmt_full(row.published_ms);
-                let doc = reader::ReaderDocument {
-                    kicker: &row.feed_title,
-                    title: &row.title,
-                    author: row.author.as_deref(),
-                    source: "",
-                    published: &published,
-                    content_html: &html,
-                };
                 if preserve {
                     let pane = Rc::clone(&app.reader);
                     let wv = pane.webview.clone();
-                    let html_doc = reader::render_document(&doc, &tokens, &rs);
+                    let row2 = row.clone();
+                    let w2 = w.clone();
                     wv.evaluate_javascript(
                         "window.scrollY",
                         None,
@@ -1156,12 +1314,13 @@ impl App {
                                     pane.pending_scroll.set(v.to_double());
                                 }
                             }
-                            pane.load_html_doc(&html_doc);
+                            if let Some(app) = w2.upgrade() {
+                                app.load_reader_html(row2, html);
+                            }
                         },
                     );
                 } else {
-                    let html_doc = reader::render_document(&doc, &tokens, &rs);
-                    app.reader.load_html_doc(&html_doc);
+                    app.load_reader_html(row, html);
                 }
                 let _ = w;
             },
@@ -1200,6 +1359,241 @@ impl App {
             self.net.fetch_feed(self.worker.clone(), feed_id, url, true);
         }
         self.show_toast(&format!("Aktualisiere {} Feeds…", self.state.borrow().feeds.len()));
+    }
+
+    fn import_opml_dialog(&self) {
+        let dlg = gtk::FileDialog::builder().title("OPML-Datei wählen").build();
+        let w = self.weak();
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(file) = dlg.open_future(None::<&gtk::Window>).await else { return };
+            let Some(path) = file.path() else { return };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) if b.len() <= crate::opml::MAX_OPML_BYTES => b,
+                Ok(_) => {
+                    if let Some(app) = w.upgrade() {
+                        app.show_toast("OPML-Datei zu groß (Limit 20 MiB)");
+                    }
+                    return;
+                }
+                Err(e) => {
+                    if let Some(app) = w.upgrade() {
+                        app.show_toast(&format!("Lesefehler: {e}"));
+                    }
+                    return;
+                }
+            };
+            let Ok(xml) = String::from_utf8(bytes) else {
+                if let Some(app) = w.upgrade() {
+                    app.show_toast("OPML-Datei ist kein UTF-8");
+                }
+                return;
+            };
+            match crate::opml::parse_opml(&xml) {
+                Ok(draft) => {
+                    if let Some(app) = w.upgrade() {
+                        app.show_opml_preview(draft);
+                    }
+                }
+                Err(e) => {
+                    if let Some(app) = w.upgrade() {
+                        app.show_toast(&format!("OPML-Fehler: {e}"));
+                    }
+                }
+            }
+        });
+    }
+
+    fn show_opml_preview(&self, draft: crate::opml::OpmlDraft) {
+        let known: std::collections::HashSet<String> =
+            self.state.borrow().feeds.iter().map(|f| f.feed_url.clone()).collect();
+        let new: Vec<&crate::opml::OpmlFeed> = draft.feeds.iter().filter(|f| !known.contains(&f.xml_url)).collect();
+        let existing = draft.feeds.len() - new.len();
+        let listing: String = new
+            .iter()
+            .take(40)
+            .map(|f| format!("• {} — {}\n", f.title, f.xml_url))
+            .collect();
+        let body = format!(
+            "{} neue Feeds, {} bestehende (bleiben erhalten, Gruppen werden zusammengeführt).{}",
+            new.len(),
+            existing,
+            if draft.errors.is_empty() {
+                String::new()
+            } else {
+                format!(" {} ungültige Einträge übersprungen.", draft.errors.len())
+            }
+        );
+        let label = gtk::Label::builder()
+            .label(&listing)
+            .xalign(0.0)
+            .wrap(true)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&label)
+            .max_content_height(280)
+            .min_content_height(80)
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("OPML-Import")
+            .body(body)
+            .extra_child(&scroll)
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("import", &format!("{} Feeds importieren", new.len()));
+        dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("import"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            let Some(app) = w.upgrade() else { return };
+            if resp == "import" {
+                app.import_opml(draft.clone());
+            }
+        });
+    }
+
+    fn import_opml(&self, draft: crate::opml::OpmlDraft) {
+        let w = self.weak();
+        self.db_query(
+            move |db| {
+                db.ensure_local_account()?;
+                let groups = db.list_groups()?;
+                let mut group_ids: std::collections::HashMap<String, i64> =
+                    groups.into_iter().map(|g| (g.name, g.id)).collect();
+                let mut new_feeds: Vec<(i64, String)> = Vec::new();
+                let mut merged = 0usize;
+                for f in &draft.feeds {
+                    let mut gids: Vec<i64> = Vec::new();
+                    for gname in &f.groups {
+                        let gid = match group_ids.get(gname) {
+                            Some(g) => *g,
+                            None => {
+                                let g = db.add_group("local", gname, None)?;
+                                group_ids.insert(gname.clone(), g);
+                                g
+                            }
+                        };
+                        gids.push(gid);
+                    }
+                    match db.feed_id_by_url(&f.xml_url)? {
+                        Some(fid) => {
+                            let existing = db.list_feeds()?.into_iter().find(|x| x.id == fid);
+                            let mut all = existing.map(|x| x.groups).unwrap_or_default();
+                            for g in gids {
+                                if !all.contains(&g) {
+                                    all.push(g);
+                                }
+                            }
+                            db.set_feed_groups(fid, &all)?;
+                            merged += 1;
+                        }
+                        None => {
+                            let accent = crate::window::ACCENTS[f.xml_url.len() % crate::window::ACCENTS.len()];
+                            let fid = db.add_feed("local", &f.xml_url, &f.title, f.html_url.as_deref(), accent)?;
+                            db.set_feed_groups(fid, &gids)?;
+                            new_feeds.push((fid, f.xml_url.clone()));
+                        }
+                    }
+                }
+                Ok::<_, storage::StorageError>((new_feeds, merged))
+            },
+            move |app, res: storage::Result<(Vec<(i64, String)>, usize)>| {
+                let Ok((new_feeds, merged)) = res else { return };
+                for (fid, url) in &new_feeds {
+                    app.net.fetch_feed(app.worker.clone(), *fid, url.clone(), true);
+                }
+                app.reload_meta_keep();
+                app.show_toast(&format!("{} Feeds importiert, {} zusammengeführt", new_feeds.len(), merged));
+                let _ = w;
+            },
+        );
+    }
+
+    fn reload_meta_keep(&self) {
+        let w = self.weak();
+        self.db_query(
+            |db| Ok::<_, storage::StorageError>((db.list_feeds()?, db.list_groups()?, db.counts()?)),
+            move |app, res: storage::Result<(Vec<storage::FeedRow>, Vec<storage::GroupRow>, storage::Counts)>| {
+                let Ok((feeds, groups, counts)) = res else { return };
+                {
+                    let mut st = app.state.borrow_mut();
+                    st.feeds = feeds;
+                    st.groups = groups;
+                    st.counts = counts;
+                }
+                app.refresh_sidebar();
+                app.load_page(false);
+                let _ = w;
+            },
+        );
+    }
+
+    fn export_opml(&self) {
+        let feeds: Vec<crate::opml::OpmlFeed> = {
+            let st = self.state.borrow();
+            st.feeds
+                .iter()
+                .map(|f| crate::opml::OpmlFeed {
+                    title: f.title.clone(),
+                    xml_url: f.feed_url.clone(),
+                    html_url: None,
+                    groups: f
+                        .groups
+                        .iter()
+                        .filter_map(|g| st.groups.iter().find(|x| x.id == *g).map(|x| x.name.clone()))
+                        .collect(),
+                })
+                .collect()
+        };
+        let dlg = gtk::FileDialog::builder().title("OPML-Export speichern unter").build();
+        dlg.set_initial_name(Some("lesefluss-abonnements.opml"));
+        let w = self.weak();
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else { return };
+            let Some(path) = file.path() else { return };
+            let xml = crate::opml::build_opml(&feeds);
+            let tmp = path.with_extension("opml.tmp");
+            let ok = std::fs::write(&tmp, xml.as_bytes()).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+            if let Some(app) = w.upgrade() {
+                app.show_toast(if ok { "OPML exportiert" } else { "Export fehlgeschlagen" });
+            }
+        });
+    }
+
+    fn backup_dialog(&self) {
+        let dlg = gtk::FileDialog::builder().title("Backup speichern unter").build();
+        dlg.set_initial_name(Some("lesefluss-backup.db"));
+        let w = self.weak();
+        let worker = self.worker.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else { return };
+            let Some(path) = file.path() else { return };
+            let res = worker.send(move |db| db.backup_to(&path)).recv();
+            let ok = res.ok().and_then(|b| b.downcast_ref::<storage::Result<()>>().map(|r| r.is_ok())).unwrap_or(false);
+            if let Some(app) = w.upgrade() {
+                app.show_toast(if ok { "Backup erstellt" } else { "Backup fehlgeschlagen" });
+            }
+        });
+    }
+
+    fn restore_dialog(&self) {
+        let dlg = gtk::FileDialog::builder().title("Backup-Datei wählen").build();
+        let w = self.weak();
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(file) = dlg.open_future(None::<&gtk::Window>).await else { return };
+            let Some(path) = file.path() else { return };
+            let pending = data_dir().join("restore.pending");
+            let ok = std::fs::copy(&path, &pending).is_ok();
+            if let Some(app) = w.upgrade() {
+                app.show_toast(if ok {
+                    "Backup vorgemerkt — wird beim nächsten Start wiederhergestellt"
+                } else {
+                    "Wiederherstellung fehlgeschlagen"
+                });
+            }
+        });
     }
 
     fn add_feed_dialog(&self) {
@@ -1525,7 +1919,7 @@ impl App {
         self.reader.webview.connect_load_changed(move |_, event| {
             if event == webkit6::LoadEvent::Finished {
                 if let Some(app) = w.upgrade() {
-                    app.reader.restore_scroll();
+                    app.after_load_finished();
                 }
             }
         });
@@ -1577,6 +1971,10 @@ impl App {
         win_action!("back", |a| a.back());
         win_action!("refresh", |a| a.do_refresh());
         win_action!("add-feed", |a| a.add_feed_dialog());
+        win_action!("import-opml", |a| a.import_opml_dialog());
+        win_action!("export-opml", |a| a.export_opml());
+        win_action!("backup", |a| a.backup_dialog());
+        win_action!("restore", |a| a.restore_dialog());
         win_action!("mark-scope-read", |a| a.mark_scope_dialog());
         win_action!("toggle-read", |a| a.toggle_read());
         win_action!("toggle-saved", |a| a.toggle_saved());

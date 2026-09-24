@@ -79,6 +79,7 @@ pub struct NewArticle {
     pub published_ms: i64,
     pub excerpt: String,
     pub html: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,7 +168,34 @@ CREATE VIRTUAL TABLE article_fts USING fts5(
     tokenize = 'unicode61 remove_diacritics 2'
 );
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+CREATE TABLE article_media (
+    feed_id INTEGER NOT NULL,
+    article_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    PRIMARY KEY (feed_id, article_id, url)
+);
+CREATE TABLE tombstones (
+    feed_id INTEGER NOT NULL,
+    article_id TEXT NOT NULL,
+    deleted_ms INTEGER NOT NULL,
+    PRIMARY KEY (feed_id, article_id)
+);
+CREATE TABLE read_positions (
+    feed_id INTEGER NOT NULL,
+    article_id TEXT NOT NULL,
+    content_hash TEXT,
+    anchor_idx INTEGER NOT NULL DEFAULT 0,
+    offset_px INTEGER NOT NULL DEFAULT 0,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (feed_id, article_id)
+);
+"#,
+    ),
+];
 
 pub struct Database {
     conn: Connection,
@@ -328,6 +356,9 @@ impl Database {
         html: Option<&str>,
         now: i64,
     ) -> Result<bool> {
+        if self.is_tombstoned(feed_id, id)? {
+            return Ok(false);
+        }
         let exists: bool = self.conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE feed_id=?1 AND id=?2",
             params![feed_id, id],
@@ -377,6 +408,14 @@ impl Database {
         let (mut added, mut updated) = (0usize, 0usize);
         let feed_title: String = tx.query_row("SELECT title FROM feeds WHERE id=?1", params![feed_id], |r| r.get(0))?;
         for item in items {
+            let tomb: bool = tx.query_row(
+                "SELECT COUNT(*) FROM tombstones WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, item.id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            if tomb {
+                continue;
+            }
             let exists: bool = tx.query_row(
                 "SELECT COUNT(*) FROM articles WHERE feed_id=?1 AND id=?2",
                 params![feed_id, item.id],
@@ -401,10 +440,10 @@ impl Database {
             if let Some(html) = &item.html {
                 let plain = strip_html(html);
                 tx.execute(
-                    "INSERT INTO article_contents(feed_id, article_id, html, plain, fetched_ms)
-                     VALUES (?1,?2,?3,?4,?5)
-                     ON CONFLICT(feed_id, article_id) DO UPDATE SET html=excluded.html, plain=excluded.plain, fetched_ms=excluded.fetched_ms",
-                    params![feed_id, item.id, html, plain, now],
+                    "INSERT INTO article_contents(feed_id, article_id, html, plain, hash, fetched_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(feed_id, article_id) DO UPDATE SET html=excluded.html, plain=excluded.plain, hash=excluded.hash, fetched_ms=excluded.fetched_ms",
+                    params![feed_id, item.id, html, plain, item.content_hash, now],
                 )?;
                 let rowid: i64 = tx.query_row(
                     "SELECT rowid FROM articles WHERE feed_id=?1 AND id=?2",
@@ -658,6 +697,101 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn set_article_media(&self, feed_id: i64, article_id: &str, urls: &[String]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM article_media WHERE feed_id=?1 AND article_id=?2",
+            params![feed_id, article_id],
+        )?;
+        for u in urls {
+            tx.execute(
+                "INSERT OR IGNORE INTO article_media(feed_id, article_id, url) VALUES (?1,?2,?3)",
+                params![feed_id, article_id, u],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pinned_media_urls(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT m.url FROM article_media m JOIN articles a
+             ON a.feed_id=m.feed_id AND a.id=m.article_id WHERE a.saved=1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn is_tombstoned(&self, feed_id: i64, article_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tombstones WHERE feed_id=?1 AND article_id=?2",
+            params![feed_id, article_id],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
+    }
+
+    pub fn prune_old_read(&self, now_ms: i64, days: i64) -> Result<usize> {
+        let cutoff = now_ms - days * 86_400_000;
+        let tx = self.conn.unchecked_transaction()?;
+        let ids: Vec<(i64, String)> = tx
+            .prepare(
+                "SELECT feed_id, id FROM articles WHERE unread=0 AND saved=0 AND first_seen_ms < ?1",
+            )?
+            .query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for (feed_id, id) in &ids {
+            tx.execute("DELETE FROM article_contents WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
+            tx.execute("DELETE FROM article_media WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
+            tx.execute("DELETE FROM read_positions WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
+            tx.execute("DELETE FROM articles WHERE feed_id=?1 AND id=?2", params![feed_id, id])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO tombstones(feed_id, article_id, deleted_ms) VALUES (?1,?2,?3)",
+                params![feed_id, id, now_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
+    pub fn save_read_position(&self, feed_id: i64, article_id: &str, content_hash: Option<&str>, anchor_idx: i64, offset_px: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO read_positions(feed_id, article_id, content_hash, anchor_idx, offset_px, updated_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(feed_id, article_id) DO UPDATE SET
+               content_hash=excluded.content_hash, anchor_idx=excluded.anchor_idx,
+               offset_px=excluded.offset_px, updated_ms=excluded.updated_ms",
+            params![feed_id, article_id, content_hash, anchor_idx, offset_px, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn read_position(&self, feed_id: i64, article_id: &str) -> Result<Option<(Option<String>, i64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT content_hash, anchor_idx, offset_px FROM read_positions WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, article_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn content_hash(&self, feed_id: i64, article_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT hash FROM article_contents WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, article_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
+        self.conn.execute("VACUUM INTO ?1", params![path.to_string_lossy().to_string()])?;
+        Ok(())
+    }
+
     pub fn update_fetch_error(&self, feed_id: i64, error_count: i64, last_error: &str, next_fetch_ms: i64, last_fetch_ms: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO feed_fetch_state(feed_id, error_count, last_error, next_fetch_ms, last_fetch_ms)
@@ -820,6 +954,7 @@ mod tests {
                 published_ms: now - i * 60_000,
                 excerpt: "e".into(),
                 html: Some(format!("<p>Text {i}</p>")),
+                content_hash: None,
             })
             .collect();
         let (added, updated) = db.upsert_articles(feed, &items, now).unwrap();

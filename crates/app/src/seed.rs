@@ -26,6 +26,7 @@ pub fn seed_fixtures(db: &storage::Database) -> storage::Result<()> {
             published_ms: a.published_at,
             excerpt: a.excerpt.clone(),
             html: lib.contents.get(&a.id).cloned(),
+            content_hash: None,
         });
     }
     for (feed_key, items) in by_feed {
