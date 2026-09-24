@@ -52,6 +52,15 @@ pub fn external_uri_allowed(raw: &str) -> bool {
 }
 
 /// Kontozustände nach §13.1 in lesbare Worte übersetzen.
+/// Sortierrichtung aus den Einstellungen lesen (Fallback: neueste zuerst).
+fn self_newest_first(db: &storage::Database) -> bool {
+    db.get_pref("newest_first")
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 pub fn status_label(status: &str) -> &'static str {
     match status {
         "initial_sync" => "Erstsynchronisation läuft",
@@ -491,6 +500,12 @@ impl App {
 
         let list_title = adw::WindowTitle::new("Ungelesen", "");
         let list_header = adw::HeaderBar::builder().title_widget(&list_title).build();
+        let sort_button = gtk::Button::builder()
+            .icon_name("view-sort-descending-symbolic")
+            .tooltip_text("Reihenfolge umkehren (Strg+Shift+P)")
+            .action_name("win.toggle-sort-order")
+            .build();
+        list_header.pack_start(&sort_button);
         let list_menu = gio::Menu::new();
         list_menu.append(Some("Bereich als gelesen markieren…"), Some("win.mark-scope-read"));
         let list_more = gtk::MenuButton::builder()
@@ -984,11 +999,25 @@ impl App {
         self.load_gen.set(self.load_gen.get() + 1);
         let gen = self.load_gen.get();
         self.db_query(
-            move |db| match &search {
-                Some(q) if !q.is_empty() => {
-                    db.search(q, &scope, filter, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200)
+            move |db| {
+                let newest = self_newest_first(db);
+                match &search {
+                    Some(q) if !q.is_empty() => db.search_ordered(
+                        q,
+                        &scope,
+                        filter,
+                        cur.as_ref().map(|(ms, id)| (*ms, id.as_str())),
+                        200,
+                        newest,
+                    ),
+                    _ => db.query_articles_ordered(
+                        &scope,
+                        filter,
+                        cur.as_ref().map(|(ms, id)| (*ms, id.as_str())),
+                        200,
+                        newest,
+                    ),
                 }
-                _ => db.query_articles(&scope, filter, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200),
             },
             move |app, res: storage::Result<Vec<ArticleRow>>| {
                 if app.load_gen.get() != gen {
@@ -1375,6 +1404,18 @@ impl App {
 
     fn current_menu_source(&self) -> Option<Scope> {
         self.state.borrow().menu_source.clone()
+    }
+
+    fn toggle_sort_order(&self) {
+        let newest = !self.prefs.borrow().newest_first;
+        self.prefs.borrow_mut().newest_first = newest;
+        self.save_pref("newest_first", if newest { "1" } else { "0" });
+        self.show_toast(if newest {
+            "Reihenfolge: neueste zuerst"
+        } else {
+            "Reihenfolge: älteste zuerst"
+        });
+        self.load_page(false);
     }
 
     fn rename_feed_dialog(&self) {
@@ -3138,6 +3179,7 @@ impl App {
                     "reader_line_height",
                     "theme",
                     "letter_shortcuts",
+                    "newest_first",
                     "refresh_min",
                     "retention_days",
                     "media_mb",
@@ -3278,6 +3320,13 @@ impl App {
         grp.add(&thumbs);
         let letters = adw::SwitchRow::builder().title("Buchstabenkürzel (j/k/n/p/m/s/o)").active(p.letter_shortcuts).build();
         grp.add(&letters);
+        let order = adw::ComboRow::builder()
+            .title("Reihenfolge")
+            .subtitle("Gilt für alle Ansichten und Konten")
+            .model(&gtk::StringList::new(&["Neueste zuerst", "Älteste zuerst"]))
+            .selected(if p.newest_first { 0 } else { 1 })
+            .build();
+        grp.add(&order);
         page_view.add(&grp);
         win.add(&page_view);
 
@@ -3398,6 +3447,15 @@ impl App {
                 app.apply_prefs_live();
             }
         });
+        let w = self.weak();
+        order.connect_selected_item_notify(move |row| {
+            let Some(app) = w.upgrade() else { return };
+            let newest = row.selected() == 0;
+            app.prefs.borrow_mut().newest_first = newest;
+            app.save_pref("newest_first", if newest { "1" } else { "0" });
+            app.load_page(false);
+        });
+
         let w = self.weak();
         letters.connect_active_notify(move |row| {
             if let Some(app) = w.upgrade() {
@@ -3756,6 +3814,7 @@ impl App {
             a.search_entry.grab_focus();
         });
         win_action!("reader-retry", |a| a.reload_current(false));
+        win_action!("toggle-sort-order", |a| a.toggle_sort_order());
         win_action!("rename-feed", |a| a.rename_feed_dialog());
         win_action!("edit-feed-groups", |a| a.edit_feed_groups_dialog());
         win_action!("unsubscribe-feed", |a| a.unsubscribe_dialog());
@@ -3800,6 +3859,7 @@ impl App {
         application.set_accels_for_action("win.refresh", &["<Control>r"]);
         application.set_accels_for_action("win.add-feed", &["<Control>n"]);
         application.set_accels_for_action("win.mark-scope-read", &["<Control><Shift>m"]);
+        application.set_accels_for_action("win.toggle-sort-order", &["<Control><Shift>p"]);
         application.set_accels_for_action("win.undo", &["<Control>z"]);
         application.set_accels_for_action("win.redo", &["<Control>y", "<Control><Shift>z"]);
         application.set_accels_for_action("win.zoom-in", &["<Control>plus", "<Control>equal", "<Control>KP_Add"]);

@@ -1027,6 +1027,19 @@ impl Database {
         before: Option<(i64, &str)>,
         limit: u32,
     ) -> Result<Vec<ArticleRow>> {
+        self.query_articles_ordered(scope, filter, before, limit, true)
+    }
+
+    /// `ascending=false` liefert älteste zuerst; der Cursor bleibt eindeutig,
+    /// weil (sort_ms, id) in beiden Richtungen total geordnet ist.
+    pub fn query_articles_ordered(
+        &self,
+        scope: &Scope,
+        filter: Filter,
+        before: Option<(i64, &str)>,
+        limit: u32,
+        newest_first: bool,
+    ) -> Result<Vec<ArticleRow>> {
         let mut sql = String::from(
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
                     a.excerpt, a.unread, a.saved,
@@ -1062,7 +1075,11 @@ impl Database {
             args.push(Box::new(*g));
         }
         if let Some((sort_ms, id)) = before {
-            where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
+            if newest_first {
+                where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
+            } else {
+                where_clauses.push("(a.sort_ms > ? OR (a.sort_ms = ? AND a.id > ?))".into());
+            }
             args.push(Box::new(sort_ms));
             args.push(Box::new(sort_ms));
             args.push(Box::new(id.to_string()));
@@ -1074,7 +1091,11 @@ impl Database {
         if join_groups {
             sql.push_str(" GROUP BY a.id, a.feed_id");
         }
-        sql.push_str(" ORDER BY a.sort_ms DESC, a.id DESC LIMIT ?");
+        if newest_first {
+            sql.push_str(" ORDER BY a.sort_ms DESC, a.id DESC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY a.sort_ms ASC, a.id ASC LIMIT ?");
+        }
         args.push(Box::new(limit as i64));
         let mut stmt = self.conn.prepare(&sql)?;
         let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|v| v.as_ref()).collect();
@@ -1108,6 +1129,18 @@ impl Database {
         before: Option<(i64, &str)>,
         limit: u32,
     ) -> Result<Vec<ArticleRow>> {
+        self.search_ordered(query, scope, filter, before, limit, true)
+    }
+
+    pub fn search_ordered(
+        &self,
+        query: &str,
+        scope: &Scope,
+        filter: Filter,
+        before: Option<(i64, &str)>,
+        limit: u32,
+        newest_first: bool,
+    ) -> Result<Vec<ArticleRow>> {
         let fts = build_fts_query(query);
         if fts.is_empty() {
             return Ok(Vec::new());
@@ -1135,11 +1168,20 @@ impl Database {
             }
         }
         if let Some((sort_ms, id)) = before {
-            where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
+            if newest_first {
+                where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
+            } else {
+                where_clauses.push("(a.sort_ms > ? OR (a.sort_ms = ? AND a.id > ?))".into());
+            }
             args.push(Box::new(sort_ms));
             args.push(Box::new(sort_ms));
             args.push(Box::new(id.to_string()));
         }
+        let order = if newest_first {
+            "a.sort_ms DESC, a.id DESC"
+        } else {
+            "a.sort_ms ASC, a.id ASC"
+        };
         let sql = format!(
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
                           a.excerpt, a.unread, a.saved, (c.article_id IS NOT NULL), a.sort_ms
@@ -1148,7 +1190,7 @@ impl Database {
                    JOIN feeds f ON f.id=a.feed_id
                    LEFT JOIN article_contents c ON c.feed_id=a.feed_id AND c.article_id=a.id
                    WHERE {}
-                   ORDER BY a.sort_ms DESC, a.id DESC
+                   ORDER BY {order}
                    LIMIT {}",
             where_clauses.join(" AND "),
             (limit as i64) + 1
@@ -2151,6 +2193,54 @@ mod tests {
             .filter(|g| g.account_id == "feedly-1")
             .collect();
         assert_eq!(remote_groups.len(), 2, "Gruppen werden nicht kontoübergreifend wiederverwendet");
+    }
+
+    #[test]
+    fn oldest_first_paginates_without_gaps_or_repeats() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        for i in 0..6 {
+            db.upsert_article(feed, &format!("a{i}"), "Titel", None, None, now - (5 - i) * 60_000, "e", None, now).unwrap();
+        }
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        for _ in 0..4 {
+            let rows = db
+                .query_articles_ordered(&Scope::Global, Filter::All, cursor.as_ref().map(|(m, i)| (*m, i.as_str())), 2, false)
+                .unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                seen.push(r.id.clone());
+            }
+            let last = rows.last().unwrap();
+            cursor = Some((last.sort_ms, last.id.clone()));
+        }
+        assert_eq!(seen.len(), 6, "jeder Artikel genau einmal: {seen:?}");
+        assert_eq!(seen.first().map(String::as_str), Some("a0"), "älteste zuerst");
+        assert_eq!(seen.last().map(String::as_str), Some("a5"));
+    }
+
+    #[test]
+    fn search_also_supports_oldest_first() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        for i in 0..3 {
+            db.upsert_article(feed, &format!("a{i}"), "Titel", None, None, now - (3 - i) * 1000, "e", Some("<p>zielwort</p>"), now).unwrap();
+        }
+        let rows = db
+            .search_ordered("zielwort", &Scope::Global, Filter::All, None, 10, false)
+            .unwrap();
+        assert_eq!(rows[0].id, "a0");
+        let rows = db
+            .search_ordered("zielwort", &Scope::Global, Filter::All, None, 10, true)
+            .unwrap();
+        assert_eq!(rows[0].id, "a2");
     }
 
     #[test]
