@@ -28,16 +28,37 @@ pub fn dbg_log(msg: &str) {
     }
 }
 
-pub fn dedupe_by_article_id(rows: Vec<ArticleRow>, existing: &[ListRow]) -> Vec<ArticleRow> {
-    let mut seen: std::collections::HashSet<String> = existing
+pub fn dedupe_by_article_id(
+    rows: Vec<ArticleRow>,
+    existing: &[ListRow],
+    account_of: &dyn Fn(i64) -> String,
+) -> Vec<ArticleRow> {
+    let mut seen: std::collections::HashSet<(String, String)> = existing
         .iter()
-        .filter_map(|r| r.article().map(|a| a.id.clone()))
+        .filter_map(|r| r.article().map(|a| (account_of(a.feed_id), a.id.clone())))
         .collect();
-    let mut out = Vec::with_capacity(rows.len());
+    let mut pos: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    let mut out: Vec<ArticleRow> = Vec::with_capacity(rows.len());
     for row in rows {
-        if seen.insert(row.id.clone()) {
-            out.push(row);
+        let key = (account_of(row.feed_id), row.id.clone());
+        if let Some(&at) = pos.get(&key) {
+            let prev = &mut out[at];
+            prev.unread |= row.unread;
+            prev.saved |= row.saved;
+            if !prev.has_content && row.has_content {
+                prev.has_content = true;
+                if prev.excerpt.is_empty() {
+                    prev.excerpt = row.excerpt.clone();
+                }
+            }
+            continue;
         }
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key.clone());
+        pos.insert(key, out.len());
+        out.push(row);
     }
     out
 }
@@ -99,6 +120,54 @@ mod router_tests {
         ] {
             assert_eq!(letter_action(key), None, "{key:?}");
         }
+    }
+
+    fn row(feed_id: i64, id: &str, unread: bool, saved: bool, has_content: bool) -> ArticleRow {
+        ArticleRow {
+            id: id.to_string(),
+            feed_id,
+            feed_title: "Feed".into(),
+            accent: "#888888".into(),
+            title: "Titel".into(),
+            author: None,
+            url: None,
+            published_ms: 0,
+            excerpt: String::new(),
+            unread,
+            saved,
+            has_content,
+        }
+    }
+
+    #[test]
+    fn dedupe_merges_status_within_account_only() {
+        let account_of = |feed_id: i64| match feed_id {
+            1 | 2 => "local".to_string(),
+            _ => "feedly".to_string(),
+        };
+        let rows = vec![
+            row(1, "x", false, true, false),
+            row(2, "x", true, false, true),
+            row(3, "x", true, false, true),
+        ];
+        let out = dedupe_by_article_id(rows, &[], &account_of);
+        assert_eq!(out.len(), 2, "getrennte Konten bleiben getrennt");
+        assert!(out[0].unread && out[0].saved, "Status wird vereinigt");
+        assert!(out[0].has_content, "Inhalt der besseren Zeile übernommen");
+        assert!(out[1].unread);
+    }
+
+    #[test]
+    fn dedupe_skips_ids_already_in_the_window() {
+        let account_of = |_: i64| "local".to_string();
+        let existing = vec![ListRow::Item(std::rc::Rc::new(list::RowCell::new(row(1, "x", true, false, true))))];
+        let out = dedupe_by_article_id(
+            vec![row(1, "x", false, false, true), row(1, "y", true, false, true)],
+            &existing,
+            &account_of,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "y");
     }
 
     #[test]
@@ -770,7 +839,15 @@ impl App {
                 let had_full_page = rows.len() >= 200;
                 let keep_sel = app.state.borrow().selected.clone();
                 let current = app.state.borrow().rows.clone();
-                let rows = dedupe_by_article_id(rows, if append { &current } else { &[] });
+                let feeds = app.state.borrow().feeds.clone();
+                let account_of = move |feed_id: i64| {
+                    feeds
+                        .iter()
+                        .find(|f| f.id == feed_id)
+                        .map(|f| f.account_id.clone())
+                        .unwrap_or_default()
+                };
+                let rows = dedupe_by_article_id(rows, if append { &current } else { &[] }, &account_of);
                 {
                     let mut st = app.state.borrow_mut();
                     if append {
