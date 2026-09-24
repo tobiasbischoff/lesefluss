@@ -17,6 +17,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 #[derive(Clone, Debug)]
 pub struct FeedRow {
     pub id: i64,
+    pub account_id: String,
     pub feed_url: String,
     pub title: String,
     pub website: Option<String>,
@@ -30,6 +31,7 @@ pub struct GroupRow {
     pub name: String,
     pub parent_id: Option<i64>,
     pub remote_id: Option<String>,
+    pub account_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -409,16 +411,17 @@ impl Database {
 
     pub fn list_feeds(&self) -> Result<Vec<FeedRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, feed_url, title, website, accent FROM feeds ORDER BY lower(title)",
+            "SELECT id, account_id, feed_url, title, website, accent FROM feeds ORDER BY lower(title)",
         )?;
         let mut feeds: Vec<FeedRow> = stmt
             .query_map([], |r| {
                 Ok(FeedRow {
                     id: r.get(0)?,
-                    feed_url: r.get(1)?,
-                    title: r.get(2)?,
-                    website: r.get(3)?,
-                    accent: r.get(4)?,
+                    account_id: r.get(1)?,
+                    feed_url: r.get(2)?,
+                    title: r.get(3)?,
+                    website: r.get(4)?,
+                    accent: r.get(5)?,
                     groups: Vec::new(),
                 })
             })?
@@ -442,10 +445,18 @@ impl Database {
     }
 
     pub fn list_groups(&self) -> Result<Vec<GroupRow>> {
-        let mut stmt = self.conn.prepare("SELECT id, name, parent_id, remote_id FROM groups ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, parent_id, remote_id, account_id FROM groups ORDER BY name",
+        )?;
         let rows = stmt
             .query_map([], |r| {
-                Ok(GroupRow { id: r.get(0)?, name: r.get(1)?, parent_id: r.get(2)?, remote_id: r.get(3)? })
+                Ok(GroupRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    parent_id: r.get(2)?,
+                    remote_id: r.get(3)?,
+                    account_id: r.get(4)?,
+                })
             })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)

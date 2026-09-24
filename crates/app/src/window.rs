@@ -61,6 +61,7 @@ pub struct App {
     pub outer: adw::NavigationSplitView,
     pub inner: adw::NavigationSplitView,
     pub sidebar_list: gtk::ListBox,
+    pub sidebar_title: adw::WindowTitle,
     pub sidebar_filters: RefCell<Vec<Option<Scope>>>,
     pub last_sync_label: gtk::Label,
     pub list_title: adw::WindowTitle,
@@ -154,9 +155,8 @@ impl App {
             .tooltip_text("Bibliothek: OPML, Backup")
             .menu_model(&library_menu)
             .build();
-        let sidebar_header = adw::HeaderBar::builder()
-            .title_widget(&adw::WindowTitle::new("Lesefluss", "Lokale Bibliothek"))
-            .build();
+        let sidebar_title = adw::WindowTitle::new("Lesefluss", "Lokale Bibliothek");
+        let sidebar_header = adw::HeaderBar::builder().title_widget(&sidebar_title).build();
         sidebar_header.pack_start(&btn_hamburger);
         sidebar_header.pack_end(&btn_library);
         sidebar_header.pack_end(&btn_refresh);
@@ -282,6 +282,7 @@ impl App {
             outer,
             inner,
             sidebar_list,
+            sidebar_title,
             sidebar_filters: RefCell::new(Vec::new()),
             last_sync_label,
             list_title,
@@ -700,7 +701,39 @@ impl App {
 
     // ── Sidebar ──
 
+    fn account_label_for_scope(&self) -> String {
+        let st = self.state.borrow();
+        let acc_name = |id: &str| -> String {
+            st.accounts
+                .iter()
+                .find(|(a, _, _)| a == id)
+                .map(|(_, k, n)| format!("{} · {}", k, n))
+                .unwrap_or_else(|| "Konto".into())
+        };
+        match &st.scope {
+            Scope::Global => {
+                if st.accounts.iter().any(|(_, k, _)| k != "local") {
+                    "Alle Konten".into()
+                } else {
+                    "Lokale Bibliothek".into()
+                }
+            }
+            Scope::Account(a) => acc_name(a),
+            Scope::Feed(f) => match st.feeds.iter().find(|x| x.id == *f) {
+                Some(feed) if feed.account_id == "local" => "Lokale Bibliothek".into(),
+                Some(feed) => acc_name(&feed.account_id),
+                None => "Lokale Bibliothek".into(),
+            },
+            Scope::Group(g) => match st.groups.iter().find(|x| x.id == *g) {
+                Some(gr) if gr.account_id == "local" => "Lokale Bibliothek".into(),
+                Some(gr) => acc_name(&gr.account_id),
+                None => "Lokale Bibliothek".into(),
+            },
+        }
+    }
+
     fn refresh_sidebar(&self) {
+        self.sidebar_title.set_subtitle(&self.account_label_for_scope());
         let state = self.state.borrow();
         let mut filters = self.sidebar_filters.borrow_mut();
         self.suppress.set(true);

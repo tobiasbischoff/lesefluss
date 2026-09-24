@@ -16,20 +16,52 @@ pub fn rebuild(
 
     add_section(list, filters_out, "Bibliothek");
     add_smart_row(list, filters_out, "mail-unread-symbolic", "Ungelesen", state.counts.unread, true, Source::Global);
+
+    add_section(list, filters_out, "Lokale Bibliothek");
+    add_account_block(list, state, filters_out, "local", on_toggle_group);
+
     for (id, kind, name) in &state.accounts {
-        if kind != "feedly" {
+        if kind == "local" {
             continue;
         }
+        let label = format!("{} · {}", kind_label(kind), name);
+        add_section(list, filters_out, &label);
         let unread = state.counts.per_account.iter().find(|(a, _)| a == id).map(|(_, c)| *c).unwrap_or(0);
         let w = icon_text_badge(Some("cloud-fill-symbolic"), name, unread, true);
         let row = gtk::ListBoxRow::builder().child(&w).css_classes(vec!["lf-sidebar-row".to_string()]).build();
         list.append(&row);
         filters_out.push(Some(Source::Account(id.clone())));
+        add_account_block(list, state, filters_out, id, on_toggle_group);
     }
 
-    add_section(list, filters_out, "Abonnements");
+    if state.search.is_none() {
+        for (i, f) in filters_out.iter().enumerate() {
+            if f.as_ref() == Some(&state.scope) {
+                if let Some(row) = list.row_at_index(i as i32) {
+                    list.select_row(Some(&row));
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn kind_label(kind: &str) -> String {
+    match kind {
+        "feedly" => "Feedly".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn add_account_block(
+    list: &gtk::ListBox,
+    state: &UiState,
+    filters: &mut Vec<Option<Source>>,
+    account_id: &str,
+    on_toggle_group: &Rc<dyn Fn(i64)>,
+) {
     let mut grouped: Vec<i64> = Vec::new();
-    for g in &state.groups {
+    for g in state.groups.iter().filter(|g| g.account_id == account_id) {
         let is_collapsed = state.collapsed.contains(&g.id);
         let count = state.group_unread(g.id);
         let arrow = if is_collapsed { "pan-end-symbolic" } else { "pan-down-symbolic" };
@@ -49,28 +81,21 @@ pub fn rebuild(
             .css_classes(vec!["lf-sidebar-row".to_string()])
             .build();
         list.append(&row);
-        filters_out.push(Some(Source::Group(g.id)));
+        filters.push(Some(Source::Group(g.id)));
 
         if !is_collapsed {
-            for f in state.feeds.iter().filter(|f| f.groups.contains(&g.id)) {
+            for f in state.feeds.iter().filter(|f| f.groups.contains(&g.id) && f.account_id == account_id) {
                 grouped.push(f.id);
-                add_feed_row(list, filters_out, state, f.id, &f.title, &f.accent);
+                add_feed_row(list, filters, state, f.id, &f.title, &f.accent);
             }
         }
     }
-    for f in state.feeds.iter().filter(|f| !grouped.contains(&f.id)) {
-        add_feed_row(list, filters_out, state, f.id, &f.title, &f.accent);
-    }
-
-    if state.search.is_none() {
-        for (i, f) in filters_out.iter().enumerate() {
-            if f.as_ref() == Some(&state.scope) {
-                if let Some(row) = list.row_at_index(i as i32) {
-                    list.select_row(Some(&row));
-                }
-                return;
-            }
-        }
+    for f in state
+        .feeds
+        .iter()
+        .filter(|f| !grouped.contains(&f.id) && f.account_id == account_id)
+    {
+        add_feed_row(list, filters, state, f.id, &f.title, &f.accent);
     }
 }
 
