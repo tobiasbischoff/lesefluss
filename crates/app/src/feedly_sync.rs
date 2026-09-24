@@ -114,7 +114,11 @@ fn entry_to_new_article(e: &pf::Entry) -> storage::NewArticle {
     }
 }
 
-async fn ingest_entries(worker: &DbWorker, account_id: &str, entries: Vec<pf::Entry>) -> usize {
+async fn ingest_entries(
+    worker: &DbWorker,
+    account_id: &str,
+    entries: Vec<pf::Entry>,
+) -> Result<usize, String> {
     let mut per_feed: std::collections::HashMap<i64, Vec<storage::NewArticle>> = std::collections::HashMap::new();
     let mut statuses: Vec<(String, bool, bool)> = Vec::new();
     for e in &entries {
@@ -136,22 +140,33 @@ async fn ingest_entries(worker: &DbWorker, account_id: &str, entries: Vec<pf::En
     for (fid, items) in per_feed {
         let (a, _u) = db(worker, move |db2| db2.upsert_articles(fid, &items, storage::now_ms()))
             .await
-            .unwrap_or((0, 0));
+            .map_err(|e| e.to_string())?;
         added += a;
     }
+    let generation = db(worker, {
+        let account_id = account_id.to_string();
+        move |db2| db2.pull_generation(&account_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     for (id, unread, saved) in statuses {
-        let _ = db(worker, move |db2| {
-            if !unread {
-                db2.set_read_by_article_id(&id, true)?;
+        db(worker, {
+            let account_id = account_id.to_string();
+            move |db2| {
+                db2.apply_remote_status(
+                    &account_id,
+                    &id,
+                    if unread { None } else { Some(true) },
+                    if saved { Some(true) } else { None },
+                    generation,
+                )?;
+                Ok::<_, storage::StorageError>(())
             }
-            if saved {
-                db2.set_saved_by_article_id(&id, true)?;
-            }
-            Ok::<_, storage::StorageError>(())
         })
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
     }
-    added
+    Ok(added)
 }
 
 pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
@@ -208,7 +223,9 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
                     .await
                     .map_err(io_err)?;
                 let items = page.items.clone();
-                added += ingest_entries(&worker, &account_id, items).await;
+                added += ingest_entries(&worker, &account_id, items)
+                    .await
+                    .map_err(string_err)?;
                 match page.continuation {
                     Some(c) if !c.is_empty() => continuation = Some(c),
                     _ => break,
@@ -297,19 +314,19 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
         let client = pf::FeedlyClient::new(token);
         let res: storage::Result<usize> = async {
             let overlap = last_sync_ms - 5 * 60_000;
+            let pull_gen = db(&worker, {
+                let account_id = account_id.clone();
+                move |db2| db2.pull_generation(&account_id)
+            })
+            .await?;
             if let Ok(reads) = client.markers_reads(overlap, 1000).await {
                 for m in reads.entries {
-                    let pending = db(&worker, {
+                    let _ = db(&worker, {
                         let account_id = account_id.clone();
                         let id = m.id.clone();
-                        move |db2| db2.outbox_has_pending(&account_id, &id, "read")
+                        move |db2| db2.apply_remote_status(&account_id, &id, Some(true), None, pull_gen)
                     })
-                    .await
-                    .unwrap_or(false);
-                    if pending {
-                        continue;
-                    }
-                    let _ = db(&worker, move |db2| db2.set_read_by_article_id(&m.id, true)).await;
+                    .await;
                 }
             }
             let stream = pf::global_all_stream(&account_id);
@@ -320,7 +337,9 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
                     .stream_contents(&stream, 100, continuation.as_deref(), Some(overlap), false)
                     .await
                     .map_err(io_err)?;
-                added += ingest_entries(&worker, &account_id, page.items.clone()).await;
+                added += ingest_entries(&worker, &account_id, page.items.clone())
+                    .await
+                    .map_err(string_err)?;
                 match page.continuation {
                     Some(c) if !c.is_empty() => continuation = Some(c),
                     _ => break,
@@ -352,36 +371,18 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
                 if remote_set.contains(id.as_str()) {
                     continue;
                 }
-                let pending = db(&worker, {
+                let _ = db(&worker, {
                     let account_id = account_id.clone();
                     let id = id.clone();
-                    move |db2| db2.outbox_has_pending(&account_id, &id, "saved")
-                })
-                .await
-                .unwrap_or(false);
-                if pending {
-                    continue;
-                }
-                let _ = db(&worker, {
-                    let id = id.clone();
-                    move |db2| db2.set_saved_by_article_id(&id, false)
+                    move |db2| db2.apply_remote_status(&account_id, &id, None, Some(false), pull_gen)
                 })
                 .await;
             }
             for id in &remote_saved {
-                let pending = db(&worker, {
+                let _ = db(&worker, {
                     let account_id = account_id.clone();
                     let id = id.clone();
-                    move |db2| db2.outbox_has_pending(&account_id, &id, "saved")
-                })
-                .await
-                .unwrap_or(false);
-                if pending {
-                    continue;
-                }
-                let _ = db(&worker, {
-                    let id = id.clone();
-                    move |db2| db2.set_saved_by_article_id(&id, true)
+                    move |db2| db2.apply_remote_status(&account_id, &id, None, Some(true), pull_gen)
                 })
                 .await;
             }
@@ -398,6 +399,10 @@ pub fn delta_sync(worker: DbWorker, net: &Net, token: String, account_id: String
             }
         }
     });
+}
+
+fn string_err(e: String) -> storage::StorageError {
+    storage::StorageError::Schema(e)
 }
 
 fn io_err(e: pf::FeedlyError) -> storage::StorageError {

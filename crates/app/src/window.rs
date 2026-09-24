@@ -28,6 +28,26 @@ pub fn dbg_log(msg: &str) {
     }
 }
 
+pub fn read_intent(was_unread: bool) -> bool {
+    was_unread
+}
+
+pub fn unread_delta(prev_unread: bool, read: Option<bool>) -> i64 {
+    match read {
+        Some(true) if prev_unread => -1,
+        Some(false) if !prev_unread => 1,
+        _ => 0,
+    }
+}
+
+pub fn saved_delta(prev_saved: bool, saved: Option<bool>) -> i64 {
+    match saved {
+        Some(true) if !prev_saved => 1,
+        Some(false) if prev_saved => -1,
+        _ => 0,
+    }
+}
+
 pub fn dedupe_by_article_id(
     rows: Vec<ArticleRow>,
     existing: &[ListRow],
@@ -137,6 +157,20 @@ mod router_tests {
             saved,
             has_content,
         }
+    }
+
+    #[test]
+    fn read_toggle_changes_the_state_in_both_directions() {
+        assert!(read_intent(true), "ungelesen -> als gelesen markieren");
+        assert!(!read_intent(false), "gelesen -> als ungelesen markieren");
+        assert_eq!(unread_delta(true, Some(true)), -1);
+        assert_eq!(unread_delta(false, Some(false)), 1);
+        assert_eq!(unread_delta(false, Some(true)), 0, "idempotentes Setzen ändert keinen Zähler");
+        assert_eq!(unread_delta(true, Some(false)), 0);
+        assert_eq!(unread_delta(true, None), 0);
+        assert_eq!(saved_delta(false, Some(true)), 1);
+        assert_eq!(saved_delta(true, Some(false)), -1);
+        assert_eq!(saved_delta(true, Some(true)), 0);
     }
 
     #[test]
@@ -664,7 +698,12 @@ impl App {
         }
         let w = self.weak();
         if mode.contains("stress") {
-            glib::timeout_add_local(Duration::from_millis(350), move || {
+            let interval: u64 = mode
+                .split(':')
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(350);
+            glib::timeout_add_local(Duration::from_millis(interval), move || {
                 match w.upgrade() {
                     Some(app) => {
                         let _ = gtk::prelude::WidgetExt::activate_action(
@@ -1145,8 +1184,6 @@ impl App {
             },
         );
 
-        self.start_read_timer(id.clone());
-
         if self.inner.is_collapsed() {
             self.inner.set_show_content(true);
         }
@@ -1180,6 +1217,14 @@ impl App {
                 dbg_log(&format!("read-timer {id}: guard"));
                 return glib::ControlFlow::Break;
             }
+            if !app.prefs.borrow().auto_read {
+                dbg_log(&format!("read-timer {id}: Auto-Read aus"));
+                return glib::ControlFlow::Break;
+            }
+            if !app.reader_is_visible() || !app.reader_loaded_ok() {
+                dbg_log(&format!("read-timer {id}: Reader nicht sichtbar oder nicht geladen"));
+                return glib::ControlFlow::Break;
+            }
             let still_unread = app.state.borrow().article(&id).map(|a| a.unread).unwrap_or(false);
             dbg_log(&format!("read-timer {id}: feuert, unread={still_unread}"));
             if still_unread {
@@ -1208,11 +1253,11 @@ impl App {
         }
         {
             let mut st = self.state.borrow_mut();
-            if let Some(r) = read {
-                let delta = if r { -1 } else { 1 };
-                st.counts.unread = (st.counts.unread + delta).max(0);
+            let read_delta = unread_delta(prev_unread, read);
+            if read_delta != 0 {
+                st.counts.unread = (st.counts.unread + read_delta).max(0);
                 if let Some(entry) = st.counts.per_feed.iter_mut().find(|(f, _)| *f == feed_id) {
-                    entry.1 = (entry.1 + delta).max(0);
+                    entry.1 = (entry.1 + read_delta).max(0);
                 }
                 let gids: Vec<i64> = st
                     .feeds
@@ -1222,12 +1267,13 @@ impl App {
                     .unwrap_or_default();
                 for entry in st.counts.per_group.iter_mut() {
                     if gids.contains(&entry.0) {
-                        entry.1 = (entry.1 + delta).max(0);
+                        entry.1 = (entry.1 + read_delta).max(0);
                     }
                 }
             }
-            if let Some(s) = saved {
-                st.counts.saved = (st.counts.saved + if s { 1 } else { -1 }).max(0);
+            let saved_delta = saved_delta(prev_saved, saved);
+            if saved_delta != 0 {
+                st.counts.saved = (st.counts.saved + saved_delta).max(0);
             }
         }
 
@@ -1243,17 +1289,7 @@ impl App {
         let feed_id2 = feed_id;
         let id2 = id.to_string();
         self.worker.send(move |db| {
-            db.set_status(feed_id2, &id2, read, saved)?;
-            if let Some(acc) = db.account_id_for_article(&id2)? {
-                if acc != "local" {
-                    if let Some(r) = read {
-                        db.enqueue_outbox(&acc, &id2, "read", r)?;
-                    }
-                    if let Some(sv) = saved {
-                        db.enqueue_outbox(&acc, &id2, "saved", sv)?;
-                    }
-                }
-            }
+            db.apply_status_with_outbox(feed_id2, &id2, read, saved)?;
             Ok::<_, storage::StorageError>(())
         });
     }
@@ -1267,7 +1303,7 @@ impl App {
         let Some(row) = self.current_article() else { return };
         let was_unread = row.unread;
         let mut batch: UndoBatch = Vec::new();
-        self.apply_status(&row.id, Some(!was_unread), None, &mut batch);
+        self.apply_status(&row.id, Some(read_intent(was_unread)), None, &mut batch);
         if was_unread {
             self.state.borrow_mut().unread_guard.remove(&row.id);
         } else {
@@ -1694,6 +1730,11 @@ impl App {
     fn after_load_finished(&self) {
         if self.reader.pending_scroll.get() >= 0.0 {
             self.reader.restore_scroll();
+        }
+        if let Some(id) = self.reader.current.borrow().clone() {
+            self.start_read_timer(id);
+        }
+        if self.reader.pending_scroll.get() >= 0.0 {
             return;
         }
         let Some(id) = self.reader.current.borrow().clone() else { return };
@@ -2360,6 +2401,20 @@ impl App {
         drop(style);
         self.media.set_max_bytes((p.media_mb as u64) * 1024 * 1024);
         self.sync_store(false);
+    }
+
+    fn reader_is_visible(&self) -> bool {
+        !self.inner.is_collapsed() && self.window.is_active()
+    }
+
+    fn reader_loaded_ok(&self) -> bool {
+        let name = self
+            .reader
+            .stack
+            .visible_child_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        name == "web"
     }
 
     fn letters_enabled(&self) -> bool {

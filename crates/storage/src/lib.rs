@@ -51,6 +51,12 @@ pub struct ArticleRow {
     pub has_content: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RemoteApply {
+    pub applied: bool,
+    pub skipped: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Counts {
     pub unread: i64,
@@ -246,10 +252,85 @@ CREATE TABLE prefs (
 );
 "#,
     ),
+    (
+        6,
+        r#"
+ALTER TABLE feeds ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE articles ADD COLUMN pruned_ms INTEGER;
+CREATE TRIGGER articles_fts_cleanup AFTER DELETE ON articles BEGIN
+    DELETE FROM article_fts WHERE rowid=OLD.rowid;
+END;
+DELETE FROM article_fts WHERE rowid NOT IN (SELECT rowid FROM articles);
+CREATE TABLE field_revisions (
+    account_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (account_id, entity_id, field)
+);
+INSERT INTO field_revisions(account_id, entity_id, field, revision, updated_ms)
+    SELECT account_id, entity_id, field, MAX(revision), MAX(created_ms)
+    FROM outbox GROUP BY account_id, entity_id, field;
+CREATE INDEX articles_account ON articles(feed_id, id);
+"#,
+    ),
+    (
+        7,
+        r#"
+CREATE TABLE remote_confirmations (
+    account_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    confirmed_revision INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (account_id, entity_id, field)
+);
+INSERT INTO remote_confirmations(account_id, entity_id, field, value, confirmed_revision, updated_ms)
+    SELECT account_id, entity_id, field, desired, revision, ?1 FROM outbox;
+"#,
+    ),
 ];
 
 pub struct Database {
     conn: Connection,
+}
+
+const OUTBOX_UPSERT: &str = "INSERT INTO outbox(account_id, entity_id, field, desired, revision, created_ms)
+     VALUES (?1,?2,?3,?4,?5,?6)
+     ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
+       desired=excluded.desired,
+       revision=excluded.revision,
+       attempts=0,
+       next_try_ms=0,
+       status='pending'";
+
+fn bump_outbox(
+    tx: &rusqlite::Transaction,
+    account_id: &str,
+    entity_id: &str,
+    field: &str,
+    desired: bool,
+) -> rusqlite::Result<i64> {
+    let now = now_ms();
+    tx.execute(
+        "INSERT INTO field_revisions(account_id, entity_id, field, revision, updated_ms)
+         VALUES (?1,?2,?3,1,?4)
+         ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
+           revision=field_revisions.revision+1, updated_ms=?4",
+        params![account_id, entity_id, field, now],
+    )?;
+    let revision: i64 = tx.query_row(
+        "SELECT revision FROM field_revisions WHERE account_id=?1 AND entity_id=?2 AND field=?3",
+        params![account_id, entity_id, field],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        OUTBOX_UPSERT,
+        params![account_id, entity_id, field, desired as i64, revision, now],
+    )?;
+    Ok(revision)
 }
 
 fn clamp_future(ms: i64, now: i64) -> i64 {
@@ -567,20 +648,33 @@ impl Database {
                  ON CONFLICT(feed_id, article_id) DO UPDATE SET html=excluded.html, plain=excluded.plain, fetched_ms=excluded.fetched_ms",
                 params![feed_id, id, html, plain, now],
             )?;
-            let feed_title: String = self
-                .conn
-                .query_row("SELECT title FROM feeds WHERE id=?1", params![feed_id], |r| r.get(0))?;
-            let rowid: i64 = self.conn.query_row(
-                "SELECT rowid FROM articles WHERE feed_id=?1 AND id=?2",
-                params![feed_id, id],
-                |r| r.get(0),
-            )?;
-            self.conn.execute("DELETE FROM article_fts WHERE rowid=?1", params![rowid])?;
             self.conn.execute(
-                "INSERT INTO article_fts(rowid, title, author, feed_title, body) VALUES (?1,?2,?3,?4,?5)",
-                params![rowid, title, author.unwrap_or(""), feed_title, plain],
+                "UPDATE articles SET pruned_ms=NULL WHERE feed_id=?1 AND id=?2",
+                params![feed_id, id],
             )?;
         }
+        let feed_title: String = self
+            .conn
+            .query_row("SELECT title FROM feeds WHERE id=?1", params![feed_id], |r| r.get(0))?;
+        let rowid: i64 = self.conn.query_row(
+            "SELECT rowid FROM articles WHERE feed_id=?1 AND id=?2",
+            params![feed_id, id],
+            |r| r.get(0),
+        )?;
+        let body: String = self
+            .conn
+            .query_row(
+                "SELECT plain FROM article_contents WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        self.conn.execute("DELETE FROM article_fts WHERE rowid=?1", params![rowid])?;
+        self.conn.execute(
+            "INSERT INTO article_fts(rowid, title, author, feed_title, body) VALUES (?1,?2,?3,?4,?5)",
+            params![rowid, title, author.unwrap_or(""), feed_title, body],
+        )?;
         Ok(!exists)
     }
 
@@ -618,25 +712,38 @@ impl Database {
                 )?;
                 added += 1;
             }
+            let plain = item.html.as_deref().map(strip_html);
             if let Some(html) = &item.html {
-                let plain = strip_html(html);
                 tx.execute(
                     "INSERT INTO article_contents(feed_id, article_id, html, plain, hash, fetched_ms)
                      VALUES (?1,?2,?3,?4,?5,?6)
                      ON CONFLICT(feed_id, article_id) DO UPDATE SET html=excluded.html, plain=excluded.plain, hash=excluded.hash, fetched_ms=excluded.fetched_ms",
-                    params![feed_id, item.id, html, plain, item.content_hash, now],
+                    params![feed_id, item.id, html, plain.clone().unwrap_or_default(), item.content_hash, now],
                 )?;
-                let rowid: i64 = tx.query_row(
-                    "SELECT rowid FROM articles WHERE feed_id=?1 AND id=?2",
-                    params![feed_id, item.id],
-                    |r| r.get(0),
-                )?;
-                tx.execute("DELETE FROM article_fts WHERE rowid=?1", params![rowid])?;
                 tx.execute(
-                    "INSERT INTO article_fts(rowid, title, author, feed_title, body) VALUES (?1,?2,?3,?4,?5)",
-                    params![rowid, item.title, item.author.clone().unwrap_or_default(), feed_title, plain],
+                    "UPDATE articles SET pruned_ms=NULL WHERE feed_id=?1 AND id=?2",
+                    params![feed_id, item.id],
                 )?;
             }
+            let rowid: i64 = tx.query_row(
+                "SELECT rowid FROM articles WHERE feed_id=?1 AND id=?2",
+                params![feed_id, item.id],
+                |r| r.get(0),
+            )?;
+            let existing_body: String = tx
+                .query_row(
+                    "SELECT plain FROM article_contents WHERE feed_id=?1 AND article_id=?2",
+                    params![feed_id, item.id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            let body = plain.clone().unwrap_or(existing_body);
+            tx.execute("DELETE FROM article_fts WHERE rowid=?1", params![rowid])?;
+            tx.execute(
+                "INSERT INTO article_fts(rowid, title, author, feed_title, body) VALUES (?1,?2,?3,?4,?5)",
+                params![rowid, item.title, item.author.clone().unwrap_or_default(), feed_title, body],
+            )?;
         }
         tx.commit()?;
         Ok((added, updated))
@@ -771,10 +878,11 @@ impl Database {
             return Ok(Vec::new());
         }
         let sql = "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
-                          a.excerpt, a.unread, a.saved, 1
+                          a.excerpt, a.unread, a.saved, (c.article_id IS NOT NULL)
                    FROM article_fts fts
                    JOIN articles a ON a.rowid = fts.rowid
                    JOIN feeds f ON f.id=a.feed_id
+                   LEFT JOIN article_contents c ON c.feed_id=a.feed_id AND c.article_id=a.id
                    WHERE article_fts MATCH ?1
                    ORDER BY rank
                    LIMIT ?2";
@@ -793,7 +901,7 @@ impl Database {
                     excerpt: r.get(8)?,
                     unread: r.get::<_, i64>(9)? == 1,
                     saved: r.get::<_, i64>(10)? == 1,
-                    has_content: true,
+                    has_content: r.get::<_, i64>(11)? == 1,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -802,13 +910,9 @@ impl Database {
 
     pub fn counts(&self) -> Result<Counts> {
         let mut c = Counts::default();
-        c.unread = self
-            .conn
-            .query_row("SELECT COUNT(DISTINCT id) FROM articles WHERE unread=1", [], |r| r.get(0))?;
-        c.saved = self
-            .conn
-            .query_row("SELECT COUNT(DISTINCT id) FROM articles WHERE saved=1", [], |r| r.get(0))?;
-        c.total = self.conn.query_row("SELECT COUNT(DISTINCT id) FROM articles", [], |r| r.get(0))?;
+        c.unread = self.distinct_count("WHERE a.unread=1")?;
+        c.saved = self.distinct_count("WHERE a.saved=1")?;
+        c.total = self.distinct_count("")?;
         let mut stmt = self
             .conn
             .prepare("SELECT feed_id, COUNT(DISTINCT id) FROM articles WHERE unread=1 GROUP BY feed_id")?;
@@ -824,6 +928,17 @@ impl Database {
         )?;
         c.per_account = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         Ok(c)
+    }
+
+    fn distinct_count(&self, clause: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM (
+               SELECT DISTINCT
+                 CASE WHEN f.account_id='local' THEN 'feed:' || a.feed_id ELSE 'account:' || f.account_id END AS scope_key,
+                 a.id
+               FROM articles a JOIN feeds f ON f.id=a.feed_id {clause})"
+        );
+        Ok(self.conn.query_row(&sql, [], |r| r.get(0))?)
     }
 
     pub fn mark_source_read(&self, ids: &[(i64, String)]) -> Result<()> {
@@ -884,7 +999,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT f.id, f.feed_url FROM feeds f
              LEFT JOIN feed_fetch_state s ON s.feed_id=f.id
-             WHERE s.next_fetch_ms IS NULL OR s.next_fetch_ms <= ?1
+             WHERE f.account_id='local' AND COALESCE(f.active,1)=1
+               AND (s.next_fetch_ms IS NULL OR s.next_fetch_ms <= ?1)
              ORDER BY COALESCE(s.next_fetch_ms, 0)",
         )?;
         let rows = stmt
@@ -931,7 +1047,13 @@ impl Database {
         let tx = self.conn.unchecked_transaction()?;
         let ids: Vec<(i64, String)> = tx
             .prepare(
-                "SELECT feed_id, id FROM articles WHERE unread=0 AND saved=0 AND first_seen_ms < ?1",
+                "SELECT a.feed_id, a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
+                 WHERE a.unread=0 AND a.saved=0 AND a.first_seen_ms < ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM outbox o
+                     WHERE o.entity_id=a.id AND o.status IN ('pending','inflight')
+                       AND o.account_id=f.account_id)
+                 ORDER BY a.feed_id, a.id",
             )?
             .query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
@@ -939,7 +1061,10 @@ impl Database {
             tx.execute("DELETE FROM article_contents WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
             tx.execute("DELETE FROM article_media WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
             tx.execute("DELETE FROM read_positions WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
-            tx.execute("DELETE FROM articles WHERE feed_id=?1 AND id=?2", params![feed_id, id])?;
+            tx.execute(
+                "UPDATE articles SET pruned_ms=?3 WHERE feed_id=?1 AND id=?2",
+                params![feed_id, id, now_ms],
+            )?;
             tx.execute(
                 "INSERT OR IGNORE INTO tombstones(feed_id, article_id, deleted_ms) VALUES (?1,?2,?3)",
                 params![feed_id, id, now_ms],
@@ -989,18 +1114,173 @@ impl Database {
     }
 
     pub fn enqueue_outbox(&self, account_id: &str, entity_id: &str, field: &str, desired: bool) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        bump_outbox(&tx, account_id, entity_id, field, desired)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn account_id_for_feed(&self, feed_id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT account_id FROM feeds WHERE id=?1", params![feed_id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn apply_status_with_outbox(
+        &self,
+        feed_id: i64,
+        article_id: &str,
+        read: Option<bool>,
+        saved: Option<bool>,
+    ) -> Result<Option<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let account: Option<String> = tx
+            .query_row("SELECT account_id FROM feeds WHERE id=?1", params![feed_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(r) = read {
+            tx.execute(
+                "UPDATE articles SET unread=?2, updated_ms=?4 WHERE feed_id=?1 AND id=?3",
+                params![feed_id, if r { 0 } else { 1 }, article_id, now_ms()],
+            )?;
+        }
+        if let Some(s) = saved {
+            tx.execute(
+                "UPDATE articles SET saved=?2, updated_ms=?4 WHERE feed_id=?1 AND id=?3",
+                params![feed_id, if s { 1 } else { 0 }, article_id, now_ms()],
+            )?;
+        }
+        if let Some(acc) = account.as_deref().filter(|a| *a != "local") {
+            if let Some(r) = read {
+                bump_outbox(&tx, acc, article_id, "read", r)?;
+            }
+            if let Some(s) = saved {
+                bump_outbox(&tx, acc, article_id, "saved", s)?;
+            }
+        }
+        tx.commit()?;
+        Ok(account)
+    }
+
+    pub fn set_read_for_account(&self, account_id: &str, article_id: &str, read: bool) -> Result<usize> {
         self.conn.execute(
-            "INSERT INTO outbox(account_id, entity_id, field, desired, revision, created_ms)
-             VALUES (?1,?2,?3,?4,1,?5)
+            "UPDATE articles SET unread=?2, updated_ms=?3
+             WHERE id=?1 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?4)",
+            params![article_id, if read { 0 } else { 1 }, now_ms(), account_id],
+        ).map_err(Into::into)
+    }
+
+    pub fn set_saved_for_account(&self, account_id: &str, article_id: &str, saved: bool) -> Result<usize> {
+        self.conn.execute(
+            "UPDATE articles SET saved=?2, updated_ms=?3
+             WHERE id=?1 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?4)",
+            params![article_id, if saved { 1 } else { 0 }, now_ms(), account_id],
+        ).map_err(Into::into)
+    }
+
+    pub fn pull_generation(&self, account_id: &str) -> Result<i64> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(revision) FROM field_revisions WHERE account_id=?1",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(v.unwrap_or(0))
+    }
+
+    pub fn record_remote_confirmation(
+        &self,
+        account_id: &str,
+        entity_id: &str,
+        field: &str,
+        value: bool,
+        revision: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO remote_confirmations(account_id, entity_id, field, value, confirmed_revision, updated_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)
              ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
-               desired=excluded.desired,
-               revision=outbox.revision+1,
-               attempts=0,
-               next_try_ms=0,
-               status='pending'",
-            params![account_id, entity_id, field, desired as i64, now_ms()],
+               value=excluded.value, confirmed_revision=excluded.confirmed_revision, updated_ms=excluded.updated_ms
+             WHERE excluded.confirmed_revision >= remote_confirmations.confirmed_revision",
+            params![account_id, entity_id, field, value as i64, revision, now_ms()],
         )?;
         Ok(())
+    }
+
+    pub fn apply_remote_status(
+        &self,
+        account_id: &str,
+        article_id: &str,
+        read: Option<bool>,
+        saved: Option<bool>,
+        pull_generation: i64,
+    ) -> Result<RemoteApply> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut applied = false;
+        let mut skipped = false;
+        for (field, value) in [("read", read), ("saved", saved)] {
+            let Some(value) = value else { continue };
+            let revision: i64 = tx
+                .query_row(
+                    "SELECT revision FROM field_revisions WHERE account_id=?1 AND entity_id=?2 AND field=?3",
+                    params![account_id, article_id, field],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let pending: bool = tx.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND entity_id=?2 AND field=?3
+                 AND status IN ('pending','inflight')",
+                params![account_id, article_id, field],
+                |r| Ok(r.get::<_, i64>(0)? > 0),
+            )?;
+            if pending || revision > pull_generation {
+                skipped = true;
+                continue;
+            }
+            if field == "read" {
+                tx.execute(
+                    "UPDATE articles SET unread=?2, updated_ms=?4
+                     WHERE id=?3 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?1)",
+                    params![account_id, if value { 0 } else { 1 }, article_id, now_ms()],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE articles SET saved=?2, updated_ms=?4
+                     WHERE id=?3 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?1)",
+                    params![account_id, if value { 1 } else { 0 }, article_id, now_ms()],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO remote_confirmations(account_id, entity_id, field, value, confirmed_revision, updated_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
+                   value=excluded.value, confirmed_revision=excluded.confirmed_revision, updated_ms=excluded.updated_ms",
+                params![account_id, article_id, field, value as i64, revision, now_ms()],
+            )?;
+            applied = true;
+        }
+        tx.commit()?;
+        Ok(RemoteApply { applied, skipped })
+    }
+
+    pub fn field_revision(&self, account_id: &str, entity_id: &str, field: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT revision FROM field_revisions WHERE account_id=?1 AND entity_id=?2 AND field=?3",
+                params![account_id, entity_id, field],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
+            .map_err(Into::into)
     }
 
     pub fn outbox_pending(&self, account_id: &str, now_ms: i64, limit: u32) -> Result<Vec<OutboxRow>> {
@@ -1039,6 +1319,17 @@ impl Database {
                 .optional()?;
             match cur {
                 Some(c) if c == *revision => {
+                    let row: Option<(String, String, String, i64)> = self
+                        .conn
+                        .query_row(
+                            "SELECT account_id, entity_id, field, desired FROM outbox WHERE id=?1",
+                            params![id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()?;
+                    if let Some((acc, entity, field, desired)) = row {
+                        self.record_remote_confirmation(&acc, &entity, &field, desired != 0, *revision)?;
+                    }
                     self.conn.execute("DELETE FROM outbox WHERE id=?1", params![id])?;
                 }
                 Some(_) => {
@@ -1341,20 +1632,203 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
+    fn remote_account(db: &Database) -> String {
+        db.conn
+            .execute(
+                "INSERT INTO accounts(id,kind,name,created_ms) VALUES ('feedly-1','feedly','Feedly',0)",
+                [],
+            )
+            .unwrap();
+        "feedly-1".to_string()
+    }
+
     #[test]
-    fn counts_ignore_duplicate_article_ids() {
+    fn identity_is_account_and_article_id() {
         let db = Database::open_in_memory().unwrap();
         let acc = db.ensure_local_account().unwrap();
+        let remote = remote_account(&db);
         let f1 = db.add_feed(&acc, "u1", "F1", None, "#111111").unwrap();
         let f2 = db.add_feed(&acc, "u2", "F2", None, "#222222").unwrap();
+        let f3 = db.add_feed(&remote, "u3", "F3", None, "#333333").unwrap();
         let now = now_ms();
         db.upsert_article(f1, "same", "Titel", None, None, now, "e", None, now).unwrap();
         db.upsert_article(f2, "same", "Titel", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(f2, "other", "Anderer", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f3, "same", "Titel", None, None, now, "e", None, now).unwrap();
         let c = db.counts().unwrap();
-        assert_eq!(c.unread, 2);
-        assert_eq!(c.total, 2);
-        assert_eq!(c.per_feed, vec![(f1, 1), (f2, 2)]);
+        assert_eq!(c.total, 3, "zwei lokale Feeds plus Feedly sind drei Artikel");
+        assert_eq!(c.unread, 3);
+        assert_eq!(c.per_feed, vec![(f1, 1), (f2, 1), (f3, 1)]);
+        assert_eq!(c.per_account, vec![(remote, 1)]);
+    }
+
+    #[test]
+    fn remote_status_updates_stay_inside_the_account() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let remote = remote_account(&db);
+        let local_feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
+        let remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let now = now_ms();
+        db.upsert_article(local_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(remote_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        assert_eq!(db.set_read_for_account(&remote, "same", true).unwrap(), 1);
+        let (local_unread, _) = db.article_status(local_feed, "same").unwrap().unwrap();
+        let (remote_unread, _) = db.article_status(remote_feed, "same").unwrap().unwrap();
+        assert!(local_unread, "lokaler Artikel bleibt ungelesen");
+        assert!(!remote_unread, "Feedly-Artikel wird gelesen");
+    }
+
+    #[test]
+    fn status_and_outbox_commit_together() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now).unwrap();
+        assert_eq!(db.apply_status_with_outbox(feed, "e1", Some(true), Some(true)).unwrap().as_deref(), Some("feedly-1"));
+        let (unread, saved) = db.article_status(feed, "e1").unwrap().unwrap();
+        assert!(!unread && saved);
+        let pending = db.outbox_pending(&remote, now, 10).unwrap();
+        assert_eq!(pending.len(), 2, "read und saved liegen in der Outbox");
+        assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 1);
+        let sent: Vec<(i64, i64)> = pending.iter().map(|p| (p.id, p.revision)).collect();
+        db.outbox_ack(&sent).unwrap();
+        assert!(db.outbox_pending(&remote, now, 10).unwrap().is_empty());
+        db.apply_status_with_outbox(feed, "e1", Some(false), None).unwrap();
+        assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 2, "Revision bleibt dauerhaft monoton");
+    }
+
+    #[test]
+    fn stale_pull_cannot_overwrite_a_confirmed_local_intent() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", Some("<p>x</p>"), now).unwrap();
+
+        let pull_gen = db.pull_generation(&remote).unwrap();
+        let pending = db.outbox_pending(&remote, now, 10).unwrap();
+
+        db.apply_status_with_outbox(feed, "e1", Some(false), None).unwrap();
+        assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 1);
+        let rows = db.outbox_pending(&remote, now, 10).unwrap();
+        let ids: Vec<(i64, i64)> = rows.iter().map(|r| (r.id, r.revision)).collect();
+        db.outbox_ack(&ids).unwrap();
+
+        let late = db
+            .apply_remote_status(&remote, "e1", Some(true), None, pull_gen)
+            .unwrap();
+        assert!(late.skipped && !late.applied, "alter Pull wird verworfen");
+        let (unread, _) = db.article_status(feed, "e1").unwrap().unwrap();
+        assert!(unread, "jüngere lokale Absicht bleibt erhalten");
+
+        let fresh_gen = db.pull_generation(&remote).unwrap();
+        let applied = db
+            .apply_remote_status(&remote, "e1", Some(true), None, fresh_gen)
+            .unwrap();
+        assert!(applied.applied, "frischer Remote-Stand gewinnt");
+        let (unread, _) = db.article_status(feed, "e1").unwrap().unwrap();
+        assert!(!unread);
+    }
+
+    #[test]
+    fn remote_pull_never_touches_local_articles() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let remote = remote_account(&db);
+        let local_feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
+        let remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let now = now_ms();
+        db.upsert_article(local_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(remote_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        let gen = db.pull_generation(&remote).unwrap();
+        db.apply_remote_status(&remote, "same", Some(true), None, gen).unwrap();
+        let (local_unread, _) = db.article_status(local_feed, "same").unwrap().unwrap();
+        let (remote_unread, _) = db.article_status(remote_feed, "same").unwrap().unwrap();
+        assert!(local_unread, "lokaler Artikel bleibt unberührt");
+        assert!(!remote_unread);
+    }
+
+    #[test]
+    fn local_status_change_creates_no_outbox() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "a1", "Titel", None, None, now, "e", None, now).unwrap();
+        assert_eq!(db.apply_status_with_outbox(feed, "a1", Some(true), None).unwrap().as_deref(), Some("local"));
+        assert!(db.outbox_pending(&acc, now, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn due_feeds_only_returns_active_local_feeds() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let remote = remote_account(&db);
+        let local = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
+        let _remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let inactive = db.add_feed(&acc, "u3", "Archiviert", None, "#333333").unwrap();
+        db.conn.execute("UPDATE feeds SET active=0 WHERE id=?1", params![inactive]).unwrap();
+        let due = db.due_feeds(now_ms()).unwrap();
+        assert_eq!(due, vec![(local, "u1".to_string())]);
+    }
+
+    #[test]
+    fn retention_keeps_metadata_and_protects_pending_outbox() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let remote = remote_account(&db);
+        let local_feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
+        let remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let now = now_ms();
+        let old = now - 200 * 86_400_000;
+        db.upsert_article(local_feed, "old-local", "Alt lokal", None, None, old, "e", Some("<p>alt</p>"), now).unwrap();
+        db.upsert_article(remote_feed, "old-remote", "Alt remote", None, None, old, "e", Some("<p>alt</p>"), now).unwrap();
+        db.set_status(local_feed, "old-local", Some(true), None).unwrap();
+        db.set_status(remote_feed, "old-remote", Some(true), None).unwrap();
+        db.conn
+            .execute(
+                "UPDATE articles SET first_seen_ms=?2",
+                params![0, old],
+            )
+            .unwrap();
+        db.enqueue_outbox(&remote, "old-remote", "read", true).unwrap();
+        let pruned = db.prune_old_read(now, 90).unwrap();
+        assert_eq!(pruned, 1, "nur der Artikel ohne ausstehende Mutation");
+        assert!(db.article_status(local_feed, "old-local").unwrap().is_some(), "Metadaten bleiben erhalten");
+        let rows = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
+        let local_row = rows.iter().find(|r| r.id == "old-local").expect("Zeile bleibt in der Liste");
+        let remote_row = rows.iter().find(|r| r.id == "old-remote").expect("Zeile bleibt in der Liste");
+        assert!(!local_row.has_content, "Inhalt des lokalen Altartikels wurde bereinigt");
+        assert!(remote_row.has_content, "Artikel mit ausstehender Mutation bleibt vollständig");
+        assert!(db.search("alt", 10).unwrap().iter().any(|r| r.id == "old-remote"));
+    }
+
+    #[test]
+    fn fts_index_survives_rowid_reuse() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "gone", "Verschwindet", None, None, now, "e", Some("<p>oldsecretword</p>"), now).unwrap();
+        assert_eq!(db.search("oldsecretword", 10).unwrap().len(), 1);
+        db.conn.execute("DELETE FROM articles WHERE feed_id=?1 AND id='gone'", params![feed]).unwrap();
+        db.conn.execute("DELETE FROM article_contents WHERE feed_id=?1 AND article_id='gone'", params![feed]).unwrap();
+        db.upsert_article(feed, "neu", "Neuer Artikel", None, None, now, "e", Some("<p>anderes wort</p>"), now).unwrap();
+        assert!(db.search("oldsecretword", 10).unwrap().is_empty(), "verwaiste FTS-Zeile darf nicht treffen");
+        assert_eq!(db.search("anderes", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn articles_without_html_are_searchable_by_title() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "a", "Sondertitel Quaternionen", Some("Autorin"), None, now, "e", None, now).unwrap();
+        let hits = db.search("sondertitel", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].has_content, "kein Inhalt, aber Treffer");
     }
 
     #[test]
