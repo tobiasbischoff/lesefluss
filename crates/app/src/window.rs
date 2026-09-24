@@ -343,6 +343,8 @@ pub struct App {
     pub last_sync_label: gtk::Label,
     pub list_title: adw::WindowTitle,
     pub list_stack: gtk::Stack,
+    pub new_articles_bar: gtk::Revealer,
+    pub new_articles_label: gtk::Button,
     pub list_store: gio::ListStore,
     pub list_selection: gtk::SingleSelection,
     pub list_view: gtk::ListView,
@@ -470,6 +472,15 @@ impl App {
             .description("In dieser Ansicht ist gerade nichts los.")
             .vexpand(true)
             .build();
+        let new_articles_label = gtk::Button::builder()
+            .label("Neue Artikel")
+            .has_frame(false)
+            .css_classes(vec!["lf-new-articles".to_string()])
+            .build();
+        let new_articles_bar = gtk::Revealer::builder()
+            .child(&new_articles_label)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .build();
         let list_stack = gtk::Stack::builder().css_classes(vec!["lf-list-bg".to_string()]).build();
         list_stack.add_named(&list_scroll, Some("list"));
         list_stack.add_named(&list_empty, Some("empty"));
@@ -510,7 +521,10 @@ impl App {
         filter_wrap.set_halign(gtk::Align::Center);
         filter_wrap.set_margin_bottom(8);
         filter_wrap.append(&filter_box);
-        let list_toolbar = adw::ToolbarView::builder().content(&list_stack).build();
+        let list_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list_body.append(&new_articles_bar);
+        list_body.append(&list_stack);
+        let list_toolbar = adw::ToolbarView::builder().content(&list_body).build();
         list_toolbar.add_top_bar(&list_header);
         list_toolbar.add_top_bar(&search_bar);
         list_toolbar.add_bottom_bar(&filter_wrap);
@@ -567,6 +581,8 @@ impl App {
             last_sync_label,
             list_title,
             list_stack,
+            new_articles_bar,
+            new_articles_label,
             list_store,
             list_selection,
             list_view,
@@ -1015,8 +1031,10 @@ impl App {
                         st.selected = Some(sel);
                     }
                 }
+                app.trim_rows();
                 app.sync_store(append);
                 app.update_list_empty_state();
+                app.offer_new_articles();
                 app.state.borrow_mut().loading_more = false;
                 if let Some(sel) = app.selected_id() {
                     let current = app.reader.current.borrow().clone();
@@ -1044,21 +1062,49 @@ impl App {
 
     // ── Store-Sync ──
 
+    /// Übernimmt nur die tatsächlichen Unterschiede in den Store: vorhandene
+    /// Zeilen werden ersetzt statt neu aufgebaut, damit Auswahl und
+    /// Scrollanker erhalten bleiben.
     fn sync_store(&self, append: bool) {
         let rows = self.state.borrow().rows.clone();
         self.suppress.set(true);
+        let existing = self.list_store.n_items() as usize;
         if append {
-            let existing = self.list_store.n_items() as usize;
             for r in rows.iter().skip(existing) {
                 self.list_store.append(&glib::BoxedAnyObject::new(r.clone()));
             }
+        } else if existing == rows.len() {
+            for (pos, r) in rows.iter().enumerate() {
+                self.list_store.remove(pos as u32);
+                self.list_store.insert(pos as u32, &glib::BoxedAnyObject::new(r.clone()));
+            }
+            self.list_store.splice(
+                rows.len() as u32,
+                existing as u32 - rows.len() as u32,
+                &[] as &[glib::BoxedAnyObject],
+            );
+        } else if existing > rows.len() {
+            self.list_store.splice(
+                rows.len() as u32,
+                existing as u32 - rows.len() as u32,
+                &[] as &[glib::BoxedAnyObject],
+            );
+            for (pos, r) in rows.iter().enumerate() {
+                self.list_store.remove(pos as u32);
+                self.list_store.insert(pos as u32, &glib::BoxedAnyObject::new(r.clone()));
+            }
         } else {
-            self.list_store.remove_all();
-            for r in &rows {
+            for (pos, r) in rows.iter().enumerate() {
+                self.list_store.remove(pos as u32);
+                self.list_store.insert(pos as u32, &glib::BoxedAnyObject::new(r.clone()));
+            }
+            for r in rows.iter().skip(existing) {
                 self.list_store.append(&glib::BoxedAnyObject::new(r.clone()));
             }
-            if let Some(sel) = self.state.borrow().selected.clone() {
-                if let Some(pos) = self.state.borrow().row_pos(&sel.1) {
+        }
+        if let Some(sel) = self.state.borrow().selected.clone() {
+            if let Some(pos) = self.state.borrow().row_pos(&sel.1) {
+                if gtk::SingleSelection::selected(&self.list_selection) != pos as u32 {
                     self.list_selection.set_selected(pos as u32);
                 }
             }
@@ -1066,6 +1112,88 @@ impl App {
         let has_items = rows.iter().any(|r| matches!(r, ListRow::Item(_)));
         self.list_stack.set_visible_child_name(if has_items { "list" } else { "empty" });
         self.suppress.set(false);
+    }
+
+    /// Kappt das Listenmodell auf ein Fenster von 2 000 Zeilen (§7.2) und
+    /// bewahrt dabei Auswahl und obersten sichtbaren Artikel.
+    fn trim_rows(&self) {
+        const MAX_ROWS: usize = 2000;
+        let (over, keep_id) = {
+            let st = self.state.borrow();
+            if st.rows.len() <= MAX_ROWS {
+                return;
+            }
+            let over = st.rows.len() - MAX_ROWS;
+            let keep = st.selected.as_ref().map(|(_, id)| id.clone());
+            (over, keep)
+        };
+        let anchor = self.top_visible_article_id();
+        let anchor = anchor.or(keep_id);
+        {
+            let mut st = self.state.borrow_mut();
+            for _ in 0..over {
+                if st.rows.len() <= MAX_ROWS {
+                    break;
+                }
+                // nie die Auswahl oder den Scrollanker entfernen
+                if let Some(keep) = anchor.as_ref() {
+                    let pos = st.rows.iter().position(|r| r.article().map(|a| &a.id == keep).unwrap_or(false));
+                    if let Some(pos) = pos {
+                        if pos < st.rows.len() - MAX_ROWS {
+                            st.rows.remove(0);
+                            continue;
+                        }
+                    }
+                }
+                st.rows.pop();
+            }
+        }
+        self.sync_store(false);
+    }
+
+    /// Neue Artikel, die oberhalb des sichtbaren Bereichs liegen, werden
+    /// angeboten statt automatisch eingefügt (§5.2).
+    fn offer_new_articles(&self) {
+        let (new_count, top) = {
+            let st = self.state.borrow();
+            let top = self.top_visible_article_id();
+            let pos = top.as_ref().and_then(|id| st.row_pos(id)).unwrap_or(0);
+            let count = st
+                .rows
+                .iter()
+                .take(pos)
+                .filter(|r| matches!(r, ListRow::Item(_)))
+                .count();
+            (count, top)
+        };
+        let _ = top;
+        {
+            let mut st = self.state.borrow_mut();
+            st.pending_new_articles = new_count;
+        }
+        self.update_new_articles_bar();
+    }
+
+    fn update_new_articles_bar(&self) {
+        let count = self.state.borrow().pending_new_articles;
+        if count == 0 {
+            self.new_articles_bar.set_visible(false);
+            return;
+        }
+        self.new_articles_bar.set_visible(true);
+        self.new_articles_label
+            .set_label(&format!("{count} neue Artikel"));
+    }
+
+    /// Aktuell sichtbare oberste Artikel-ID als Scrollanker.
+    fn top_visible_article_id(&self) -> Option<String> {
+        let pos = self.list_scroll.vadjustment().value().round().max(0.0);
+        let st = self.state.borrow();
+        st.rows
+            .iter()
+            .filter_map(|r| r.article())
+            .min_by_key(|a| (a.sort_ms.abs_diff(pos as i64), a.id.clone()))
+            .map(|a| a.id)
     }
 
     fn update_list_empty_state(&self) {
@@ -3143,6 +3271,19 @@ impl App {
         });
 
         let w = self.weak();
+        self.new_articles_label.connect_clicked(move |_| {
+            let Some(app) = w.upgrade() else { return };
+            app.state.borrow_mut().pending_new_articles = 0;
+            app.update_new_articles_bar();
+            if let Some(pos) = app.state.borrow().rows.iter().position(
+                |r| matches!(r, ListRow::Item(_)),
+            ) {
+                app.list_view.scroll_to(pos as u32, gtk::ListScrollFlags::NONE, None::<gtk::ScrollInfo>);
+            }
+            app.load_page(false);
+        });
+
+        let w = self.weak();
         self.list_view.connect_activate(move |_, pos| {
             let Some(app) = w.upgrade() else { return };
             let row = app.state.borrow().rows.get(pos as usize).and_then(|r| r.article());
@@ -3196,9 +3337,19 @@ impl App {
             });
         }
 
+        let last_scroll_value = std::cell::Cell::new(0.0);
         let w = self.weak();
         self.list_scroll.vadjustment().connect_value_changed(move |adj| {
             let Some(app) = w.upgrade() else { return };
+            if adj.value() > last_scroll_value.get() + 0.5 {
+                last_scroll_value.set(adj.value());
+                let mut st = app.state.borrow_mut();
+                if st.pending_new_articles > 0 {
+                    st.pending_new_articles = 0;
+                    drop(st);
+                    app.update_new_articles_bar();
+                }
+            }
             let near_bottom = adj.value() + adj.page_size() >= adj.upper() - 400.0;
             if !near_bottom {
                 return;
