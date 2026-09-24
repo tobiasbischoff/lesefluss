@@ -127,6 +127,7 @@ searchbar > revealer > box {{ background-color: {sl}; border-color: {sep}; box-s
                         sep = self.separator.css(),
             sep2 = self.separator.rgba(0.55),
             sel = self.selection.css(),
+            ac = self.accent.css(),
             sidebar_bg_decl = sidebar_bg_decl,
         )
     }
