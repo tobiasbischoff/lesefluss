@@ -603,7 +603,6 @@ impl App {
     }
 
     fn set_source(&self, f: Source) {
-        self.flush_keep_visible(None);
         {
             let mut st = self.state.borrow_mut();
             st.source = f.clone();
@@ -643,10 +642,7 @@ impl App {
         self.open_article(row, focus, flush);
     }
 
-    fn open_article(&self, row: ArticleRow, focus: bool, flush: bool) {
-        if flush {
-            self.flush_keep_visible(Some(&row.id));
-        }
+    fn open_article(&self, row: ArticleRow, focus: bool, _flush: bool) {
         let id = row.id.clone();
         {
             let mut st = self.state.borrow_mut();
@@ -659,6 +655,7 @@ impl App {
             self.suppress.set(true);
             self.list_selection.set_selected(pos as u32);
             self.suppress.set(false);
+            self.list_view.scroll_to(pos as u32, gtk::ListScrollFlags::NONE, None::<gtk::ScrollInfo>);
         }
 
         self.reader.title.set_title(&row.title);
@@ -778,26 +775,8 @@ impl App {
             }
         }
 
-        let still_matches = {
-            let st = self.state.borrow();
-            let a = st.article(id);
-            match (&st.effective_source(), a) {
-                (_, None) => false,
-                (Source::Unread, Some(a)) => a.unread,
-                (Source::Saved, Some(a)) => a.saved,
-                _ => true,
-            }
-        };
-        if still_matches {
-            self.update_row(id);
-        } else if self.selected_id().as_deref() == Some(id)
-            || self.state.borrow().keep_visible.as_ref().map(|(_, i)| i.as_str()) == Some(id)
-        {
-            self.state.borrow_mut().keep_visible = Some((feed_id, id.to_string()));
-            self.update_row(id);
-        } else {
-            self.remove_row(id);
-        }
+        let _ = feed_id;
+        self.update_row(id);
 
         if self.reader.current.borrow().as_deref() == Some(id) {
             if let Some(row) = self.state.borrow().article(id).cloned() {
@@ -809,28 +788,6 @@ impl App {
         let feed_id2 = feed_id;
         let id2 = id.to_string();
         self.worker.send(move |db| db.set_status(feed_id2, &id2, read, saved));
-    }
-
-    fn flush_keep_visible(&self, new_selection: Option<&str>) {
-        let kv = self.state.borrow_mut().keep_visible.take();
-        if let Some((kv_feed, kv_id)) = kv {
-            if Some(kv_id.as_str()) == new_selection {
-                self.state.borrow_mut().keep_visible = Some((kv_feed, kv_id));
-                return;
-            }
-            let still_matches = {
-                let st = self.state.borrow();
-                match (&st.effective_source(), st.article(&kv_id)) {
-                    (_, None) => false,
-                    (Source::Unread, Some(a)) => a.unread,
-                    (Source::Saved, Some(a)) => a.saved,
-                    _ => true,
-                }
-            };
-            if !still_matches {
-                self.remove_row(&kv_id);
-            }
-        }
     }
 
     fn current_article(&self) -> Option<ArticleRow> {

@@ -100,7 +100,8 @@ impl Tokens {
 .lf-list {{ background-color: {sl}; }}
 listview.lf-articles {{ background-color: transparent; }}
 listview.lf-articles > row {{ background: transparent; padding: 0; margin: 0; }}
-listview.lf-articles > row:selected {{ background: transparent; }}
+listview.lf-articles > row:selected {{ background-color: {sel}; border-radius: 8px; }}
+listview.lf-articles > row:selected .lf-article-row {{ background-color: {sel}; border-radius: 8px; box-shadow: inset 3px 0 0 0 {ac}; }}
 .lf-article-row {{ padding: 12px 16px; min-height: 92px; border-bottom: 1px solid {sep2}; }}
 .lf-article-row:selected, listview.lf-articles > row:selected .lf-article-row {{ background-color: {sel}; border-radius: 8px; }}
 .lf-article-title {{ font-size: 14px; font-weight: 400; }}
