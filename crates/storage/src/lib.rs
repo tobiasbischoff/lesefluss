@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use thiserror::Error;
 
@@ -1108,6 +1108,53 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn validate_candidate(path: &std::path::Path) -> Result<i64> {
+        let file = std::fs::File::open(path)?;
+        let meta = file.metadata()?;
+        if meta.len() < 512 {
+            return Err(StorageError::Schema("Datei ist keine SQLite-Datenbank".into()));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| StorageError::Schema(format!("Keine SQLite-Datenbank: {e}")))?;
+        let integrity: String = conn
+            .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+            .map_err(|e| StorageError::Schema(format!("Integritätsprüfung fehlgeschlagen: {e}")))?;
+        if integrity != "ok" {
+            return Err(StorageError::Schema(format!(
+                "Integritätsprüfung: {integrity}"
+            )));
+        }
+        for table in ["accounts", "feeds", "articles", "schema_version"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .map_err(|e| StorageError::Schema(e.to_string()))?;
+            if found == 0 {
+                return Err(StorageError::Schema(format!(
+                    "Erwartete Tabelle {table} fehlt — keine Lesefluss-Bibliothek"
+                )));
+            }
+        }
+        let version: i64 = conn
+            .query_row("SELECT COALESCE(MAX(version),0) FROM schema_version", [], |r| {
+                r.get(0)
+            })
+            .map_err(|e| StorageError::Schema(e.to_string()))?;
+        let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
+        if version > max_known {
+            return Err(StorageError::Schema(format!(
+                "Schema-Version {version} ist neuer als diese App ({max_known})"
+            )));
+        }
+        Ok(version)
+    }
+
     pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
         self.conn.execute("VACUUM INTO ?1", params![path.to_string_lossy().to_string()])?;
         Ok(())
@@ -1503,6 +1550,13 @@ fn build_fts_query(query: &str) -> String {
 mod tests {
     use super::*;
 
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lesefluss-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn seed(db: &Database) -> i64 {
         db.ensure_local_account().unwrap();
         db.add_feed("local", "https://example.com/feed.xml", "Example", Some("https://example.com"), "#123456")
@@ -1696,6 +1750,80 @@ mod tests {
         assert!(db.outbox_pending(&remote, now, 10).unwrap().is_empty());
         db.apply_status_with_outbox(feed, "e1", Some(false), None).unwrap();
         assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 2, "Revision bleibt dauerhaft monoton");
+    }
+
+    #[test]
+    fn candidate_validation_rejects_garbage_and_foreign_databases() {
+        let dir = tempdir("validate");
+        let garbage = dir.join("garbage.db");
+        std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
+        assert!(Database::validate_candidate(&garbage).is_err(), "kein SQLite");
+
+        let truncated = dir.join("truncated.db");
+        let db = Database::open(&dir.join("live.db")).unwrap();
+        db.ensure_local_account().unwrap();
+        db.backup_to(&truncated).unwrap();
+        {
+            let bytes = std::fs::read(&truncated).unwrap();
+            let mut cut = bytes.clone();
+            cut.truncate(bytes.len() / 2);
+            std::fs::write(&truncated, &cut).unwrap();
+        }
+        assert!(
+            Database::validate_candidate(&truncated).is_err(),
+            "abgeschnittene Datenbank wird abgelehnt"
+        );
+
+        let foreign = dir.join("foreign.db");
+        let conn = Connection::open(&foreign).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated(x);").unwrap();
+        drop(conn);
+        assert!(Database::validate_candidate(&foreign).is_err(), "fremde Datenbank");
+
+        let good = dir.join("good.db");
+        db.backup_to(&good).unwrap();
+        assert!(Database::validate_candidate(&good).is_ok());
+    }
+
+    #[test]
+    fn candidate_validation_rejects_newer_schema() {
+        let dir = tempdir("newer");
+        let candidate = dir.join("candidate.db");
+        let db = Database::open(&dir.join("live.db")).unwrap();
+        db.ensure_local_account().unwrap();
+        db.backup_to(&candidate).unwrap();
+        {
+            let conn = Connection::open(&candidate).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version(version, applied_ms) VALUES (9999, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let err = Database::validate_candidate(&candidate).unwrap_err();
+        assert!(err.to_string().contains("neuer"), "{err}");
+    }
+
+    #[test]
+    fn backup_keeps_outbox_and_preferences() {
+        let dir = tempdir("backup");
+        let live = dir.join("live.db");
+        let target = dir.join("backup.db");
+        let db = Database::open(&live).unwrap();
+        let remote = remote_account(&db);
+        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", Some("<p>x</p>"), now).unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), Some(true)).unwrap();
+        db.set_pref("theme", "omarchy").unwrap();
+        db.backup_to(&target).unwrap();
+        let restored = Database::open(&target).unwrap();
+        assert_eq!(restored.get_pref("theme").unwrap().as_deref(), Some("omarchy"));
+        assert_eq!(restored.outbox_pending(&remote, now, 10).unwrap().len(), 2);
+        assert_eq!(
+            restored.article_status(feed, "e1").unwrap(),
+            Some((false, true))
+        );
     }
 
     #[test]

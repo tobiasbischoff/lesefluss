@@ -13,17 +13,21 @@ struct Envelope {
 
 pub struct DbWorker {
     tx: std::sync::mpsc::Sender<Envelope>,
+    pub failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Clone for DbWorker {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone() }
+        Self { tx: self.tx.clone(), failure: self.failure.clone() }
     }
 }
 
 impl DbWorker {
     pub fn start(path: PathBuf) -> Self {
         let (tx, rx): (std::sync::mpsc::Sender<Envelope>, Receiver<Envelope>) = std::sync::mpsc::channel();
+        let failure: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let failure_thread = failure.clone();
         std::thread::Builder::new()
             .name("lf-db".into())
             .spawn(move || {
@@ -31,6 +35,9 @@ impl DbWorker {
                     Ok(db) => db,
                     Err(e) => {
                         eprintln!("Datenbank konnte nicht geöffnet werden: {e}");
+                        if let Ok(mut slot) = failure_thread.lock() {
+                            *slot = Some(e.to_string());
+                        }
                         return;
                     }
                 };
@@ -40,7 +47,7 @@ impl DbWorker {
                 }
             })
             .expect("db worker thread");
-        Self { tx }
+        Self { tx, failure }
     }
 
     pub fn send<F, R>(&self, f: F) -> Receiver<JobOut>

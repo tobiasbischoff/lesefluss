@@ -1443,7 +1443,7 @@ impl App {
         self.reload_meta_keep();
     }
 
-    fn show_toast(&self, msg: &str) {
+    pub fn show_toast(&self, msg: &str) {
         self.toast.add_toast(adw::Toast::new(msg));
     }
 
@@ -2193,14 +2193,20 @@ impl App {
             let Ok(file) = dlg.open_future(None::<&gtk::Window>).await else { return };
             let Some(path) = file.path() else { return };
             let pending = data_dir().join("restore.pending");
-            let ok = std::fs::copy(&path, &pending).is_ok();
+            let mut message = match std::fs::copy(&path, &pending) {
+                Ok(_) => match storage::Database::validate_candidate(&pending) {
+                    Ok(_) => "Backup geprüft — es wird beim nächsten Start wiederhergestellt".to_string(),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&pending);
+                        format!("Diese Datei ist keine lesbare Lesefluss-Bibliothek: {e}")
+                    }
+                },
+                Err(e) => format!("Wiederherstellung fehlgeschlagen: {e}"),
+            };
             if let Some(app) = w.upgrade() {
-                app.show_toast(if ok {
-                    "Backup vorgemerkt — wird beim nächsten Start wiederhergestellt"
-                } else {
-                    "Wiederherstellung fehlgeschlagen"
-                });
+                app.show_toast(&message);
             }
+            message.clear();
         });
     }
 
