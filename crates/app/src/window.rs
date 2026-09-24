@@ -67,7 +67,9 @@ pub struct App {
     pub preview_timer: RefCell<Option<glib::SourceId>>,
     pub search_timer: RefCell<Option<glib::SourceId>>,
     pub read_gen: Cell<u64>,
+    pub load_gen: Cell<u64>,
     pub suppress: Cell<bool>,
+    pub syncing_filters: Cell<bool>,
     pub selection_cause: Cell<SelectionCause>,
     pub list_dirty: RefCell<Vec<String>>,
     pub undo_stack: RefCell<Vec<UndoBatch>>,
@@ -190,8 +192,8 @@ impl App {
             .icon_name("view-list-symbolic")
             .tooltip_text("Alle Artikel anzeigen")
             .build();
-        let filter_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        filter_box.add_css_class("linked");
+        let filter_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        filter_box.add_css_class("lf-filterbar");
         filter_box.append(&filter_saved);
         filter_box.append(&filter_unread);
         filter_box.append(&filter_all);
@@ -273,7 +275,9 @@ impl App {
             preview_timer: RefCell::new(None),
             search_timer: RefCell::new(None),
             read_gen: Cell::new(0),
+            load_gen: Cell::new(0),
             suppress: Cell::new(false),
+            syncing_filters: Cell::new(false),
             selection_cause: Cell::new(SelectionCause::Unknown),
             list_dirty: RefCell::new(Vec::new()),
             undo_stack: RefCell::new(Vec::new()),
@@ -464,13 +468,24 @@ impl App {
             return;
         }
         let cur = cursor.clone();
+        self.load_gen.set(self.load_gen.get() + 1);
+        let gen = self.load_gen.get();
         self.db_query(
             move |db| match &search {
                 Some(q) if !q.is_empty() => db.search(q, 200),
                 _ => db.query_articles(&scope, filter, cur.as_ref().map(|(ms, id)| (*ms, id.as_str())), 200),
             },
             move |app, res: storage::Result<Vec<ArticleRow>>| {
+                if app.load_gen.get() != gen {
+                    dbg_log(&format!("load_page: stale gen {gen} verworfen"));
+                    return;
+                }
                 let Ok(rows) = res else { return };
+                if let Some(first) = rows.first() {
+                    dbg_log(&format!("load_page gen={gen} rows={} first={} unread={}", rows.len(), first.id, first.unread));
+                } else {
+                    dbg_log(&format!("load_page gen={gen} rows=0"));
+                }
                 let had_full_page = rows.len() >= 200;
                 let keep_sel = app.state.borrow().selected.clone();
                 {
@@ -489,6 +504,13 @@ impl App {
                 }
                 app.sync_store(append);
                 app.update_list_empty_state();
+                app.state.borrow_mut().loading_more = false;
+                if let Some(sel) = app.selected_id() {
+                    let current = app.reader.current.borrow().clone();
+                    if current.as_deref() != Some(sel.as_str()) {
+                        app.open_article_by_id(&sel, false, false);
+                    }
+                }
             },
         );
     }
@@ -672,9 +694,11 @@ impl App {
 
     fn sync_filter_buttons(&self) {
         let f = self.state.borrow().filter;
+        self.syncing_filters.set(true);
         self.filter_saved.set_active(f == Filter::Saved);
         self.filter_unread.set_active(f == Filter::Unread);
         self.filter_all.set_active(f == Filter::All);
+        self.syncing_filters.set(false);
     }
 
     fn scope_label_now(&self) -> String {
@@ -840,6 +864,7 @@ impl App {
 
         let feed_id2 = feed_id;
         let id2 = id.to_string();
+        dbg_log(&format!("set_status job: {id2} read={read:?} saved={saved:?}"));
         self.worker.send(move |db| db.set_status(feed_id2, &id2, read, saved));
     }
 
@@ -1459,8 +1484,13 @@ impl App {
             let w = self.weak();
             btn.connect_toggled(move |b| {
                 let Some(app) = w.upgrade() else { return };
+                if app.syncing_filters.get() {
+                    return;
+                }
                 if !b.is_active() {
+                    app.syncing_filters.set(true);
                     b.set_active(true);
+                    app.syncing_filters.set(false);
                     return;
                 }
                 app.set_filter(f);

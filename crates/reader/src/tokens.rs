@@ -112,6 +112,10 @@ listview.lf-articles > row:selected .lf-article-row {{ background-color: {sel}; 
 .lf-article-meta {{ font-size: 11px; color: {ts}; }}
 .lf-article-excerpt {{ font-size: 12px; color: {ts}; }}
 .lf-thumb {{ min-width: 64px; min-height: 64px; border-radius: 6px; }}
+.lf-filterbar {{ background: transparent; }}
+.lf-filterbar button {{ background: transparent; box-shadow: none; border: none; border-radius: 999px; min-width: 36px; min-height: 32px; padding: 0 8px; color: {ts}; }}
+.lf-filterbar button:hover {{ background: {sel}; }}
+.lf-filterbar button:checked {{ background: {sel}; color: {tp}; }}
 .lf-day-header {{ font-size: 12px; font-weight: 700; color: {ts}; padding: 14px 16px 2px; background-color: {sl}; }}
 .lf-status-icon {{ color: {ts}; opacity: 0.6; }}
 .lf-separator {{ background-color: {sep}; min-width: 1px; }}
