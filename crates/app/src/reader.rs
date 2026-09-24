@@ -3,6 +3,20 @@ use gtk::gio;
 use std::cell::{Cell, RefCell};
 use webkit6::prelude::*;
 
+/// Läuft in einer isolierten Script-Welt und setzt nachgeladene Bilder anhand
+/// von `data-lf-src`. Der WebView selbst bleibt skriptfrei (CSP `default-src 'none'`).
+const MEDIA_BRIDGE_JS: &str = r#"
+document.addEventListener('lf-media', function (event) {
+  var detail = event.detail;
+  if (!detail || !detail.url) return;
+  var images = document.querySelectorAll('img[data-lf-src="' + detail.url + '"]');
+  for (var i = 0; i < images.length; i++) {
+    images[i].src = detail.data;
+    images[i].removeAttribute('data-pending');
+  }
+});
+"#;
+
 pub struct ReaderPane {
     pub loading: adw::StatusPage,
     pub toolbar: adw::ToolbarView,
@@ -18,12 +32,26 @@ pub struct ReaderPane {
     pub current: RefCell<Option<String>>,
     pub pending_scroll: Cell<f64>,
     pub style: RefCell<crate::style::ReaderStyleState>,
+    pub document_generation: Cell<u64>,
 }
 
 impl ReaderPane {
     pub fn new() -> Self {
         let session = webkit6::NetworkSession::new_ephemeral();
-        let webview = webkit6::WebView::builder().network_session(&session).build();
+        // Mediennachlagerung läuft als User-Script in einer isolierten Welt;
+        // die Seite selbst bleibt durch `default-src 'none'` skriptfrei.
+        let content_manager = webkit6::UserContentManager::new();
+        content_manager.add_script(&webkit6::UserScript::new(
+            MEDIA_BRIDGE_JS,
+            webkit6::UserContentInjectedFrames::TopFrame,
+            webkit6::UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        ));
+        let webview = webkit6::WebView::builder()
+            .network_session(&session)
+            .user_content_manager(&content_manager)
+            .build();
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
             settings.set_enable_back_forward_navigation_gestures(false);
         }
@@ -158,6 +186,7 @@ impl ReaderPane {
             current: RefCell::new(None),
             pending_scroll: Cell::new(-1.0),
             style: RefCell::new(crate::style::ReaderStyleState::default()),
+            document_generation: Cell::new(0),
         }
     }
 
@@ -165,8 +194,9 @@ impl ReaderPane {
         self.stack.set_visible_child_name("loading");
     }
 
-    pub fn load_html_doc(&self, html: &str) {
+    pub fn load_html_doc(&self, html: &str, generation: u64) {
         self.stack.set_visible_child_name("web");
+        self.document_generation.set(generation);
         self.webview.load_html(html, None);
     }
 
@@ -179,6 +209,25 @@ impl ReaderPane {
         self.empty.set_title(title);
         self.empty.set_description(Some(description));
         self.stack.set_visible_child_name("empty");
+    }
+
+    /// Weist einem Bild anhand seiner `data-lf-src`-Adresse ein Bild zu.
+    /// Die Brücke läuft im User-Script, nicht in der Seite.
+    pub fn apply_media(&self, url: &str, data_uri: &str) {
+        fn escape(v: &str) -> String {
+            v.replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', "\\n")
+        }
+        let payload = format!(
+            "{{\\\"url\\\":'{}',\\\"data\\\":'{}'}}",
+            escape(url),
+            escape(data_uri)
+        );
+        let js = format!(
+            "document.dispatchEvent(new CustomEvent('lf-media', {{ detail: {payload} }}));"
+        );
+        self.webview.evaluate_javascript(&js, None, None, None::<&gio::Cancellable>, |_| {});
     }
 
     pub fn restore_scroll(&self) {

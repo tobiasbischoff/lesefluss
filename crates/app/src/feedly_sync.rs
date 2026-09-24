@@ -196,6 +196,7 @@ async fn ingest_entries(
     entries: Vec<pf::Entry>,
 ) -> Result<usize, String> {
     let mut per_feed: std::collections::HashMap<i64, Vec<storage::NewArticle>> = std::collections::HashMap::new();
+    let mut per_feed_media: Vec<(i64, Vec<(String, Vec<String>)>)> = Vec::new();
     let mut statuses: Vec<(String, bool, bool)> = Vec::new();
     for e in &entries {
         let Some(stream) = e.feed_stream_id() else { continue };
@@ -210,6 +211,10 @@ async fn ingest_entries(
             _ => continue,
         };
         statuses.push((e.id.clone(), e.unread.unwrap_or(true), e.is_saved()));
+        let urls = reader::sanitize::image_sources(
+            &e.html().unwrap_or_else(|| "<p></p>".to_string()),
+        );
+        per_feed_media.push((fid, vec![(e.id.clone(), urls)]));
         per_feed.entry(fid).or_default().push(entry_to_new_article(e));
     }
     let mut added = 0usize;
@@ -218,6 +223,16 @@ async fn ingest_entries(
             .await
             .map_err(|e| e.to_string())?;
         added += a;
+    }
+    for (fid, images) in per_feed_media {
+        db(worker, move |db2| {
+            for (article_id, urls) in images {
+                db2.set_article_media(fid, &article_id, &urls)?;
+            }
+            Ok::<_, storage::StorageError>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
     let generation = db(worker, {
         let account_id = account_id.to_string();

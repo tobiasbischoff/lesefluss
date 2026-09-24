@@ -18,6 +18,9 @@ pub struct ReaderDocument<'a> {
     pub source: &'a str,
     pub published: &'a str,
     pub content_html: &'a str,
+    /// Kennung des Dokuments; verhindert, dass verspätete Ergebnisse die
+    /// Leseposition eines anderen Artikels überschreiben.
+    pub generation: u64,
 }
 
 pub struct ReaderStyle {
@@ -50,6 +53,7 @@ pub fn render_document(doc: &ReaderDocument, tokens: &Tokens, style: &ReaderStyl
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:;">
+<meta name="lf-doc" content="{generation}">
 <style>{css}</style>
 </head>
 <body>
@@ -70,5 +74,6 @@ pub fn render_document(doc: &ReaderDocument, tokens: &Tokens, style: &ReaderStyl
         title = escape_html(doc.title),
         meta = meta,
         content = doc.content_html,
+        generation = doc.generation,
     )
 }

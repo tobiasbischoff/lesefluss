@@ -193,3 +193,173 @@ mod tests {
         assert!(r.html.contains("rel=\"noopener noreferrer nofollow\""), "{}", r.html);
     }
 }
+
+/// Ersetzt **nur** das `src`-Attribut innerhalb von `<img>`-Tags durch einen
+/// Platzhalter und merkt die Originaladresse in `data-lf-src`.
+/// Text, Linkziele und andere Attribute bleiben unangetastet, weil nur der
+/// Bereich zwischen `<img` und dem zugehörigen `>` verändert wird.
+pub fn rewrite_images(html: &str, placeholder: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &html[i..];
+        if !rest.get(..4).map(|t| t.eq_ignore_ascii_case("<img")).unwrap_or(false) {
+            let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&rest[..ch_len]);
+            i += ch_len;
+            continue;
+        }
+        let tag_end = match rest.find('>') {
+            Some(e) => i + e,
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        let tag = &html[i..tag_end];
+        match attr_value(tag, "src") {
+            Some(src) if !src.starts_with("data:") => {
+                let escaped = escape_attr(&src);
+                let mut replaced = String::with_capacity(tag.len() + escaped.len() + 24);
+                if let Some(pos) = tag_lower_find(&tag.to_ascii_lowercase(), "src") {
+                    replaced.push_str(&tag[..pos]);
+                    replaced.push_str(&format!(
+                        "data-lf-src=\"{escaped}\" src=\"{}\"",
+                        escape_attr(placeholder)
+                    ));
+                    replaced.push_str(&tag[pos + 3..]);
+                } else {
+                    replaced.push_str(&tag[4..]);
+                    replaced.push_str(&format!(" data-lf-src=\"{escaped}\" src=\"{}\"", escape_attr(placeholder)));
+                }
+                out.push_str(&replaced);
+            }
+            _ => out.push_str(tag),
+        }
+        i = tag_end;
+    }
+    out
+}
+
+fn tag_lower_find(tag_lower: &str, attr: &str) -> Option<usize> {
+    let needle = format!(" {attr}");
+    tag_lower.find(&needle).map(|i| i + 1)
+}
+
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let pos = tag_lower_find(&lower, name)?;
+    let rest = &tag[pos + name.len()..];
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let end = rest[1..].find(quote)?;
+        return Some(rest[1..1 + end].to_string());
+    }
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '>')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+fn escape_attr(value: &str) -> String {
+    value.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Setzt für Bilder mit passendem `data-lf-src` die Datenquelle;
+/// berührt ausschließlich das `src`-Attribut von `<img>`.
+pub fn replace_marker(html: &str, url: &str, data_uri: &str) -> String {
+    rewrite_images_one(html, url, data_uri)
+}
+
+fn rewrite_images_one(html: &str, url: &str, data_uri: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &html[i..];
+        if !rest.get(..4).map(|t| t.eq_ignore_ascii_case("<img")).unwrap_or(false) {
+            let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&rest[..ch_len]);
+            i += ch_len;
+            continue;
+        }
+        let tag_end = match rest.find('>') {
+            Some(e) => i + e,
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        let tag = &html[i..tag_end];
+        if attr_value(tag, "data-lf-src").as_deref() == Some(url) {
+            let lower = tag.to_ascii_lowercase();
+            let src_pos = tag_lower_find(&lower, "src");
+            let mut rebuilt = String::with_capacity(tag.len() + data_uri.len());
+            if let Some(pos) = src_pos {
+                rebuilt.push_str(&tag[..pos]);
+                rebuilt.push_str(&format!("src=\"{}\"", escape_attr(data_uri)));
+                rebuilt.push_str(&tag[pos + 3..]);
+            } else {
+                rebuilt.push_str(tag);
+            }
+            out.push_str(&rebuilt);
+        } else {
+            out.push_str(tag);
+        }
+        i = tag_end;
+    }
+    out
+}
+
+pub fn image_alt_texts(html: &str) -> Vec<(String, String)> {
+    let Ok(selector) = scraper::Selector::parse("img[data-lf-src]") else {
+        return Vec::new();
+    };
+    scraper::Html::parse_fragment(html)
+        .select(&selector)
+        .filter_map(|el| {
+            el.value()
+                .attr("data-lf-src")
+                .map(|src| (src.to_string(), el.value().attr("alt").unwrap_or("Bild").to_string()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn only_img_src_is_replaced() {
+        let html = r#"<p>Text mit https://cdn.example/a.png als Linktext</p>
+            <a href="https://cdn.example/a.png">Link</a>
+            <img src="https://cdn.example/a.png" alt="Bild">"#;
+        let out = rewrite_images(html, "data:image/gif;base64,R0lGODlhAQABAAAAACw=");
+        assert!(!out.contains("Linktext mit https://cdn.example/a.png"));
+        assert!(out.contains(r#"<a href="https://cdn.example/a.png">"#), "Linkziel bleibt");
+        assert!(out.contains(r#"data-lf-src="https://cdn.example/a.png""#));
+        assert!(out.contains(r#"src="data:image/gif;base64,R0lGODlhAQABAAAAACw=""#));
+        let alts = image_alt_texts(&out);
+        assert_eq!(alts, vec![("https://cdn.example/a.png".to_string(), "Bild".to_string())]);
+    }
+
+    #[test]
+    fn marker_is_replaced_only_for_the_matching_image() {
+        let html = r#"<img data-lf-src="https://a.example/1.png" src="PH" alt="eins">
+            <img data-lf-src="https://a.example/2.png" src="PH" alt="zwei">"#;
+        let out = replace_marker(html, "https://a.example/1.png", "data:image/png;base64,AAA");
+        assert!(out.contains(r#"src="data:image/png;base64,AAA""#));
+        assert!(out.contains(r#"data-lf-src="https://a.example/2.png" src="PH""#), "zweites Bild bleibt");
+    }
+
+    #[test]
+    fn inline_data_images_are_left_alone() {
+        let html = r#"<img src="data:image/png;base64,iVBORw0KGgo=" alt="x">"#;
+        let out = rewrite_images(html, "data:image/gif;base64,R0lGODlhAQABAAAAACw=");
+        assert!(out.contains("data:image/png;base64"));
+        assert!(!out.contains("data-lf-src"));
+    }
+}

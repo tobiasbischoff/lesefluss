@@ -29,6 +29,21 @@ pub fn dbg_log(msg: &str) {
 }
 
 /// Externe Einstiegspunkte: nur http(s), ohne Userinfo.
+/// `"<gen>:<idx>:<offset>"` aus dem Reader-JS; `None` bei ungültiger Antwort.
+pub fn parse_position(raw: &str) -> Option<(u64, i64, i64)> {
+    let mut parts = raw.split(':');
+    let gen: u64 = parts.next()?.trim().parse().ok()?;
+    let idx: i64 = parts.next()?.trim().parse().ok()?;
+    let off: i64 = parts.next()?.trim().parse().ok()?;
+    Some((gen, idx, off))
+}
+
+fn app_at<F: FnOnce(&Rc<App>)>(w: &Weak<App>, f: F) {
+    if let Some(app) = w.upgrade() {
+        f(&app);
+    }
+}
+
 pub fn external_uri_allowed(raw: &str) -> bool {
     match url::Url::parse(raw) {
         Ok(u) if matches!(u.scheme(), "http" | "https") => u.username().is_empty() && u.password().is_none(),
@@ -169,6 +184,14 @@ mod router_tests {
     }
 
     #[test]
+    fn position_payload_is_parsed_with_generation() {
+        assert_eq!(parse_position("7:12:340"), Some((7, 12, 340)));
+        assert_eq!(parse_position("0:-1:0"), Some((0, -1, 0)));
+        assert_eq!(parse_position("keine:12:340"), None);
+        assert_eq!(parse_position("7:12"), None);
+    }
+
+    #[test]
     fn external_uris_are_restricted_to_http_without_userinfo() {
         assert!(external_uri_allowed("https://example.com/a"));
         assert!(external_uri_allowed("http://example.com/a"));
@@ -263,7 +286,7 @@ pub fn data_dir() -> std::path::PathBuf {
     base.join("lesefluss")
 }
 
-const JS_CAPTURE_POS: &str = "(()=>{const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return '-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return idx+':'+Math.round(off);})()";
+const JS_CAPTURE_POS: &str = "(()=>{const g=document.querySelector('meta[name=lf-doc]');const gen=g?g.content:'-1';const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return gen+':-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return gen+':'+idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return gen+':'+idx+':'+Math.round(off);})()";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SelectionCause {
@@ -305,7 +328,7 @@ pub struct App {
     pub media: std::sync::Arc<provider_local::media::MediaCache>,
     pub prefs: RefCell<Prefs>,
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
-    pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<(ArticleRow, String, Vec<(String, String)>)>>>,
+    pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<((i64, String), u64, Vec<(String, String)>)>>>,
     pub drain_active: Cell<bool>,
     pub preview_timer: RefCell<Option<glib::SourceId>>,
     pub search_timer: RefCell<Option<glib::SourceId>>,
@@ -606,16 +629,16 @@ impl App {
         if let Ok(mut q) = self.pending_media.lock() {
             let jobs: Vec<_> = q.drain(..).collect();
             drop(q);
-            for (row, mut html, reps) in jobs {
+            for ((feed_id, id), gen, reps) in jobs {
                 let current = self.reader.current.borrow().clone();
-                if current.as_deref() != Some(row.id.as_str()) {
+                if current.as_deref() != Some(id.as_str()) || self.read_gen.get() != gen {
+                    dbg_log(&format!("Medienergebnis für {id} verworfen (Generation {gen})"));
                     continue;
                 }
-                for (u, d) in &reps {
-                    html = html.replace(u, d).replace(&u.replace('&', "&amp;"), d);
+                let _ = feed_id;
+                for (url, data) in &reps {
+                    self.reader.apply_media(url, data);
                 }
-                let doc = self.reader_doc(&row, &html);
-                self.reader.load_html_doc(&doc);
             }
         }
         loop {
@@ -1741,58 +1764,54 @@ impl App {
             source: "",
             published: &published,
             content_html: html,
+            generation: self.reader.document_generation.get(),
         };
         reader::render_document(&doc, &tokens, &rs)
     }
 
     fn load_reader_html(&self, row: ArticleRow, html: String) {
-        let imgs: Vec<(String, String)> = {
-            let srcs = reader::sanitize::image_sources(&html);
-            if let Ok(sel) = scraper::Selector::parse("img[src]") {
-                let doc = scraper::Html::parse_fragment(&html);
-                srcs
-                    .into_iter()
-                    .take(25)
-                    .map(|u| {
-                        let alt = doc
-                            .select(&sel)
-                            .find_map(|el| {
-                                if el.value().attr("src") == Some(u.as_str()) {
-                                    Some(el.value().attr("alt").unwrap_or("Bild").to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| "Bild".to_string());
-                        (u, alt)
-                    })
-                    .collect()
-            } else {
-                srcs.into_iter().take(25).map(|u| (u, "Bild".to_string())).collect()
-            }
-        };
-        if imgs.is_empty() {
-            let doc = self.reader_doc(&row, &html);
-            self.reader.load_html_doc(&doc);
+        // Sofort rendern: Cache-Bilder einbetten, alle anderen als Platzhalter
+        // markieren. Nachgeladen wird asynchron über die Medien-Brücke.
+        let cached: Vec<(String, String)> = reader::sanitize::image_alt_texts(&html)
+            .into_iter()
+            .filter_map(|(url, _)| {
+                self.media
+                    .get_cached(&url)
+                    .map(|(bytes, mime)| (url, provider_local::media::data_uri(&bytes, mime)))
+            })
+            .collect();
+        let placeholder = provider_local::media::placeholder_data_uri("Bild");
+        let mut prepared = reader::sanitize::rewrite_images(&html, &placeholder);
+        for (url, data) in &cached {
+            prepared = reader::sanitize::replace_marker(&prepared, url, data);
+        }
+        let doc = self.reader_doc(&row, &prepared);
+        let gen = self.read_gen.get() + 1;
+        self.reader.load_html_doc(&doc, gen);
+
+        let missing: Vec<(String, String)> = reader::sanitize::image_alt_texts(&html)
+            .into_iter()
+            .filter(|(url, _)| !cached.iter().any(|(u, _)| u == url))
+            .collect();
+        if missing.is_empty() {
             return;
         }
         let media = std::sync::Arc::clone(&self.media);
         let http = self.net.http();
         let queue = self.pending_media.clone();
+        let article_key = (row.feed_id, row.id.clone());
         self.net.spawn(async move {
-            let mut reps: Vec<(String, String)> = Vec::new();
-            for (u, alt) in imgs {
-                match media.get_or_fetch(&http, &u).await {
+            let mut jobs: Vec<(String, String)> = Vec::new();
+            for (url, alt) in missing {
+                match media.get_or_fetch(&http, &url).await {
                     Some((bytes, mime)) => {
-                        reps.push((u, provider_local::media::data_uri(&bytes, mime)));
+                        jobs.push((url, provider_local::media::data_uri(&bytes, mime)));
                     }
-                    None => {
-                        reps.push((u, provider_local::media::placeholder_data_uri(&alt)));
-                    }
+                    None => jobs.push((url, provider_local::media::placeholder_data_uri(&alt))),
                 }
             }
             if let Ok(mut q) = queue.lock() {
-                q.push((row, html, reps));
+                q.push((article_key, gen, jobs));
             }
         });
     }
@@ -1801,37 +1820,37 @@ impl App {
         let Some(row) = self.state.borrow().article(id) else { return };
         let w = self.weak();
         let id2 = id.to_string();
+        let gen = self.reader.document_generation.get();
         let row_db = row.clone();
-        self.db_query(
-            move |db| db.content_hash(row_db.feed_id, &row_db.id),
-            move |app, res: storage::Result<Option<String>>| {
-                let hash = res.ok().flatten();
+        // Erst den Inhalt des gezeigten Dokuments sichern, dann den Hash holen.
+        self.reader.webview.evaluate_javascript(
+            JS_CAPTURE_POS,
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            move |res| {
+                let Ok(v) = res else { return };
+                let raw = v.to_string();
+                let Some((doc_gen, idx, off)) = parse_position(&raw) else { return };
+                if doc_gen != gen {
+                    dbg_log(&format!("Leseposition verworfen: Dokument {doc_gen} statt {gen}"));
+                    return;
+                }
                 let w2 = w.clone();
                 let id3 = id2.clone();
-                app.reader.webview.evaluate_javascript(
-                    JS_CAPTURE_POS,
-                    None,
-                    None,
-                    None::<&gio::Cancellable>,
-                    move |res| {
-                        let Ok(v) = res else { return };
-                        let s = v.to_string();
-                        let mut parts = s.split(':');
-                        let idx: i64 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                        let off: i64 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                        if idx < 0 {
-                            return;
-                        }
-                        if let Some(app) = w2.upgrade() {
-                            if let Some(r) = app.state.borrow().article(&id3) {
-                                let _ = app.worker.send(move |db| {
-                                    db.save_read_position(r.feed_id, &r.id, hash.as_deref(), idx, off)
-                                });
-                            }
-                        }
-                    },
-                );
-                let _ = w;
+                app_at(&w2, move |app| {
+                    let row_db2 = row_db.clone();
+                    let id4 = id3.clone();
+                    app.db_query(
+                        move |db| {
+                            let hash = db.content_hash(row_db2.feed_id, &row_db2.id)?;
+                            db.save_read_position(row_db2.feed_id, &row_db2.id, hash.as_deref(), idx, off)
+                        },
+                        move |_app, _res| {
+                            let _ = &id4;
+                        },
+                    );
+                });
             },
         );
     }
@@ -1848,6 +1867,7 @@ impl App {
         }
         let Some(id) = self.reader.current.borrow().clone() else { return };
         let Some(row) = self.state.borrow().article(&id) else { return };
+        let row_id = row.id.clone();
         let w = self.weak();
         self.db_query(
             move |db| {
@@ -1862,6 +1882,9 @@ impl App {
                     return;
                 }
                 if idx == 0 && off == 0 {
+                    return;
+                }
+                if app.reader.current.borrow().as_deref() != Some(row_id.as_str()) {
                     return;
                 }
                 let js = format!(
