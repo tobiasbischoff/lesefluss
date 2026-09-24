@@ -1,5 +1,6 @@
 use crate::dbworker::{DbWorker, JobOut};
 use crate::feedly_sync;
+use crate::prefs::Prefs;
 use crate::list;
 use crate::model::{ListRow, UiState};
 use crate::net::{Net, NetEvent};
@@ -81,6 +82,7 @@ pub struct App {
     pub worker: DbWorker,
     pub net: Rc<Net>,
     pub media: std::sync::Arc<provider_local::media::MediaCache>,
+    pub prefs: RefCell<Prefs>,
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
     pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<(ArticleRow, String, Vec<(String, String)>)>>>,
     pub drain_active: Cell<bool>,
@@ -271,6 +273,7 @@ impl App {
             .content(&toast)
             .build();
         window.add_css_class("lf-window");
+        gtk::prelude::GtkWindowExt::set_icon_name(&window, Some("io.github.PROJEKTINHABER.Lesefluss"));
 
         let css = gtk::CssProvider::new();
         let display = gtk::prelude::WidgetExt::display(&window);
@@ -301,6 +304,7 @@ impl App {
             state: RefCell::new(UiState::default()),
             worker,
             net,
+            prefs: RefCell::new(Prefs::default()),
             media: std::sync::Arc::new(
                 provider_local::media::MediaCache::new(
                     provider_local::media::cache_dir(),
@@ -332,7 +336,9 @@ impl App {
             app.reader.webview.clone().upcast::<gtk::Widget>(),
         ];
 
+        app.load_prefs();
         app.apply_theme_now();
+        app.start_theme_watch();
         app.wire(factory);
         app.register_actions(application);
         app.install_width_watcher();
@@ -2004,8 +2010,26 @@ impl App {
     // ── Thema & Layout ──
 
     fn apply_theme_now(&self) {
-        let dark = adw::StyleManager::default().is_dark();
-        let tokens = tokens_for(dark);
+        let mode = self.prefs.borrow().theme.clone();
+        let tokens = match mode.as_str() {
+            "omarchy" => crate::theme_omarchy::omarchy_tokens().unwrap_or_else(|| tokens_for(adw::StyleManager::default().is_dark())),
+            "dark" => tokens_for(true),
+            "light" => tokens_for(false),
+            _ => tokens_for(adw::StyleManager::default().is_dark()),
+        };
+        let scheme = match mode.as_str() {
+            "dark" => adw::ColorScheme::ForceDark,
+            "light" => adw::ColorScheme::ForceLight,
+            "omarchy" => {
+                if tokens.dark {
+                    adw::ColorScheme::ForceDark
+                } else {
+                    adw::ColorScheme::ForceLight
+                }
+            }
+            _ => adw::ColorScheme::PreferLight,
+        };
+        adw::StyleManager::default().set_color_scheme(scheme);
         *self.tokens.borrow_mut() = tokens;
         self.css.load_from_string(&gtk_css_for(&tokens));
         let rgba = gtk::gdk::RGBA::new(
@@ -2020,6 +2044,273 @@ impl App {
     fn apply_theme(&self) {
         self.apply_theme_now();
         self.reload_current(true);
+    }
+
+    fn load_prefs(&self) {
+        let worker = self.worker.clone();
+        let res = worker.send(|db| {
+            let mut out: Vec<(String, String)> = Vec::new();
+            for key in [
+                "auto_read",
+                "compact",
+                "thumbs",
+                "reader_font",
+                "reader_measure",
+                "reader_line_height",
+                "theme",
+                "letter_shortcuts",
+                "refresh_min",
+                "retention_days",
+                "media_mb",
+            ] {
+                if let Ok(Some(v)) = db.get_pref(key) {
+                    out.push((key.to_string(), v));
+                }
+            }
+            out
+        }).recv();
+        if let Ok(boxed) = res {
+            if let Some(entries) = boxed.downcast_ref::<Vec<(String, String)>>() {
+                let map: std::collections::HashMap<String, String> = entries.clone().into_iter().collect();
+                let prefs = Prefs::load(&|k| map.get(k).cloned());
+                *self.prefs.borrow_mut() = prefs.clone();
+                self.apply_prefs_live();
+            }
+        }
+    }
+
+    fn apply_prefs_live(&self) {
+        let p = self.prefs.borrow().clone();
+        self.window.remove_css_class("lf-compact");
+        if p.compact {
+            self.window.add_css_class("lf-compact");
+        }
+        let mut style = self.reader.style.borrow_mut();
+        style.font_size = p.reader_font;
+        style.measure_ch = p.reader_measure;
+        style.line_height = p.reader_line_height;
+        drop(style);
+        self.media.set_max_bytes((p.media_mb as u64) * 1024 * 1024);
+        self.register_letter_accels();
+        self.sync_store(false);
+    }
+
+    fn register_letter_accels(&self) {
+        let app = adw::Application::default();
+        let on = self.prefs.borrow().letter_shortcuts;
+        let pairs: &[(&str, &[&str])] = &[
+            ("win.next-article", if on { &["j"] } else { &[] }),
+            ("win.prev-article", if on { &["k"] } else { &[] }),
+            ("win.next-unread", if on { &["n"] } else { &[] }),
+            ("win.prev-unread", if on { &["p"] } else { &[] }),
+            ("win.toggle-read", if on { &["m"] } else { &[] }),
+            ("win.toggle-saved", if on { &["s"] } else { &[] }),
+            ("win.open-external", if on { &["o"] } else { &[] }),
+        ];
+        for (action, accels) in pairs {
+            app.set_accels_for_action(action, accels);
+        }
+    }
+
+    fn save_pref(&self, key: &str, value: &str) {
+        let k = key.to_string();
+        let v = value.to_string();
+        self.worker.send(move |db| db.set_pref(&k, &v));
+    }
+
+    fn settings_dialog(&self) {
+        let win = adw::PreferencesWindow::builder().modal(true).transient_for(&self.window).build();
+        let p = self.prefs.borrow().clone();
+
+        let page_read = adw::PreferencesPage::builder().title("Lesen").icon_name("text-x-generic-symbolic").build();
+        let grp = adw::PreferencesGroup::builder().title("Leseverhalten").build();
+        let auto = adw::SwitchRow::builder().title("Automatisch als gelesen markieren").subtitle("Nach 0,8 s sichtbarem Artikel").active(p.auto_read).build();
+        grp.add(&auto);
+        let font = adw::SpinRow::builder().title("Schriftgröße Reader").adjustment(&gtk::Adjustment::new(p.reader_font, 14.0, 28.0, 1.0, 2.0, 0.0)).build();
+        grp.add(&font);
+        let measure = adw::SpinRow::builder().title("Zeilenbreite (Zeichen)").adjustment(&gtk::Adjustment::new(p.reader_measure as f64, 55.0, 85.0, 1.0, 5.0, 0.0)).build();
+        grp.add(&measure);
+        let lh = adw::SpinRow::builder().title("Zeilenhöhe").adjustment(&gtk::Adjustment::new(p.reader_line_height, 1.4, 2.0, 0.05, 0.1, 0.0)).build();
+        grp.add(&lh);
+        page_read.add(&grp);
+        win.add(&page_read);
+
+        let page_view = adw::PreferencesPage::builder().title("Darstellung").icon_name("preferences-desktop-appearance-symbolic").build();
+        let grp = adw::PreferencesGroup::builder().title("Erscheinungsbild").build();
+        let theme = adw::ComboRow::builder().title("Theme").model(&gtk::StringList::new(&["system", "dark", "light", "omarchy"])).build();
+        let idx = match p.theme.as_str() {
+            "dark" => 1,
+            "light" => 2,
+            "omarchy" => 3,
+            _ => 0,
+        };
+        theme.set_selected(idx);
+        grp.add(&theme);
+        let compact = adw::SwitchRow::builder().title("Kompakte Liste").active(p.compact).build();
+        grp.add(&compact);
+        let thumbs = adw::SwitchRow::builder().title("Bildvorschauen in der Liste").active(p.thumbs).build();
+        grp.add(&thumbs);
+        let letters = adw::SwitchRow::builder().title("Buchstabenkürzel (j/k/n/p/m/s/o)").active(p.letter_shortcuts).build();
+        grp.add(&letters);
+        page_view.add(&grp);
+        win.add(&page_view);
+
+        let page_sync = adw::PreferencesPage::builder().title("Aktualisierung").icon_name("view-refresh-symbolic").build();
+        let grp = adw::PreferencesGroup::builder().title("Abruf").build();
+        let refresh = adw::SpinRow::builder().title("Intervall (Minuten)").adjustment(&gtk::Adjustment::new(p.refresh_min as f64, 5.0, 1440.0, 5.0, 30.0, 0.0)).build();
+        grp.add(&refresh);
+        page_sync.add(&grp);
+        win.add(&page_sync);
+
+        let page_store = adw::PreferencesPage::builder().title("Speicher & Datenschutz").icon_name("drive-harddisk-symbolic").build();
+        let grp = adw::PreferencesGroup::builder().title("Aufbewahrung").build();
+        let retention = adw::SpinRow::builder().title("Gelesene Inhalte behalten (Tage)").subtitle("Danach Bereinigung; Gespeicherte bleiben").adjustment(&gtk::Adjustment::new(p.retention_days as f64, 7.0, 3650.0, 1.0, 30.0, 0.0)).build();
+        grp.add(&retention);
+        let media = adw::SpinRow::builder().title("Bildcache (MiB)").adjustment(&gtk::Adjustment::new(p.media_mb as f64, 64.0, 4096.0, 64.0, 256.0, 0.0)).build();
+        grp.add(&media);
+        page_store.add(&grp);
+        win.add(&page_store);
+
+        let page_acc = adw::PreferencesPage::builder().title("Konten").icon_name("system-users-symbolic").build();
+        let grp = adw::PreferencesGroup::builder().title("Konten").build();
+        let local = adw::ActionRow::builder().title("Lokale Bibliothek").subtitle("Aktiv — Feeds, OPML, Suche, Offline").build();
+        grp.add(&local);
+        let feedly_state = {
+            let st = self.state.borrow();
+            if st.accounts.iter().any(|(_, k, _)| k == "feedly") {
+                "Verbunden (Delta-Sync alle 15 min)"
+            } else {
+                "Nicht verbunden (Zahnrad → Feedly verbinden)"
+            }
+        };
+        let feedly = adw::ActionRow::builder().title("Feedly").subtitle(feedly_state).build();
+        grp.add(&feedly);
+        page_acc.add(&grp);
+        win.add(&page_acc);
+
+        let w = self.weak();
+        auto.connect_active_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().auto_read = row.is_active();
+                let v = if row.is_active() { "1" } else { "0" };
+                app.save_pref("auto_read", v);
+            }
+        });
+        let w = self.weak();
+        font.connect_value_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().reader_font = row.value();
+                app.save_pref("reader_font", &row.value().to_string());
+                app.reload_current(true);
+            }
+        });
+        let w = self.weak();
+        measure.connect_value_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().reader_measure = row.value() as u32;
+                app.save_pref("reader_measure", &(row.value() as u32).to_string());
+                app.reload_current(true);
+            }
+        });
+        let w = self.weak();
+        lh.connect_value_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().reader_line_height = row.value();
+                app.save_pref("reader_line_height", &row.value().to_string());
+                app.reload_current(true);
+            }
+        });
+        let w = self.weak();
+        theme.connect_selected_item_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                let mode = match row.selected() {
+                    1 => "dark",
+                    2 => "light",
+                    3 => "omarchy",
+                    _ => "system",
+                };
+                app.prefs.borrow_mut().theme = mode.to_string();
+                app.save_pref("theme", mode);
+                app.apply_theme();
+            }
+        });
+        let w = self.weak();
+        compact.connect_active_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().compact = row.is_active();
+                app.save_pref("compact", if row.is_active() { "1" } else { "0" });
+                app.apply_prefs_live();
+            }
+        });
+        let w = self.weak();
+        thumbs.connect_active_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().thumbs = row.is_active();
+                app.save_pref("thumbs", if row.is_active() { "1" } else { "0" });
+                app.apply_prefs_live();
+            }
+        });
+        let w = self.weak();
+        letters.connect_active_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().letter_shortcuts = row.is_active();
+                app.save_pref("letter_shortcuts", if row.is_active() { "1" } else { "0" });
+                app.register_letter_accels();
+            }
+        });
+        let w = self.weak();
+        refresh.connect_value_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().refresh_min = row.value() as i64;
+                app.save_pref("refresh_min", &(row.value() as i64).to_string());
+            }
+        });
+        let w = self.weak();
+        retention.connect_value_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().retention_days = row.value() as i64;
+                app.save_pref("retention_days", &(row.value() as i64).to_string());
+            }
+        });
+        let w = self.weak();
+        media.connect_value_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().media_mb = row.value() as i64;
+                app.save_pref("media_mb", &(row.value() as i64).to_string());
+                app.media.set_max_bytes(row.value() as u64 * 1024 * 1024);
+            }
+        });
+
+        win.present();
+    }
+
+    fn start_theme_watch(&self) {
+        let Some(dir) = crate::theme_omarchy::watch_dir() else { return };
+        let file = gio::File::for_path(&dir);
+        let Ok(monitor) = file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, None::<&gio::Cancellable>) else {
+            return;
+        };
+        let w = self.weak();
+        let pending = Rc::new(Cell::new(false));
+        monitor.connect_changed(move |_, _, _, _| {
+            let Some(app) = w.upgrade() else { return };
+            if app.prefs.borrow().theme != "omarchy" || pending.get() {
+                return;
+            }
+            pending.set(true);
+            let w2 = w.clone();
+            let pending2 = pending.clone();
+            glib::timeout_add_local(Duration::from_millis(250), move || {
+                pending2.set(false);
+                if let Some(app) = w2.upgrade() {
+                    if app.prefs.borrow().theme == "omarchy" {
+                        app.apply_theme();
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        });
+        std::mem::forget(monitor);
     }
 
     fn install_width_watcher(&self) {
@@ -2056,12 +2347,14 @@ impl App {
             let li = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
             li.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
         });
+        let w = self.weak();
         factory.connect_bind(move |_, list_item| {
             let li = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
             let Some(obj) = li.item() else { return };
             let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() else { return };
             let row = boxed.borrow::<ListRow>();
-            li.set_child(Some(&list::row_widget(&row)));
+            let thumbs = w.upgrade().map(|a| a.prefs.borrow().thumbs).unwrap_or(true);
+            li.set_child(Some(&list::row_widget(&row, thumbs)));
         });
         factory.connect_unbind(|_, list_item| {
             let li = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
@@ -2270,6 +2563,7 @@ impl App {
         win_action!("back", |a| a.back());
         win_action!("refresh", |a| a.do_refresh());
         win_action!("add-feed", |a| a.add_feed_dialog());
+        win_action!("settings", |a| a.settings_dialog());
         win_action!("connect-feedly", |a| a.connect_feedly_dialog());
         win_action!("import-opml", |a| a.import_opml_dialog());
         win_action!("export-opml", |a| a.export_opml());
@@ -2322,13 +2616,7 @@ impl App {
         quit.connect_activate(move |_, _| app_for_quit.quit());
         application.add_action(&quit);
 
-        application.set_accels_for_action("win.next-article", &["j"]);
-        application.set_accels_for_action("win.prev-article", &["k"]);
-        application.set_accels_for_action("win.next-unread", &["n"]);
-        application.set_accels_for_action("win.prev-unread", &["p"]);
-        application.set_accels_for_action("win.toggle-read", &["m"]);
-        application.set_accels_for_action("win.toggle-saved", &["s"]);
-        application.set_accels_for_action("win.open-external", &["o"]);
+        application.set_accels_for_action("win.settings", &["<Control>comma"]);
         application.set_accels_for_action("win.find", &["<Control>f"]);
         application.set_accels_for_action("win.article-search", &["<Control>l"]);
         application.set_accels_for_action("win.refresh", &["<Control>r"]);

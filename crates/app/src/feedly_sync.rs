@@ -13,9 +13,15 @@ pub fn token_path() -> std::path::PathBuf {
     base.join("lesefluss").join("feedly-token")
 }
 
-pub fn token_from_disk() -> Option<String> {
-    let t = std::fs::read_to_string(token_path()).ok()?;
-    let t = t.trim().to_string();
+fn keyring_lookup() -> Option<String> {
+    let out = std::process::Command::new("secret-tool")
+        .args(["lookup", "lesefluss", "feedly-token"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if t.is_empty() {
         None
     } else {
@@ -23,7 +29,42 @@ pub fn token_from_disk() -> Option<String> {
     }
 }
 
+fn keyring_store(token: &str) -> bool {
+    use std::io::Write;
+    let mut child = match std::process::Command::new("secret-tool")
+        .args(["store", "--label=Lesefluss: Feedly-Token", "lesefluss", "feedly-token"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(token.trim().as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+pub fn token_from_disk() -> Option<String> {
+    if let Some(t) = keyring_lookup() {
+        return Some(t);
+    }
+    let t = std::fs::read_to_string(token_path()).ok()?;
+    let t = t.trim().to_string();
+    if t.is_empty() {
+        return None;
+    }
+    if keyring_store(&t) {
+        let _ = std::fs::remove_file(token_path());
+    }
+    Some(t)
+}
+
 pub fn save_token(token: &str) -> std::io::Result<()> {
+    if keyring_store(token) {
+        let _ = std::fs::remove_file(token_path());
+        return Ok(());
+    }
     let p = token_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;

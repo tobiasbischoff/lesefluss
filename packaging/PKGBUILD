@@ -1,0 +1,28 @@
+# Maintainer: Lesefluss Projekt <dev@example.org>
+pkgname=lesefluss-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Nativer GTK-4-RSS-Reader (Wayland) mit lokaler Bibliothek und Feedly-Sync"
+arch=('x86_64')
+url="https://example.org/lesefluss"
+license=('MIT' 'Apache-2.0')
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'sqlite' 'libsecret' 'xdg-desktop-portal' 'hicolor-icon-theme')
+makedepends=('cargo' 'git')
+source=("git+file://${srcdir}/../" )
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir"/*
+  cargo build --release --locked --bin lesefluss-app
+}
+
+package() {
+  cd "$srcdir"/*
+  install -Dm755 target/release/lesefluss-app "$pkgdir/usr/bin/lesefluss"
+  install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.desktop \
+    "$pkgdir/usr/share/applications/io.github.PROJEKTINHABER.Lesefluss.desktop"
+  install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.PROJEKTINHABER.Lesefluss.svg"
+  install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.appdata.xml \
+    "$pkgdir/usr/share/metainfo/io.github.PROJEKTINHABER.Lesefluss.appdata.xml"
+}

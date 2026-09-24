@@ -218,6 +218,7 @@ ALTER TABLE feeds ADD COLUMN remote_id TEXT;
 ALTER TABLE groups ADD COLUMN remote_id TEXT;
 "#,
     ),
+
     (
         4,
         r#"
@@ -234,6 +235,15 @@ CREATE TABLE outbox (
     created_ms INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX outbox_unique ON outbox(account_id, entity_id, field);
+"#,
+    ),
+    (
+        5,
+        r#"
+CREATE TABLE prefs (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#,
     ),
 ];
@@ -1081,6 +1091,22 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn get_pref(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM prefs WHERE key=?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_pref(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO prefs(key, value) VALUES (?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     pub fn mark_feeds_read(&self, feed_ids: &[i64]) -> Result<usize> {

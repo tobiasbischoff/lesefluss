@@ -87,7 +87,7 @@ impl ListRow {
     }
 }
 
-pub fn row_widget(row: &ListRow) -> gtk::Widget {
+pub fn row_widget(row: &ListRow, thumbs: bool) -> gtk::Widget {
     match row {
         ListRow::Header { label, .. } => gtk::Label::builder()
             .label(label)
@@ -97,7 +97,7 @@ pub fn row_widget(row: &ListRow) -> gtk::Widget {
             .upcast(),
         ListRow::Item(cell) => {
             let a = cell.article();
-            let (root, handles) = article_row(&a);
+            let (root, handles) = article_row(&a, thumbs);
             cell.register(handles);
             root.upcast()
         }
@@ -112,7 +112,7 @@ pub fn unregister(row: &ListRow, widget: &gtk::Widget) {
     }
 }
 
-fn article_row(a: &ArticleRow) -> (gtk::Box, RowHandles) {
+fn article_row(a: &ArticleRow, thumbs: bool) -> (gtk::Box, RowHandles) {
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
@@ -177,27 +177,29 @@ fn article_row(a: &ArticleRow) -> (gtk::Box, RowHandles) {
 
     root.append(&text_col);
 
-    let thumb = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .width_request(64)
-        .height_request(64)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
-        .css_classes(vec!["lf-thumb".to_string()])
-        .build();
-    let initial = a.feed_title.chars().next().unwrap_or('?').to_string();
-    let thumb_label = gtk::Label::builder()
-        .use_markup(true)
-        .label(&format!(
-            "<span size=\"18000\" weight=\"bold\" foreground=\"{}\">{}</span>",
-            a.accent,
-            glib::markup_escape_text(&initial)
-        ))
-        .vexpand(true)
-        .hexpand(true)
-        .build();
-    thumb.append(&thumb_label);
-    root.append(&thumb);
+    if thumbs {
+        let thumb = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .width_request(64)
+            .height_request(64)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .css_classes(vec!["lf-thumb".to_string()])
+            .build();
+        let initial = a.feed_title.chars().next().unwrap_or('?').to_string();
+        let thumb_label = gtk::Label::builder()
+            .use_markup(true)
+            .label(&format!(
+                "<span size=\"18000\" weight=\"bold\" foreground=\"{}\">{}</span>",
+                a.accent,
+                glib::markup_escape_text(&initial)
+            ))
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        thumb.append(&thumb_label);
+        root.append(&thumb);
+    }
 
     let handles = RowHandles {
         root: root.clone(),

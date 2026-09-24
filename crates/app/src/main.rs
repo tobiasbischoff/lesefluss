@@ -5,6 +5,8 @@ mod model;
 mod feedly_sync;
 mod net;
 mod opml;
+mod prefs;
+mod theme_omarchy;
 mod reader;
 mod seed;
 mod sidebar;

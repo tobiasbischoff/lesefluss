@@ -10,7 +10,7 @@ pub const MAX_DECODED_MEGAPIXEL: u32 = 40;
 
 pub struct MediaCache {
     dir: PathBuf,
-    max_bytes: u64,
+    max_bytes: std::sync::atomic::AtomicU64,
 }
 
 fn magic_mime(bytes: &[u8]) -> Option<&'static str> {
@@ -44,7 +44,10 @@ pub fn key_of(url: &str) -> String {
 impl MediaCache {
     pub fn new(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir, max_bytes })
+        Ok(Self {
+            dir,
+            max_bytes: std::sync::atomic::AtomicU64::new(max_bytes),
+        })
     }
 
     pub fn path_for(&self, url: &str) -> PathBuf {
@@ -75,6 +78,10 @@ impl MediaCache {
         Some((bytes, mime))
     }
 
+    pub fn set_max_bytes(&self, b: u64) {
+        self.max_bytes.store(b, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn total_bytes(&self) -> u64 {
         std::fs::read_dir(&self.dir)
             .map(|rd| {
@@ -95,13 +102,14 @@ impl MediaCache {
             entries.push((e.path(), m.len(), modified));
         }
         let total: u64 = entries.iter().map(|(_, l, _)| l).sum();
-        if total <= self.max_bytes {
+        let cap = self.max_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if total <= cap {
             return;
         }
         entries.sort_by_key(|(_, _, t)| *t);
         let mut used = total;
         for (path, len, _) in entries {
-            if used <= self.max_bytes {
+            if used <= cap {
                 break;
             }
             let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
