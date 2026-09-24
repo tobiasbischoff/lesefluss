@@ -28,6 +28,100 @@ pub fn dbg_log(msg: &str) {
     }
 }
 
+pub fn dedupe_by_article_id(rows: Vec<ArticleRow>, existing: &[ListRow]) -> Vec<ArticleRow> {
+    let mut seen: std::collections::HashSet<String> = existing
+        .iter()
+        .filter_map(|r| r.article().map(|a| a.id.clone()))
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if seen.insert(row.id.clone()) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+pub fn letter_action(keyval: gtk::gdk::Key) -> Option<&'static str> {
+    Some(match keyval {
+        gtk::gdk::Key::j => "win.next-article",
+        gtk::gdk::Key::k => "win.prev-article",
+        gtk::gdk::Key::n => "win.next-unread",
+        gtk::gdk::Key::p => "win.prev-unread",
+        gtk::gdk::Key::m => "win.toggle-read",
+        gtk::gdk::Key::s => "win.toggle-saved",
+        gtk::gdk::Key::o => "win.open-external",
+        _ => return None,
+    })
+}
+
+pub fn is_editing_class(name: &str) -> bool {
+    matches!(
+        name,
+        "GtkEntry"
+            | "GtkPasswordEntry"
+            | "GtkSearchEntry"
+            | "GtkText"
+            | "GtkTextView"
+            | "GtkSpinButton"
+            | "AdwEntryRow"
+            | "AdwPasswordEntryRow"
+            | "AdwSpinRow"
+            | "AdwSearchEntry"
+    )
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    #[test]
+    fn letter_keys_map_to_actions() {
+        assert_eq!(letter_action(gtk::gdk::Key::j), Some("win.next-article"));
+        assert_eq!(letter_action(gtk::gdk::Key::k), Some("win.prev-article"));
+        assert_eq!(letter_action(gtk::gdk::Key::n), Some("win.next-unread"));
+        assert_eq!(letter_action(gtk::gdk::Key::p), Some("win.prev-unread"));
+        assert_eq!(letter_action(gtk::gdk::Key::m), Some("win.toggle-read"));
+        assert_eq!(letter_action(gtk::gdk::Key::s), Some("win.toggle-saved"));
+        assert_eq!(letter_action(gtk::gdk::Key::o), Some("win.open-external"));
+    }
+
+    #[test]
+    fn other_keys_are_untouched() {
+        for key in [
+            gtk::gdk::Key::a,
+            gtk::gdk::Key::z,
+            gtk::gdk::Key::F5,
+            gtk::gdk::Key::Up,
+            gtk::gdk::Key::space,
+            gtk::gdk::Key::Return,
+            gtk::gdk::Key::Escape,
+        ] {
+            assert_eq!(letter_action(key), None, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn editing_classes_are_recognized() {
+        for name in [
+            "GtkEntry",
+            "GtkPasswordEntry",
+            "GtkSearchEntry",
+            "GtkText",
+            "GtkTextView",
+            "GtkSpinButton",
+            "AdwEntryRow",
+            "AdwPasswordEntryRow",
+            "AdwSpinRow",
+        ] {
+            assert!(is_editing_class(name), "{name}");
+        }
+        for name in ["AdwApplicationWindow", "GtkListView", "WebKitWebView", "AdwButton"] {
+            assert!(!is_editing_class(name), "{name}");
+        }
+    }
+}
+
 pub fn now_ms() -> i64 {
     storage::now_ms()
 }
@@ -153,13 +247,19 @@ impl App {
         library_menu.append(Some("Backup erstellen …"), Some("win.backup"));
         library_menu.append(Some("Aus Backup wiederherstellen …"), Some("win.restore"));
         let btn_library = gtk::MenuButton::builder()
-            .icon_name("emblem-system-symbolic")
+            .icon_name("document-open-symbolic")
             .tooltip_text("Bibliothek: OPML, Backup")
             .menu_model(&library_menu)
             .build();
         let sidebar_title = adw::WindowTitle::new("Lesefluss", "Lokale Bibliothek");
         let sidebar_header = adw::HeaderBar::builder().title_widget(&sidebar_title).build();
+        let btn_settings = gtk::Button::builder()
+            .icon_name("preferences-system-symbolic")
+            .tooltip_text("Einstellungen (Strg+,)")
+            .action_name("win.settings")
+            .build();
         sidebar_header.pack_start(&btn_hamburger);
+        sidebar_header.pack_start(&btn_settings);
         sidebar_header.pack_end(&btn_library);
         sidebar_header.pack_end(&btn_refresh);
         sidebar_header.pack_end(&btn_add);
@@ -340,6 +440,7 @@ impl App {
         app.apply_theme_now();
         app.start_theme_watch();
         app.start_frame_probe();
+        app.install_letter_router();
         app.wire(factory);
         app.register_actions(application);
         app.install_width_watcher();
@@ -677,6 +778,8 @@ impl App {
                 }
                 let had_full_page = rows.len() >= 200;
                 let keep_sel = app.state.borrow().selected.clone();
+                let current = app.state.borrow().rows.clone();
+                let rows = dedupe_by_article_id(rows, if append { &current } else { &[] });
                 {
                     let mut st = app.state.borrow_mut();
                     if append {
@@ -1242,6 +1345,27 @@ impl App {
 
     // ── Navigation ──
 
+    fn next_distinct(
+        &self,
+        positions: &[usize],
+        cur_idx: i32,
+        delta: i32,
+    ) -> Option<(i32, usize, ArticleRow)> {
+        let sel = self.selected_id();
+        let n = positions.len() as i32;
+        let mut i = cur_idx + delta;
+        while i >= 0 && i < n {
+            let pos = positions[i as usize];
+            let row = self.state.borrow().rows.get(pos).and_then(|r| r.article());
+            match row {
+                Some(a) if Some(a.id.as_str()) == sel.as_deref() => i += delta,
+                Some(a) => return Some((i, pos, a)),
+                None => i += delta,
+            }
+        }
+        None
+    }
+
     fn move_selection(&self, delta: i32) {
         let positions: Vec<usize> = self
             .state
@@ -1255,6 +1379,7 @@ impl App {
             })
             .collect();
         if positions.is_empty() {
+            dbg_log("move_selection: keine Artikel in der Liste");
             return;
         }
         let cur_id = self.selected_id();
@@ -1264,13 +1389,10 @@ impl App {
             .and_then(|p| positions.iter().position(|x| *x == p))
             .map(|i| i as i32)
             .unwrap_or(if delta > 0 { -1 } else { positions.len() as i32 });
-        let target = (cur_idx + delta).clamp(0, positions.len() as i32 - 1);
-        let idx = positions[target as usize];
-        let row = self.state.borrow().rows.get(idx).and_then(|r| r.article());
-        let Some(row) = row else { return };
-        if self.selected_id().as_deref() == Some(row.id.as_str()) {
+        let Some((target, idx, row)) = self.next_distinct(&positions, cur_idx, delta) else {
+            dbg_log(&format!("move_selection: kein weiterer Artikel ab cur_idx={cur_idx}"));
             return;
-        }
+        };
         dbg_log(&format!("move_selection delta={delta} cur_idx={cur_idx} target={target} idx={idx} von {}", positions.len()));
         self.open_article(row, false, true);
         self.scroll_to_selected();
@@ -1312,6 +1434,13 @@ impl App {
             positions.iter().rev().find(|&&p| p < cur).copied().or_else(|| positions.last().copied())
         };
         if let Some(idx) = next {
+            let sel = self.selected_id();
+            let row = self.state.borrow().rows.get(idx).and_then(|r| r.article());
+            if let Some(row) = row {
+                if Some(row.id.as_str()) == sel.as_deref() {
+                    return;
+                }
+            }
             let row = self.state.borrow().rows.get(idx).and_then(|r| r.article());
             if let Some(row) = row {
                 self.open_article(row, false, true);
@@ -2139,6 +2268,12 @@ impl App {
                 let map: std::collections::HashMap<String, String> = entries.clone().into_iter().collect();
                 let prefs = Prefs::load(&|k| map.get(k).cloned());
                 *self.prefs.borrow_mut() = prefs.clone();
+                dbg_log(&format!(
+                    "Einstellungen geladen: {} Einträge, Buchstabenkürzel={}, Theme={}",
+                    map.len(),
+                    prefs.letter_shortcuts,
+                    prefs.theme
+                ));
                 self.apply_prefs_live();
             }
         }
@@ -2156,25 +2291,50 @@ impl App {
         style.line_height = p.reader_line_height;
         drop(style);
         self.media.set_max_bytes((p.media_mb as u64) * 1024 * 1024);
-        self.register_letter_accels();
         self.sync_store(false);
     }
 
-    fn register_letter_accels(&self) {
-        let app = adw::Application::default();
-        let on = self.prefs.borrow().letter_shortcuts;
-        let pairs: &[(&str, &[&str])] = &[
-            ("win.next-article", if on { &["j"] } else { &[] }),
-            ("win.prev-article", if on { &["k"] } else { &[] }),
-            ("win.next-unread", if on { &["n"] } else { &[] }),
-            ("win.prev-unread", if on { &["p"] } else { &[] }),
-            ("win.toggle-read", if on { &["m"] } else { &[] }),
-            ("win.toggle-saved", if on { &["s"] } else { &[] }),
-            ("win.open-external", if on { &["o"] } else { &[] }),
-        ];
-        for (action, accels) in pairs {
-            app.set_accels_for_action(action, accels);
+    fn letters_enabled(&self) -> bool {
+        self.prefs.borrow().letter_shortcuts
+    }
+
+    fn editing_widget(&self) -> bool {
+        let Some(mut w) = self.window.focus_child() else { return false };
+        for _ in 0..8 {
+            if is_editing_class(w.type_().name()) {
+                return true;
+            }
+            match w.parent() {
+                Some(p) => w = p,
+                None => break,
+            }
         }
+        false
+    }
+
+    fn install_letter_router(&self) {
+        let w = self.weak();
+        let ctrl = gtk::EventControllerKey::new();
+        ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        ctrl.connect_key_pressed(move |_, keyval, _keycode, _state| {
+            let Some(app) = w.upgrade() else { return glib::Propagation::Proceed };
+            let Some(action) = letter_action(keyval) else { return glib::Propagation::Proceed };
+            if !app.letters_enabled() {
+                return glib::Propagation::Proceed;
+            }
+            if app.editing_widget() {
+                dbg_log(&format!("Buchstabe {keyval:?} im Eingabefeld: nicht abgefangen"));
+                return glib::Propagation::Proceed;
+            }
+            match gtk::prelude::WidgetExt::activate_action(&app.window, action, None) {
+                Ok(()) => {
+                    dbg_log(&format!("Buchstabe {keyval:?} -> {action}"));
+                    glib::Propagation::Stop
+                }
+                Err(_) => glib::Propagation::Proceed,
+            }
+        });
+        self.window.add_controller(ctrl);
     }
 
     fn save_pref(&self, key: &str, value: &str) {
@@ -2323,7 +2483,6 @@ impl App {
             if let Some(app) = w.upgrade() {
                 app.prefs.borrow_mut().letter_shortcuts = row.is_active();
                 app.save_pref("letter_shortcuts", if row.is_active() { "1" } else { "0" });
-                app.register_letter_accels();
             }
         });
         let w = self.weak();

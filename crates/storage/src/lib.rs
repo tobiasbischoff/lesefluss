@@ -802,10 +802,16 @@ impl Database {
 
     pub fn counts(&self) -> Result<Counts> {
         let mut c = Counts::default();
-        c.unread = self.conn.query_row("SELECT COUNT(*) FROM articles WHERE unread=1", [], |r| r.get(0))?;
-        c.saved = self.conn.query_row("SELECT COUNT(*) FROM articles WHERE saved=1", [], |r| r.get(0))?;
-        c.total = self.conn.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))?;
-        let mut stmt = self.conn.prepare("SELECT feed_id, COUNT(*) FROM articles WHERE unread=1 GROUP BY feed_id")?;
+        c.unread = self
+            .conn
+            .query_row("SELECT COUNT(DISTINCT id) FROM articles WHERE unread=1", [], |r| r.get(0))?;
+        c.saved = self
+            .conn
+            .query_row("SELECT COUNT(DISTINCT id) FROM articles WHERE saved=1", [], |r| r.get(0))?;
+        c.total = self.conn.query_row("SELECT COUNT(DISTINCT id) FROM articles", [], |r| r.get(0))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT feed_id, COUNT(DISTINCT id) FROM articles WHERE unread=1 GROUP BY feed_id")?;
         c.per_feed = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut stmt = self.conn.prepare(
             "SELECT fg.group_id, COUNT(DISTINCT a.id) FROM articles a
@@ -813,7 +819,7 @@ impl Database {
         )?;
         c.per_group = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut stmt = self.conn.prepare(
-            "SELECT f.account_id, COUNT(*) FROM articles a JOIN feeds f ON f.id=a.feed_id
+            "SELECT f.account_id, COUNT(DISTINCT a.id) FROM articles a JOIN feeds f ON f.id=a.feed_id
              WHERE a.unread=1 AND f.account_id != 'local' GROUP BY f.account_id",
         )?;
         c.per_account = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
@@ -1333,6 +1339,22 @@ mod tests {
         assert_eq!(c.per_group, vec![(g, 2)]);
         let rows = db.query_articles(&Scope::Group(g), Filter::Unread, None, 10).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn counts_ignore_duplicate_article_ids() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let f1 = db.add_feed(&acc, "u1", "F1", None, "#111111").unwrap();
+        let f2 = db.add_feed(&acc, "u2", "F2", None, "#222222").unwrap();
+        let now = now_ms();
+        db.upsert_article(f1, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f2, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f2, "other", "Anderer", None, None, now, "e", None, now).unwrap();
+        let c = db.counts().unwrap();
+        assert_eq!(c.unread, 2);
+        assert_eq!(c.total, 2);
+        assert_eq!(c.per_feed, vec![(f1, 1), (f2, 2)]);
     }
 
     #[test]
