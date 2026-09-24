@@ -99,6 +99,12 @@ fn keyring_store(token: &str) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
+/// Liest das Token ohne den GTK-Thread zu blockieren:
+/// Datei- und Schlüsselbundzugriff laufen in einem Worker.
+pub async fn token_from_disk_async() -> Option<String> {
+    tokio::task::spawn_blocking(token_from_disk).await.ok().flatten()
+}
+
 pub fn token_from_disk() -> Option<String> {
     if let Some(t) = keyring_lookup() {
         return Some(t);
@@ -166,7 +172,10 @@ where
             .ok()
             .and_then(|b| b.downcast::<T>().ok())
             .map(|b| *b)
-            .expect("db antwort")
+            .unwrap_or_else(|| {
+                eprintln!("[lf] Datenbank-Worker antwortet nicht — Anfrage verworfen");
+                panic!("db worker unavailable");
+            })
     })
     .await
     .expect("db join")

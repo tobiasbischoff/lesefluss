@@ -289,6 +289,15 @@ pub fn data_dir() -> std::path::PathBuf {
 const JS_CAPTURE_POS: &str = "(()=>{const g=document.querySelector('meta[name=lf-doc]');const gen=g?g.content:'-1';const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return gen+':-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return gen+':'+idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return gen+':'+idx+':'+Math.round(off);})()";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TokenAction {
+    StartFeedly,
+    Refresh,
+    QueuedSync,
+    MarkScopeServer,
+    CheckConnect,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SelectionCause {
     Unknown,
     Pointer,
@@ -329,6 +338,8 @@ pub struct App {
     pub prefs: RefCell<Prefs>,
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
     pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<((i64, String), u64, Vec<(String, String)>)>>>,
+    pub bg_jobs_tx: std::sync::mpsc::Sender<Box<dyn FnOnce(&Rc<App>) + Send>>,
+    pub bg_jobs_rx: std::sync::mpsc::Receiver<Box<dyn FnOnce(&Rc<App>) + Send>>,
     pub drain_active: Cell<bool>,
     pub preview_timer: RefCell<Option<glib::SourceId>>,
     pub search_timer: RefCell<Option<glib::SourceId>>,
@@ -521,6 +532,7 @@ impl App {
         let display = gtk::prelude::WidgetExt::display(&window);
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
+        let (bg_jobs_tx, bg_jobs_rx) = std::sync::mpsc::channel::<Box<dyn FnOnce(&Rc<App>) + Send>>();
         let app = Rc::new(Self {
             window,
             toast,
@@ -556,6 +568,8 @@ impl App {
             ),
             pending_db: RefCell::new(Vec::new()),
             pending_media: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            bg_jobs_tx: bg_jobs_tx.clone(),
+            bg_jobs_rx,
             drain_active: Cell::new(false),
             preview_timer: RefCell::new(None),
             search_timer: RefCell::new(None),
@@ -625,7 +639,7 @@ impl App {
         });
     }
 
-    fn drain_once(&self) {
+    fn drain_once(self: &Rc<Self>) {
         if let Ok(mut q) = self.pending_media.lock() {
             let jobs: Vec<_> = q.drain(..).collect();
             drop(q);
@@ -640,6 +654,9 @@ impl App {
                     self.reader.apply_media(url, data);
                 }
             }
+        }
+        while let Ok(job) = self.bg_jobs_rx.try_recv() {
+            job(self);
         }
         loop {
             let net_event = self.net.events.try_recv().ok();
@@ -710,17 +727,15 @@ impl App {
                     std::mem::take(&mut st.feedly_sync_queued)
                 };
                 if queued {
-                    if let Some(token) = feedly_sync::token_from_disk() {
-                        if let Some(account_id) = self
-                            .state
-                            .borrow()
-                            .accounts
-                            .iter()
-                            .find(|(_, k, _)| k == "feedly")
-                            .map(|(id, _, _)| id.clone())
-                        {
-                            self.request_feedly_sync(account_id, token, false);
-                        }
+                    if let Some(account_id) = self
+                        .state
+                        .borrow()
+                        .accounts
+                        .iter()
+                        .find(|(_, k, _)| k == "feedly")
+                        .map(|(id, _, _)| id.clone())
+                    {
+                        self.with_token(TokenAction::QueuedSync);
                     }
                 }
                 let w = self.weak();
@@ -868,9 +883,7 @@ impl App {
                     let _ = w2.send(|db| db.outbox_reset_inflight());
                 });
                 if std::env::var("LF_FEEDLY_CONNECT").is_ok() && !has_feedly_account {
-                    if let Some(token) = feedly_sync::token_from_disk() {
-                        app.start_feedly(token);
-                    }
+                    app.with_token(TokenAction::StartFeedly);
                 }
                 if let Some(ms) = last {
                     app.last_sync_label.set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(ms)));
@@ -1547,32 +1560,35 @@ impl App {
         if scope_feeds.is_empty() {
             return;
         }
-        let Some(token) = feedly_sync::token_from_disk() else {
-            self.show_toast("Kein Feedly-Token vorhanden");
-            return;
-        };
-        let remote_ids: Vec<String> = scope_feeds.iter().map(|(_, r)| r.clone()).collect();
-        let local_ids: Vec<i64> = scope_feeds.iter().map(|(id, _)| *id).collect();
-        let n_feeds = remote_ids.len();
-        let tx = self.net.event_sender();
-        let worker = self.worker.clone();
-        self.net.spawn(async move {
-            let client = provider_feedly::FeedlyClient::new(token);
-            match client.markers_feeds("markAsRead", &remote_ids).await {
-                Ok(()) => {
-                    let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added: 0 });
-                    let _ = worker.send(move |db| db.mark_feeds_read(&local_ids));
+        self.with_token(TokenAction::MarkScopeServer);
+    }
+
+    fn mark_scope_server_with(&self, token: String) {
+        {
+            let scope_feeds = self.feedly_scope_feeds();
+            let remote_ids: Vec<String> = scope_feeds.iter().map(|(_, r)| r.clone()).collect();
+            let local_ids: Vec<i64> = scope_feeds.iter().map(|(id, _)| *id).collect();
+            let n_feeds = remote_ids.len();
+            let tx = self.net.event_sender();
+            let worker = self.worker.clone();
+            self.net.spawn(async move {
+                let client = provider_feedly::FeedlyClient::new(token);
+                match client.markers_feeds("markAsRead", &remote_ids).await {
+                    Ok(()) => {
+                        let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added: 0 });
+                        let _ = worker.send(move |db| db.mark_feeds_read(&local_ids));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                            message: format!("Serverseitig als gelesen fehlgeschlagen: {e}"),
+                        });
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                        message: format!("Serverseitig als gelesen fehlgeschlagen: {e}"),
-                    });
-                }
-            }
-        });
-        self.show_toast(&format!(
-            "Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung"
-        ));
+            });
+            self.show_toast(&format!(
+                "Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung"
+            ));
+        }
     }
 
     pub fn show_toast(&self, msg: &str) {
@@ -2005,11 +2021,9 @@ impl App {
                 _ => true,
             };
             if scope_is_feedly {
-                if let Some(token) = feedly_sync::token_from_disk() {
-                    self.request_feedly_sync(account_id, token, true);
-                    self.show_toast("Feedly: Delta-Sync angefordert");
-                    return;
-                }
+                let _ = account_id;
+                self.with_token(TokenAction::Refresh);
+                return;
             }
         }
         if feeds.is_empty() {
@@ -2024,6 +2038,68 @@ impl App {
 
     /// Startet höchstens einen Feedly-Zyklus; ein laufender wird nicht verdoppelt,
     /// ein weiterer Wunsch wird für den nächsten Zyklus vermerkt.
+    /// Schlüsselbundzugriff gehört in einen Worker; die Aktion selbst läuft
+    /// danach wieder im Hauptthread.
+    fn with_token(&self, action: TokenAction) {
+        let tx = self.bg_jobs_tx.clone();
+        std::thread::Builder::new()
+            .name("lf-keyring".into())
+            .spawn(move || {
+                let token = feedly_sync::token_from_disk();
+                let _ = tx.send(Box::new(move |app: &Rc<App>| {
+                    if let Some(token) = token {
+                        app.run_token_action(action, token);
+                    }
+                }) as Box<dyn FnOnce(&Rc<App>) + Send>);
+            })
+            .ok();
+    }
+
+    fn run_token_action(&self, action: TokenAction, token: String) {
+        match action {
+            TokenAction::StartFeedly => self.start_feedly(token),
+            TokenAction::Refresh => {
+                if let Some(account_id) = self
+                    .state
+                    .borrow()
+                    .accounts
+                    .iter()
+                    .find(|(_, k, _)| k == "feedly")
+                    .map(|(id, _, _)| id.clone())
+                {
+                    self.request_feedly_sync(account_id, token, true);
+                    self.show_toast("Feedly: Delta-Sync angefordert");
+                }
+            }
+            TokenAction::QueuedSync => {
+                if let Some(account_id) = self
+                    .state
+                    .borrow()
+                    .accounts
+                    .iter()
+                    .find(|(_, k, _)| k == "feedly")
+                    .map(|(id, _, _)| id.clone())
+                {
+                    self.request_feedly_sync(account_id, token, false);
+                }
+            }
+            TokenAction::MarkScopeServer => self.mark_scope_server_with(token),
+            TokenAction::CheckConnect => {
+                let connected = self
+                    .state
+                    .borrow()
+                    .accounts
+                    .iter()
+                    .any(|(_, k, _)| k == "feedly");
+                if connected {
+                    self.start_feedly(token);
+                } else {
+                    self.show_feedly_token_dialog();
+                }
+            }
+        }
+    }
+
     fn request_feedly_sync(&self, account_id: String, token: String, priority: bool) {
         {
             let mut st = self.state.borrow_mut();
@@ -2049,39 +2125,40 @@ impl App {
     }
 
     fn connect_feedly_dialog(&self) {
-        match feedly_sync::token_from_disk() {
-            Some(token) => self.start_feedly(token),
-            None => {
-                let entry = gtk::Entry::builder()
-                    .placeholder_text("Feedly Developer Token einfügen")
-                    .visibility(false)
-                    .build();
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Feedly verbinden")
-                    .body("Privater Testzugang: Token unter feedly.com/v3/auth/dev bzw. via PKCE-Flow erzeugen und hier einfügen. Speicherung lokal (chmod 600); Schlüsselbund-Integration folgt.")
-                    .extra_child(&entry)
-                    .build();
-                dialog.add_response("cancel", "Abbrechen");
-                dialog.add_response("ok", "Verbinden");
-                dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
-                dialog.set_default_response(Some("ok"));
-                dialog.set_close_response("cancel");
-                let w = self.weak();
-                dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
-                    let Some(app) = w.upgrade() else { return };
-                    if resp != "ok" {
-                        return;
-                    }
-                    let token = entry.text().trim().to_string();
-                    if token.is_empty() {
-                        return;
-                    }
-                    if feedly_sync::save_token(&token, None).is_ok() {
-                        app.start_feedly(token);
-                    }
-                });
+        self.with_token(TokenAction::CheckConnect);
+    }
+
+    fn show_feedly_token_dialog(&self) {
+        let entry = gtk::Entry::builder()
+            .placeholder_text("Feedly Developer Token einfügen")
+            .visibility(false)
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Feedly verbinden")
+            .body("Privater Testzugang: Token unter feedly.com/v3/auth/dev bzw. via PKCE-Flow erzeugen und hier einfügen. Gespeicherung im Schlüsselbund; nur ohne Schlüsselbund in einer Datei mit Modus 600.")
+            .extra_child(&entry)
+            .build();
+        dialog.add_response("cancel", "Abbrechen");
+        dialog.add_response("ok", "Verbinden");
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("cancel");
+        let w = self.weak();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |resp| {
+            let Some(app) = w.upgrade() else { return };
+            if resp != "ok" {
+                return;
             }
-        }
+            let token = entry.text().trim().to_string();
+            if token.is_empty() {
+                return;
+            }
+            if feedly_sync::save_token(&token, None).is_ok() {
+                app.start_feedly(token);
+            } else {
+                app.show_toast("Token konnte nicht gespeichert werden");
+            }
+        });
     }
 
     fn start_feedly(&self, token: String) {
@@ -2098,24 +2175,50 @@ impl App {
                 st.accounts.iter().any(|(_, k, _)| k == "feedly")
             };
             if should {
-                if let Some(token) = feedly_sync::token_from_disk() {
-                    let acc = app.state.borrow().accounts.iter().find(|(_, k, _)| k == "feedly").map(|(id, _, _)| id.clone());
-                    if let Some(account_id) = acc {
-                        let acc2 = account_id.clone();
-                        let has = app
-                            .worker
-                            .clone()
-                            .send(move |db| db.outbox_pending(&acc2, storage::now_ms(), 1).map(|v| !v.is_empty()))
-                            .recv()
-                            .ok()
-                            .and_then(|b| b.downcast::<storage::Result<bool>>().ok())
-                            .map(|b| *b)
-                            .unwrap_or(Ok(false))
-                            .unwrap_or(false);
-                        if has {
-                            feedly_sync::process_outbox(app.worker.clone(), &app.net, token, account_id);
-                        }
-                    }
+                let account_id = {
+                    let st = app.state.borrow();
+                    st.accounts
+                        .iter()
+                        .find(|(_, k, _)| k == "feedly")
+                        .map(|(id, _, _)| id.clone())
+                };
+                if let Some(account_id) = account_id {
+                    let worker = app.worker.clone();
+                    let tx = app.bg_jobs_tx.clone();
+                    // Schlüsselbund und Datenbank gehören nicht in den UI-Thread.
+                    std::thread::Builder::new()
+                        .name("lf-outbox-check".into())
+                        .spawn(move || {
+                            let token = feedly_sync::token_from_disk();
+                            let acc = account_id.clone();
+                            let has = worker
+                                .send(move |db| {
+                                    db.outbox_pending(&acc, storage::now_ms(), 1)
+                                        .map(|v| !v.is_empty())
+                                })
+                                .recv()
+                                .ok()
+                                .and_then(|b| b.downcast::<storage::Result<bool>>().ok())
+                                .map(|b| *b)
+                                .unwrap_or(Ok(false))
+                                .unwrap_or(false);
+                            if !has {
+                                return;
+                            }
+                            let token = match token {
+                                Some(t) => t,
+                                None => return,
+                            };
+                            let _ = tx.send(Box::new(move |app: &Rc<App>| {
+                                feedly_sync::process_outbox(
+                                    app.worker.clone(),
+                                    &app.net,
+                                    token,
+                                    account_id.clone(),
+                                );
+                            }) as Box<dyn FnOnce(&Rc<App>) + Send>);
+                        })
+                        .ok();
                 }
             }
             glib::ControlFlow::Continue
@@ -2147,18 +2250,7 @@ impl App {
                 }
             };
             if due {
-                if let Some(token) = feedly_sync::token_from_disk() {
-                    let account_id = app
-                        .state
-                        .borrow()
-                        .accounts
-                        .iter()
-                        .find(|(_, k, _)| k == "feedly")
-                        .map(|(id, _, _)| id.clone());
-                    if let Some(account_id) = account_id {
-                        app.request_feedly_sync(account_id, token, false);
-                    }
-                }
+                app.with_token(TokenAction::QueuedSync);
             }
             glib::ControlFlow::Continue
         });
@@ -2362,10 +2454,19 @@ impl App {
         glib::MainContext::default().spawn_local(async move {
             let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else { return };
             let Some(path) = file.path() else { return };
-            let res = worker.send(move |db| db.backup_to(&path)).recv();
-            let ok = res.ok().and_then(|b| b.downcast_ref::<storage::Result<()>>().map(|r| r.is_ok())).unwrap_or(false);
+            let res = tokio::task::spawn_blocking(move || {
+                worker
+                    .send(move |db| db.backup_to(&path))
+                    .recv()
+                    .ok()
+                    .and_then(|b| b.downcast::<storage::Result<()>>().ok())
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
             if let Some(app) = w.upgrade() {
-                app.show_toast(if ok { "Backup erstellt" } else { "Backup fehlgeschlagen" });
+                app.show_toast(if res { "Backup erstellt" } else { "Backup fehlgeschlagen" });
             }
         });
     }
@@ -2540,42 +2641,44 @@ impl App {
     }
 
     fn load_prefs(&self) {
-        let worker = self.worker.clone();
-        let res = worker.send(|db| {
-            let mut out: Vec<(String, String)> = Vec::new();
-            for key in [
-                "auto_read",
-                "compact",
-                "thumbs",
-                "reader_font",
-                "reader_measure",
-                "reader_line_height",
-                "theme",
-                "letter_shortcuts",
-                "refresh_min",
-                "retention_days",
-                "media_mb",
-            ] {
-                if let Ok(Some(v)) = db.get_pref(key) {
-                    out.push((key.to_string(), v));
+        let w = self.weak();
+        self.db_query(
+            |db| {
+                let mut out: Vec<(String, String)> = Vec::new();
+                for key in [
+                    "auto_read",
+                    "compact",
+                    "thumbs",
+                    "reader_font",
+                    "reader_measure",
+                    "reader_line_height",
+                    "theme",
+                    "letter_shortcuts",
+                    "refresh_min",
+                    "retention_days",
+                    "media_mb",
+                ] {
+                    if let Ok(Some(v)) = db.get_pref(key) {
+                        out.push((key.to_string(), v));
+                    }
                 }
-            }
-            out
-        }).recv();
-        if let Ok(boxed) = res {
-            if let Some(entries) = boxed.downcast_ref::<Vec<(String, String)>>() {
-                let map: std::collections::HashMap<String, String> = entries.clone().into_iter().collect();
+                Ok::<_, storage::StorageError>(out)
+            },
+            move |app, res| {
+                let Ok(entries) = res else { return };
+                let map: std::collections::HashMap<String, String> = entries.into_iter().collect();
                 let prefs = Prefs::load(&|k| map.get(k).cloned());
-                *self.prefs.borrow_mut() = prefs.clone();
+                *app.prefs.borrow_mut() = prefs.clone();
                 dbg_log(&format!(
                     "Einstellungen geladen: {} Einträge, Buchstabenkürzel={}, Theme={}",
                     map.len(),
                     prefs.letter_shortcuts,
                     prefs.theme
                 ));
-                self.apply_prefs_live();
-            }
-        }
+                app.apply_prefs_live();
+                let _ = w;
+            },
+        );
     }
 
     fn apply_prefs_live(&self) {
