@@ -989,15 +989,19 @@ impl App {
         let target = (cur_idx + delta).clamp(0, positions.len() as i32 - 1);
         let idx = positions[target as usize];
         let row = self.state.borrow().rows.get(idx).and_then(|r| r.article());
-        if let Some(row) = row {
-            self.open_article(row, false, true);
-            self.scroll_to_selected();
+        let Some(row) = row else { return };
+        if self.selected_id().as_deref() == Some(row.id.as_str()) {
+            return;
         }
+        dbg_log(&format!("move_selection delta={delta} cur_idx={cur_idx} target={target} idx={idx} von {}", positions.len()));
+        self.open_article(row, false, true);
+        self.scroll_to_selected();
     }
 
     fn scroll_to_selected(&self) {
         if let Some(id) = self.selected_id() {
             if let Some(pos) = self.state.borrow().row_pos(&id) {
+                dbg_log(&format!("scroll_to pos={pos}"));
                 self.list_view.scroll_to(pos as u32, gtk::ListScrollFlags::NONE, None::<gtk::ScrollInfo>);
             }
         }
