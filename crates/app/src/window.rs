@@ -1378,7 +1378,8 @@ impl App {
                     _ => return,
                 }
             };
-            app.set_scope(f, matches!(f, Scope::Global));
+            let reset = matches!(f, Scope::Global);
+            app.set_scope(f, reset);
         });
 
         let w = self.weak();
