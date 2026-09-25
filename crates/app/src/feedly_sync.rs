@@ -71,9 +71,19 @@ pub fn token_path() -> std::path::PathBuf {
 const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn secret_tool(args: &[&str], stdin_data: Option<&[u8]>) -> Option<std::process::Output> {
+    secret_tool_with(std::path::Path::new("secret-tool"), args, stdin_data)
+}
+
+/// Wie `secret_tool`, aber mit wählbarem Programm. Tests nutzen damit ein Skript
+/// statt den echten Secret Service und ohne die Umgebung zu verändern.
+fn secret_tool_with(
+    program: &std::path::Path,
+    args: &[&str],
+    stdin_data: Option<&[u8]>,
+) -> Option<std::process::Output> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("secret-tool")
+    let mut child = Command::new(program)
         .args(args)
         .stdin(if stdin_data.is_some() {
             Stdio::piped()
@@ -124,11 +134,6 @@ fn secret_tool_lookup(args: &[&str], stdin_data: Option<&[u8]>) -> Option<String
 
 /// **Schreiben/Löschen**: hier zählt nur der Exit-Status. `secret-tool store`
 /// gibt absichtlich nichts auf stdout aus; ein leerer Text wäre kein Fehlschlag.
-fn secret_tool_ok(args: &[&str], stdin_data: Option<&[u8]>) -> bool {
-    secret_tool(args, stdin_data)
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
 
 /// Der Schlüsselbund-Eintrag ist an das bestätigte Profil gebunden, damit ein
 /// Token nicht versehentlich mit der Outbox eines anderen Kontos gekoppelt wird.
@@ -137,7 +142,12 @@ pub fn keyring_account() -> Option<String> {
 }
 
 pub fn bind_account(account_id: &str) -> bool {
-    secret_tool_ok(
+    bind_account_with(std::path::Path::new("secret-tool"), account_id)
+}
+
+pub fn bind_account_with(program: &std::path::Path, account_id: &str) -> bool {
+    secret_tool_with(
+        program,
         &[
             "store",
             "--label=Lesefluss: Feedly-Konto",
@@ -146,6 +156,8 @@ pub fn bind_account(account_id: &str) -> bool {
         ],
         Some(account_id.as_bytes()),
     )
+    .map(|out| out.status.success())
+    .unwrap_or(false)
 }
 
 /// Löscht Token **und** Kontobindung und meldet zurück, ob etwas entfernt wurde.
@@ -154,9 +166,14 @@ pub fn forget_token() -> bool {
 }
 
 pub fn forget_token_at(path: &std::path::Path) -> bool {
+    forget_token_at_with(path, std::path::Path::new("secret-tool"))
+}
+
+/// Wie `forget_token_at`, aber mit wählbarem Keyring-Programm (Tests).
+pub fn forget_token_at_with(path: &std::path::Path, program: &std::path::Path) -> bool {
     let mut removed = false;
     for key in ["feedly-token", "feedly-account"] {
-        if let Some(out) = secret_tool(&["clear", "lesefluss", key], None) {
+        if let Some(out) = secret_tool_with(program, &["clear", "lesefluss", key], None) {
             removed |= out.status.success();
         }
     }
@@ -170,11 +187,29 @@ pub fn forget_token_at(path: &std::path::Path) -> bool {
 }
 
 fn keyring_lookup() -> Option<String> {
-    secret_tool_lookup(&["lookup", "lesefluss", "feedly-token"], None)
+    keyring_lookup_with(std::path::Path::new("secret-tool"))
+}
+
+fn keyring_lookup_with(program: &std::path::Path) -> Option<String> {
+    let out = secret_tool_with(program, &["lookup", "lesefluss", "feedly-token"], None)?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn keyring_store(token: &str) -> bool {
-    secret_tool_ok(
+    keyring_store_with(std::path::Path::new("secret-tool"), token)
+}
+
+fn keyring_store_with(program: &std::path::Path, token: &str) -> bool {
+    secret_tool_with(
+        program,
         &[
             "store",
             "--label=Lesefluss: Feedly-Token",
@@ -183,6 +218,8 @@ fn keyring_store(token: &str) -> bool {
         ],
         Some(token.trim().as_bytes()),
     )
+    .map(|out| out.status.success())
+    .unwrap_or(false)
 }
 
 /// Passt das Token zum gewünschten Konto? Ohne gespeicherte Bindung (z. B. Datei-
@@ -216,6 +253,38 @@ pub fn token_from_disk() -> Option<String> {
         let _ = std::fs::remove_file(token_path());
     }
     Some(t)
+}
+
+/// Wie `save_token`, aber mit wählbarem Keyring-Programm (Tests).
+pub fn save_token_at(
+    path: &std::path::Path,
+    token: &str,
+    program: &std::path::Path,
+) -> std::io::Result<()> {
+    if secret_tool_with(
+        program,
+        &[
+            "store",
+            "--label=Lesefluss: Feedly-Token",
+            "lesefluss",
+            "feedly-token",
+        ],
+        Some(token.trim().as_bytes()),
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    write_private(path, token.trim().as_bytes())
 }
 
 pub fn save_token(token: &str, account_id: Option<&str>) -> std::io::Result<()> {
@@ -1596,6 +1665,16 @@ mod r1_regression {
 mod r6_token_tests {
     use super::*;
 
+    fn write_script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("secret-tool-{}", body.len()));
+        std::fs::write(&path, body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
     fn tempdir(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("lesefluss-token-{tag}-{}", std::process::id()));
@@ -1651,66 +1730,45 @@ mod r6_token_tests {
     }
 
     /// A7: `secret-tool store` liefert absichtlich keinen Text; ein leerer stdout
-    /// darf nicht als Fehlschlag gelten. Der Test benutzt ein Skript, das nur den
-    /// Exit-Status setzt.
+    /// darf nicht als Fehlschlag gelten. Geprüft wird gegen ein Skript, nicht
+    /// gegen den echten Secret Service.
     #[test]
     fn speichern_gilt_bei_exit_null_als_erfolg() {
         let dir = tempdir("exit0");
-        let fake = dir.join("secret-tool");
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\n#liest stdin, gibt nichts aus\ncat >/dev/null\nexit 0\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let old_path = std::env::var("PATH").ok();
-        std::env::set_var(
-            "PATH",
-            format!("{}:{}", dir.display(), old_path.clone().unwrap_or_default()),
+        let fake = write_script(&dir, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        assert!(
+            bind_account_with(&fake, "feedly-1"),
+            "store mit leerem stdout"
         );
-        let stored = bind_account("feedly-1");
-        let token_stored = keyring_store("tok");
-        match old_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        assert!(stored, "store mit leerem stdout ist erfolgreich");
-        assert!(token_stored, "auch das Token wird als gespeichert erkannt");
+        assert!(keyring_store_with(&fake, "tok"), "Token wird gespeichert");
     }
 
-    /// A7: Ein Lookup ohne Treffer liefert `None`, ein Treffer den Wert.
+    /// Ein Lookup ohne Treffer liefert `None`, ein Treffer den Wert.
     #[test]
     fn lookup_unterscheidet_treffer_von_leerer_ausgabe() {
         let dir = tempdir("lookup");
-        let fake = dir.join("secret-tool");
-        std::fs::write(
-            &fake,
-            r#"#!/bin/sh
-if [ "$3" = "feedly-token" ]; then echo geheim; fi
-exit 0
-"#,
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let old_path = std::env::var("PATH").ok();
-        std::env::set_var(
-            "PATH",
-            format!("{}:{}", dir.display(), old_path.clone().unwrap_or_default()),
+        let fake = write_script(
+            &dir,
+            "#!/bin/sh\nif [ \"$3\" = \"feedly-token\" ]; then echo geheim; fi\nexit 0\n",
         );
-        let found = keyring_lookup();
-        let missing = keyring_account();
-        match old_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        assert_eq!(found.as_deref(), Some("geheim"));
-        assert!(missing.is_none(), "leere Ausgabe ist kein Treffer");
+        assert_eq!(keyring_lookup_with(&fake).as_deref(), Some("geheim"));
+        let leer = write_script(&dir, "#!/bin/sh\nexit 0\n");
+        assert!(
+            keyring_lookup_with(&leer).is_none(),
+            "leere Ausgabe ist kein Treffer"
+        );
+    }
+
+    /// Ein blockierter Schlüsselbund darf den Dateifallback auslösen, nicht crashen.
+    #[test]
+    fn gesperrter_keyring_fuehrt_zum_dateifallback() {
+        let dir = tempdir("gesperrt");
+        let fehlend = dir.join("gibt-es-nicht");
+        assert!(!bind_account_with(&fehlend, "feedly-1"));
+        assert!(!keyring_store_with(&fehlend, "tok"));
+        let path = dir.join("feedly-token");
+        save_token_at(&path, "tok", &fehlend).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "tok");
     }
 
     #[test]
