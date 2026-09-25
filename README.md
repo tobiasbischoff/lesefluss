@@ -5,6 +5,8 @@
   <p>A native RSS reader for Linux, built for comfortable reading and a keyboard-first workflow.</p>
 </div>
 
+![Lesefluss with the Omarchy theme: sources, article list and reading view](docs/images/lesefluss.png)
+
 <p align="center">
   <a href="#installation">Install</a> ·
   <a href="#getting-started">Get started</a> ·
@@ -55,7 +57,7 @@ cd lesefluss/packaging
 makepkg -si
 ```
 
-Run `makepkg` as your regular user; it requests elevated permissions when installing the package. While the repository is private, cloning requires an authorized GitHub account.
+Run `makepkg` as your regular user; it requests elevated permissions when installing the package.
 
 Launch **Lesefluss** from your application menu, or run:
 
