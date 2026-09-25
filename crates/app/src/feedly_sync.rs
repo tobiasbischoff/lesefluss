@@ -15,6 +15,16 @@ pub struct RunCtx {
     pub base: Option<String>,
 }
 
+/// Abbruch als explizites Laufergebnis: kein Watermark, kein `ready`, kein
+/// weiterer Request.
+fn cancelled() -> SyncFailure {
+    SyncFailure::new(
+        "Lauf abgebrochen (Logout, Auth- oder Quotenstopp)",
+        None,
+        None,
+    )
+}
+
 impl RunCtx {
     #[cfg(test)]
     pub fn new(account_id: &str, run_id: u64) -> Self {
@@ -859,8 +869,7 @@ pub async fn load_contents(
     let mut loaded_total = 0usize;
     for chunk in wanted.chunks(batch.max(1)) {
         if ctx.is_cancelled() {
-            dbg_log("Nachladen: Lauf abgebrochen");
-            break;
+            return Err(cancelled());
         }
         let entries = client
             .entries_mget(chunk)
@@ -977,7 +986,13 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     net.spawn(async move {
         let client = pf::FeedlyClient::with_base(token, ctx.base());
         let res: SyncResult<usize> = async {
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             let profile = client.profile().await.map_err(io_err)?;
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             db(&worker, {
                 let p = profile.clone();
                 move |db2| {
@@ -998,6 +1013,9 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und Ereignisse.
             let account_id = profile.id.clone();
             sync_subscriptions(&worker, &client, &account_id).await?;
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             let stream = pf::global_all_stream(&profile.id);
             let newer_than = storage::now_ms() - 30 * 86_400_000;
             // Generation vor dem ersten Inhaltsabruf erfassen.
@@ -1093,6 +1111,9 @@ pub fn mark_feeds_server_side(
         let client = pf::FeedlyClient::with_base(token, ctx.base());
         match client.markers_feeds("markAsRead", &remote_feed_ids).await {
             Ok(()) => {
+                if ctx.is_cancelled() {
+                    return;
+                }
                 let marked = db(&worker, move |db2| sr(db2.mark_feeds_read(&local_feed_ids))).await;
                 if let Err(e) = marked {
                     eprintln!("[lf] lokale Zähler konnten nicht nachgezogen werden: {e}");
@@ -1479,6 +1500,9 @@ pub fn delta_sync(
     net.spawn(async move {
         let client = pf::FeedlyClient::with_base(token, ctx.base());
         let res: SyncResult<usize> = async {
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             let overlap = last_sync_ms - 5 * 60_000;
             let pull_gen = db(&worker, {
                 let account_id = account_id.clone();
@@ -1488,6 +1512,9 @@ pub fn delta_sync(
             let mut reads_pager = pf::Pager::new();
             let mut reads_continuation: Option<String> = None;
             loop {
+                if ctx.is_cancelled() {
+                    return Err(cancelled());
+                }
                 let page = client
                     .markers_reads_page(overlap, 1000, reads_continuation.as_deref())
                     .await
@@ -1527,6 +1554,9 @@ pub fn delta_sync(
                     }
                 }
             }
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             let stream = pf::global_all_stream(&account_id);
             let summary = fetch_stream_inventory(
                 &client,
@@ -1551,6 +1581,9 @@ pub fn delta_sync(
                     pf::Inventory::Incomplete(r) => format!("unvollständig: {r}"),
                 }
             ));
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             let saved_phase = reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
             // Vollständiger Leseabgleich: Unread-Inventar und fehlende Inhalte.
             let unread =
@@ -2939,6 +2972,155 @@ mod outbox_single_end_tests {
                 .unwrap()
         });
         assert_eq!(inflight, 0, "keine Zeile bleibt als inflight hängen");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::feedly_sync::app_mock_server::mock;
+
+    fn worker(tag: &str) -> (DbWorker, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("lesefluss-cancel-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let worker = DbWorker::start(path.clone());
+        db_blocking(&worker, |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+        });
+        (worker, path)
+    }
+
+    /// B3: Ein **vorab** abgebrochener Lauf erzeugt keinen Request und keinen
+    /// Watermark.
+    #[test]
+    fn vorab_abgebrochener_delta_lauf_tut_nichts() {
+        let (worker, path) = worker("delta");
+        let (base, hits) = mock(|_| (200, "{}".to_string()));
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        ctx.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let last = storage::now_ms() - 60_000;
+        delta_sync(
+            worker.clone(),
+            &net,
+            "tok".to_string(),
+            "feedly-1".to_string(),
+            last,
+            ctx,
+        );
+        let mut failed = None;
+        for _ in 0..50 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncFailed { message, .. }) => {
+                    failed = Some(message);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            failed.unwrap_or_default().contains("abgebrochen"),
+            "der Lauf meldet den Abbruch"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "kein HTTP-Request nach dem Abbruch"
+        );
+        let watermark = db_blocking(&worker, |db| db.last_sync("feedly-1").unwrap());
+        assert!(watermark.is_none(), "kein Watermark nach dem Abbruch");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// B3: Ein vorab abgebrochener Erst-Sync legt kein Konto an und sendet nichts.
+    #[test]
+    fn vorab_abgebrochener_initial_lauf_tut_nichts() {
+        let (worker, path) = worker("initial");
+        let (base, hits) = mock(|_| (200, "{}".to_string()));
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        ctx.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        initial_sync(worker.clone(), &net, "tok".to_string(), ctx);
+        let mut failed = false;
+        for _ in 0..50 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncFailed { .. }) => {
+                    failed = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(failed, "der Erst-Sync meldet den Abbruch");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let watermark = db_blocking(&worker, |db| db.last_sync("feedly-1").unwrap());
+        assert!(watermark.is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// B3: Abbruch mitten im Lauf verhindert Watermark und Status `ready`.
+    #[test]
+    fn abbruch_waehrend_des_laufs_ohne_watermark() {
+        let (worker, path) = worker("mitte");
+        let (base, _hits) = mock(move |req| {
+            if req.contains("markers/reads") {
+                // Verzögerte Antwort: der Abbruch kommt während des Wartens an.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                (200, r#"{"entries":[]}"#.to_string())
+            } else if req.contains("global.saved") || req.contains("global.unread") {
+                (200, r#"{"ids":[]}"#.to_string())
+            } else if req.contains("global.all") {
+                (200, r#"{"items":[],"updated":1700000000}"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        let flag = ctx.cancel.clone();
+        let last = storage::now_ms() - 60_000;
+        delta_sync(
+            worker.clone(),
+            &net,
+            "tok".to_string(),
+            "feedly-1".to_string(),
+            last,
+            ctx,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut failed = false;
+        for _ in 0..80 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncFailed { .. }) => {
+                    failed = true;
+                    break;
+                }
+                Ok(crate::net::NetEvent::FeedlySyncDone { .. }) => {
+                    panic!("ein abgebrochener Lauf darf keinen Erfolg melden")
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(failed, "der Lauf endet mit einem Fehler");
+        let watermark = db_blocking(&worker, |db| db.last_sync("feedly-1").unwrap());
+        assert!(watermark.is_none(), "kein Watermark nach dem Abbruch");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
