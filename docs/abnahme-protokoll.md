@@ -13,7 +13,8 @@ nicht „vermutlich in Ordnung“.
 
 | Fall | Soll | Ist | Beleg | Status |
 |---|---|---|---|---|
-| Testsuite | alle grün | 15 Suiten / 139 Tests grün (2026-09-25: Restore/WAL-Recovery, Netzwerkpolicy mit Mock-Nachweis, Tokenpfad, Identität/Paging, Reader-JS via `node --check`, Cache-Pins/Dedupe, Undo/Redo, Sync-Mocks, Outbox-Revisionen, Coordinator) | `cargo test --workspace` | erfüllt |
+| Testsuite | alle grün | 15 Suiten / 163 Tests grün (2026-09-25: Restore/WAL-Recovery, Netzwerkpolicy mit Mock-Nachweis, Tokenpfad, Identität/Paging, Reader-JS via `node --check`, Cache-Pins/Dedupe, Undo/Redo, Sync-Mocks über die echten Einstiege, Outbox-Revisionen, Coordinator, Refresh-Plan) | `cargo test --workspace` | erfüllt |
+| Clippy streng | keine Warnungen | `cargo clippy --workspace --all-targets -- -D warnings` besteht | dito | erfüllt |
 | Clippy | keine Fehler | 0 Fehler, 24 Warnungen (Typkomplexität, ungenutzte Hilfsmethoden) | `cargo clippy --workspace --all-targets --locked` | erfüllt mit Vorbehalt |
 | Formatierung | einheitlich | `cargo fmt --all -- --check` besteht seit 2026-09-25 (Bestand nachformatiert) | `cargo fmt --all -- --check` | erfüllt |
 | Paketbau | Arch-Paket aus dem Repository | `makepkg -f --noconfirm --nodeps` erzeugt 5,3 MiB (`lesefluss-git-0.1.0-2`); CI-Job installiert jetzt die GTK-/Adwaita-/WebKitGTK-Buildabhängigkeiten und prüft sie mit `pkg-config` | `packaging/PKGBUILD`, `.github/workflows/ci.yml` | erfüllt (CI-Lauf auf GitHub steht aus) |
@@ -48,7 +49,7 @@ Details und Rohwerte: `docs/perf-report.md`.
 
 | Fall | Soll | Ist | Status |
 |---|---|---|---|
-| Feedly zwei Richtungen | Read/Unread und Saved/Unsaved je Richtung | Die älteren Läufe sind keine Nachweise (R1: der Stream-Pager lud keine Seite). Seit 2026-09-25 automatisiert abgesichert: 12 App-Pfad-Tests gegen einen Mockserver mit echter DB (Paginierung, Saved-/Unread-Abgleich, Nachladen, Bestätigung), 8 Provider-Tests, 8 Coordinator-Tests. Eine Live-Abnahme steht aus | **offen** (X2) |
+| Feedly zwei Richtungen | Read/Unread und Saved/Unsaved je Richtung | Ältere Läufe sind keine Nachweise (R1). Seit 2026-09-25 automatisiert über die **echten** Sync-Einstiege: Delta-Sync gegen Mockserver prüft beide Statusrichtungen, Nachladen unbekannter gespeicherter IDs, Abo-Abgleich; Outbox-Pfad prüft die Nachbestätigung. Eine Live-Abnahme steht aus | **offen** (X2) |
 | Feedly Delta-Sync | wiederkehrender Abgleich | Phasen laufen über `fetch_stream_inventory`/`fetch_id_inventory`, Abbrüche propagieren, Watermark = sicherer Checkpoint (Start/Serverstand). Koordination, Quotenpause, Auth-Stopp und Bestätigung per `.mget` sind implementiert und getestet; nicht live geprüft | **offen** (X2) |
 | Keyring | Token im Secret Service | `secret-tool lookup` liefert Token, Datei entfernt | erfüllt |
 | Outbox nach Neustart | Änderungen gehen raus | Outbox-Zeilen bleiben persistent, `outbox_reset_inflight` beim Start | erfüllt (Test), live nach Neustart bestätigt |

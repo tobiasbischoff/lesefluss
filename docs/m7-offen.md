@@ -29,10 +29,17 @@ zusätzlich einen geklärten Zugangsweg und bestandene reale Sync-Abnahmen.
   erst nach vollständigem Abschluss. 8 App-Pfad-Regressionen gegen einen
   Mockserver mit echter DB (erster/mehrere/leere+Cursor/Zyklus/Limit/503 auf Seite 2/
   unvollständiges Inventar/Abgleich beider Richtungen), 6 Provider-Tests, 88 Tests
-  workspaceweit grün, `cargo fmt --all -- --check` grün. Die Watermark-Semantik aus S1
+  workspaceweit grün, `cargo fmt --all -- --check` grün, `cargo clippy -- -D warnings` grün. Die Watermark-Semantik aus S1
   ist seit 2026-09-25 mit erledigt (Checkpoint statt lokaler Endzeit). Offen bleibt die
   Live-Abnahme X2. Bereits lokal verlorene Saved-Markierungen lassen sich nur aus einem
   verlässlich vollständigen Remote-Snapshot wiederherstellen; das ist Teil von X2.
+- [x] **A1–A9 (Abschlussprüfung 2026-09-25):** alle neun Befunde behoben; ein
+  Dispatcher führt Erst-Sync, Delta, Outbox und Serveraktionen mit Laufkennung,
+  Abbruch und Pausen; vollständiger Leseabgleich im echten Sync-Zyklus mit beiden
+  Statusrichtungen und `.mget`-Nachladen; Tokenbindung wird geprüft; unvollständige
+  Statusphasen gelten als Fehler; CI baut das Paket als unprivilegierter Benutzer.
+  163 Tests, strenges Clippy und Formatcheck grün. Details je Befund in
+  `review-abschlusspruefung-2026-09-25.md`.
 - [x] **L1/L2 (R4/R5, 2026-09-25):** Restore läuft nach exklusiver `flock`-Sicherung
   und GTK-Einzelinstanz-Registrierung; Sicherung über `VACUUM INTO` inklusive WAL,
   Kandidat wird vollständig geprüft (Tabellen- und Spaltensatz, Fremdschlüssel,

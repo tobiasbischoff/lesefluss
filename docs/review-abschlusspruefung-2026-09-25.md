@@ -6,7 +6,28 @@ committeten Reparaturen. Es gibt deutliche Verbesserungen, aber die Aussage
 ergänzt `m7-offen.md` und ersetzt dessen Produkt- und Abnahmeanforderungen nicht.
 Anwendungscode wurde bei dieser Prüfung nicht geändert.
 
-## Nachweise und Grenzen
+
+## Bearbeitungsstand (25.09.2026, nach diesem Bericht)
+
+Alle Befunde A1–A9 sind im Code behoben und mit Tests abgesichert; 163 Tests grün,
+`cargo fmt --all -- --check` grün, `cargo clippy --workspace --all-targets -- -D warnings`
+grün, Release-Build und Arch-Paket bauen. Offen bleiben Live-Abnahme mit echtem
+Feedly-Konto (X2), öffentliche Anmeldung (X1) und die in `m7-offen.md` ausgewiesenen
+P-/Q-Punkte. Ein GitHub-Lauf des geänderten Workflows steht aus.
+
+| Befund | Umsetzung | Nachweis |
+|---|---|---|
+| A1 RefCell-Borrow | `first_account_of_kind`/`account_id_of_kind` kopieren die ID, der Borrow endet vor jedem Aufruf | Test `konto_lookup_haelt_keinen_borrow` (echte `RefCell`) |
+| A2 Folgelauf startet nicht | `finish()` liefert `ReservedRun`, der Dispatcher startet ihn direkt; Fehlerpfad ebenso | `reservierter_folgelauf_wird_genau_einmal_gestartet`, `auch_im_fehlerfall_bleibt_kein_haengender_lauf` |
+| A3 Dispatcher | `request_feedly_job` für Initial/Delta/Outbox/Serveraktion, Laufkennung in allen Ereignissen, `RunCtx` bricht ab, Outbox stoppt nach 401/403/429, `SyncFailure` trägt Status und Retry-Zeit | `veraltete_ereignisse_wuerden_verworfen`, Tests in `sync-engine` und `feedly_sync` |
+| A4 Leseabgleich | `reconcile_unread`/`load_contents` in beiden Einstiegen, beide Statusrichtungen, unbekannte Origins als inaktiver Feed, `.mget`-Nachladen, Abo-Abgleich deaktiviert entfernte Quellen | `delta_sync_gleicht_beide_richtungen_und_laedt_unbekanntes_nach` (echter Delta-Einstieg gegen Mockserver) |
+| A5 Nachbestätigung | `outbox_requeue_if_unchanged` nur ohne neuere Absicht, fehlende IDs unbestätigt, Abfragefehler sichtbar | `verzoegerte_bestaetigung_ueberschreibt_keine_neue_absicht` (echter Outbox-Pfad, verzögerte Antwort) |
+| A6 Unvollständigkeit | `PhaseResult` + `require_complete`: kein Watermark, kein `FeedlySyncDone`; Kontostatus mit Profil-ID | `unvollstaendige_statusphase_beendet_den_lauf_ohne_watermark` |
+| A7 Tokenbindung | Lookup und Schreiben getrennt (Exit-Status statt Text), Bindung wird vor dem Versand geprüft, aktives Konto statt „erster Feedly“ | `speichern_gilt_bei_exit_null_als_erfolg`, `lookup_unterscheidet_treffer_von_leerer_ausgabe`, `tokenbindung_werden_geprueft` |
+| A8 Refresh | `refresh_plan` ermittelt den Provider aus den Feeds im Bereich | `refresh_richtet_sich_nach_den_feeds_im_bereich` |
+| A9 CI/Nachweise | pkg-config-Datei korrigiert, `makepkg` als eigener Benutzer, vier tote Tests aktiviert (8 → 12), Clippy streng grün | `.github/workflows/ci.yml`, Testanzahl je Lauf |
+
+## Nachweise und Grenzen (des Reviews, unverändert)
 
 - `cargo test --workspace --locked`: **139 Tests bestanden**. Die lokalen
   HTTP-Mocks benötigten die Freigabe zum Öffnen von Testports.
