@@ -33,13 +33,20 @@ zusätzlich einen geklärten Zugangsweg und bestandene reale Sync-Abnahmen.
   ist seit 2026-09-25 mit erledigt (Checkpoint statt lokaler Endzeit). Offen bleibt die
   Live-Abnahme X2. Bereits lokal verlorene Saved-Markierungen lassen sich nur aus einem
   verlässlich vollständigen Remote-Snapshot wiederherstellen; das ist Teil von X2.
-- [x] **A1–A9 (Abschlussprüfung 2026-09-25):** alle neun Befunde behoben; ein
-  Dispatcher führt Erst-Sync, Delta, Outbox und Serveraktionen mit Laufkennung,
-  Abbruch und Pausen; vollständiger Leseabgleich im echten Sync-Zyklus mit beiden
-  Statusrichtungen und `.mget`-Nachladen; Tokenbindung wird geprüft; unvollständige
-  Statusphasen gelten als Fehler; CI baut das Paket als unprivilegierter Benutzer.
-  163 Tests, strenges Clippy und Formatcheck grün. Details je Befund in
-  `review-abschlusspruefung-2026-09-25.md`.
+- [x] **A1–A9 (Abschlussprüfung 2026-09-25), je Befund nachgewiesen in der
+  Nachkontrolle B1–B7 (2026-09-25, Commits `087de81`–`1595e0c`):** ein Dispatcher
+  führt Erst-Sync, Delta, Outbox und Serveraktionen mit Laufkennung, Abbruch und
+  Pausen; vollständiger Leseabgleich im echten Sync-Zyklus mit beiden
+  Statusrichtungen und `.mget`-Nachladen; Credential-Bindung wird beim ersten
+  Verbinden persistiert und vor jedem Token-Zugriff geprüft (auch Outbox-Tick);
+  unvollständige Statusphasen gelten in **beiden** Einstiegen als Fehler; Initial
+  ordnet Watermark/Status/Ereignis der validierten Profil-ID zu; Delta gleicht
+  Abos/Gruppen ab; Layoutwiederherstellung nennt Fehler statt sie zu verschlucken.
+  177 Tests workspaceweit grün, strenges Clippy, Formatcheck und Release-Build
+  grün. Offen bleiben: Live-Feedly (X2), OAuth (X1), echter CI-Lauf und die
+  unten gelisteten Produktpunkte. Einzelheiten und Testnamen je Befund in
+  `review-abschlusspruefung-2026-09-25.md` und
+  `review-nachkontrolle-55ab20a.md`.
 - [x] **L1/L2 (R4/R5, 2026-09-25):** Restore läuft nach exklusiver `flock`-Sicherung
   und GTK-Einzelinstanz-Registrierung; Sicherung über `VACUUM INTO` inklusive WAL,
   Kandidat wird vollständig geprüft (Tabellen- und Spaltensatz, Fremdschlüssel,

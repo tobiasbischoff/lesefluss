@@ -1,8 +1,12 @@
 # Abnahmeprotokoll
 
-**Stand:** 25.09.2026 · Build: `cargo build --release --locked` · Feedly-Statuszeilen dieses
-Tages nachträglich als offen gekennzeichnet (R1); Messwerte vom 24.09.2026 stammen aus
-dem Commit `e76802c` und sind seither nicht neu gemessen
+**Stand:** 25.09.2026 · Build: `cargo build --release` grün (Commits bis `1595e0c`) ·
+Feedly-Statuszeilen dieses Tages nachträglich als offen gekennzeichnet (R1);
+Messwerte vom 24.09.2026 stammen aus dem Commit `e76802c` und sind seither nicht
+neu gemessen. **Nachkontrolle B1–B7:** alle sieben Befunde sind einzeln behoben und
+über die produktiven Einstiege getestet (`docs/review-nachkontrolle-55ab20a.md`);
+ersetzt die frühere pauschale A1–A9-Aussage. Nicht abgedeckt: Live-Feedly (X2),
+OAuth (X1), GitHub-CI-Lauf, Geräte-/GTK-Abnahme.
 **Referenzmaschine:** Intel Core 5 320, 15 GiB RAM, Omarchy/Hyprland, 2560×1600 @ 60 Hz,
 Skalierung 1.667, GTK 4, WebKitGTK 6.
 
@@ -13,7 +17,7 @@ nicht „vermutlich in Ordnung“.
 
 | Fall | Soll | Ist | Beleg | Status |
 |---|---|---|---|---|
-| Testsuite | alle grün | 15 Suiten / 163 Tests grün (2026-09-25: Restore/WAL-Recovery, Netzwerkpolicy mit Mock-Nachweis, Tokenpfad, Identität/Paging, Reader-JS via `node --check`, Cache-Pins/Dedupe, Undo/Redo, Sync-Mocks über die echten Einstiege, Outbox-Revisionen, Coordinator, Refresh-Plan) | `cargo test --workspace` | erfüllt |
+| Testsuite | alle grün | 15 Suiten / 177 Tests grün (2026-09-25: Restore/WAL-Recovery, Netzwerkpolicy mit Mock-Nachweis, Tokenpfad, Identität/Paging, Reader-JS via `node --check`, Cache-Pins/Dedupe, Undo/Redo, Sync-Mocks über die echten Einstiege, Outbox-Revisionen, Coordinator, Refresh-Plan; Nachkontrolle B1–B7: Outbox-Einzelabschluss, reservierte Läufe, Abbruch in allen Phasen, Credential-Bindung, Erst-Sync-Vollständigkeit, Abo-Abgleich im Delta, Layout-Leser) | `cargo test --workspace` | erfüllt |
 | Clippy streng | keine Warnungen | `cargo clippy --workspace --all-targets -- -D warnings` besteht | dito | erfüllt |
 | Clippy | keine Fehler | 0 Fehler, 24 Warnungen (Typkomplexität, ungenutzte Hilfsmethoden) | `cargo clippy --workspace --all-targets --locked` | erfüllt mit Vorbehalt |
 | Formatierung | einheitlich | `cargo fmt --all -- --check` besteht seit 2026-09-25 (Bestand nachformatiert) | `cargo fmt --all -- --check` | erfüllt |
