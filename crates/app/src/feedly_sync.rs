@@ -434,17 +434,25 @@ async fn ingest_entries(
         let Some(stream) = e.feed_stream_id() else {
             continue;
         };
-        let fid = match db(worker, {
-            let account_id = account_id.to_string();
-            let stream = stream.clone();
-            move |db2| db2.feed_id_by_remote(&account_id, &stream)
+        let account_for_feed = account_id.to_string();
+        let stream_for_feed = stream.clone();
+        let title = e
+            .origin
+            .as_ref()
+            .and_then(|o| o.title.clone())
+            .unwrap_or_else(|| e.feed_stream_id().unwrap_or_default());
+        // Unbekannte Origins werden nicht übersprungen: der Feed entsteht inaktiv,
+        // damit gespeicherte Artikel nicht abonnierter Quellen sichtbar bleiben.
+        let fid = db(worker, move |db2| {
+            db2.ensure_origin_feed(&account_for_feed, &stream_for_feed, &title)
         })
         .await
-        {
-            Ok(Some(f)) => f,
-            _ => continue,
-        };
-        statuses.push((e.id.clone(), e.unread.unwrap_or(true), e.is_saved()));
+        .map_err(|e| e.to_string())?;
+        if let Some(unread) = e.unread {
+            // Beide Richtungen: remote ungelesen wird lokal wieder ungelesen,
+            // remote gelesen wird lokal gelesen (revisionsgeschützt).
+            statuses.push((e.id.clone(), unread, e.is_saved()));
+        }
         let urls =
             reader::sanitize::image_sources(&e.html().unwrap_or_else(|| "<p></p>".to_string()));
         per_feed_media.push((fid, vec![(e.id.clone(), urls)]));
@@ -476,14 +484,15 @@ async fn ingest_entries(
         db(worker, {
             let account_id = account_id.to_string();
             move |db2| {
-                db2.apply_remote_status(
+                // `read` ist der gewünschte Zustand: `unread = !read`.
+                sr(db2.apply_remote_status(
                     &account_id,
                     &id,
-                    if unread { None } else { Some(true) },
+                    Some(!unread),
                     if saved { Some(true) } else { None },
                     generation,
-                )?;
-                Ok::<_, storage::StorageError>(())
+                ))?;
+                Ok::<_, SyncFailure>(())
             }
         })
         .await
@@ -686,6 +695,14 @@ pub async fn reconcile_unread(
         .filter(|id| !remote_set.contains(id.as_str()))
         .cloned()
         .collect();
+    // Zweite Richtung: lokal gelesene Artikel, die remote wieder ungelesen sind,
+    // werden revisionsgeschützt wieder als ungelesen markiert.
+    let became_unread: Vec<String> = db(worker, {
+        let account_id = account_id.to_string();
+        let ids: Vec<String> = remote.clone();
+        move |db2| sr(db2.read_ids_within(&account_id, &ids))
+    })
+    .await?;
     let mut applied = 0usize;
     for id in missing {
         let changed = db(worker, {
@@ -707,13 +724,116 @@ pub async fn reconcile_unread(
             applied += 1;
         }
     }
+    let mut newly_unread = 0usize;
+    for id in became_unread {
+        let changed = db(worker, {
+            let account_id = account_id.to_string();
+            move |db2| {
+                let res = sr(db2.apply_remote_status(
+                    &account_id,
+                    &id,
+                    Some(false),
+                    None,
+                    pull_generation,
+                ))?;
+                Ok::<_, SyncFailure>(res.applied)
+            }
+        })
+        .await?;
+        if changed {
+            newly_unread += 1;
+        }
+    }
     dbg_log(&format!(
-        "Unread-Reconciliation: remote {}, lokal {}, neu als gelesen {}",
+        "Unread-Reconciliation: remote {}, lokal {}, neu gelesen {}, neu ungelesen {}",
         remote.len(),
         local.len(),
-        applied
+        applied,
+        newly_unread
     ));
-    Ok(applied)
+    Ok(applied + newly_unread)
+}
+
+/// Prüft, ob der Server die gerade gesendete Absicht tatsächlich übernommen hat.
+pub fn confirmed(entry: &pf::Entry, field: &str, desired: bool) -> bool {
+    match field {
+        "read" => entry.unread.map(|u| u != desired).unwrap_or(false),
+        _ => entry.is_saved() == desired,
+    }
+}
+
+/// Gesammelte IDs beider Statusinventare (für das Nachladen unbekannter Artikel).
+pub fn inventory_ids(saved: &pf::Inventory, unread: &pf::Inventory) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for inventory in [saved, unread] {
+        if let pf::Inventory::Complete(list) = inventory {
+            for id in list {
+                if seen.insert(id.clone()) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Lädt Inhalte nach: lokale Artikel ohne Inhalt **und** IDs aus den Statusinventaren,
+/// die lokal noch nicht existieren. Beides in Batches per `.mget`.
+pub async fn load_contents(
+    worker: &DbWorker,
+    client: &pf::FeedlyClient,
+    account_id: &str,
+    pull_generation: i64,
+    remote_ids: &[String],
+    batch: usize,
+    ctx: &RunCtx,
+) -> SyncResult<usize> {
+    if remote_ids.is_empty() {
+        return Ok(0);
+    }
+    let known = db(worker, {
+        let account_id = account_id.to_string();
+        let ids: Vec<String> = remote_ids.to_vec();
+        move |db2| sr(db2.known_article_ids(&account_id, &ids))
+    })
+    .await?;
+    let known_set: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    // Unbekannte IDs zuerst: gespeicherte Artikel nicht (mehr) abonnierter Quellen.
+    let mut wanted: Vec<String> = remote_ids
+        .iter()
+        .filter(|id| !known_set.contains(id.as_str()))
+        .cloned()
+        .collect();
+    // Lokale gespeicherte oder ungelesene Artikel ohne Inhalt kommen danach.
+    wanted.extend(
+        db(worker, {
+            let account_id = account_id.to_string();
+            move |db2| sr(db2.articles_needing_content(&account_id, batch as u32))
+        })
+        .await?,
+    );
+    wanted.dedup();
+    let mut loaded_total = 0usize;
+    for chunk in wanted.chunks(batch.max(1)) {
+        if ctx.is_cancelled() {
+            dbg_log("Nachladen: Lauf abgebrochen");
+            break;
+        }
+        let entries = client
+            .entries_mget(chunk)
+            .await
+            .map_err(|e| SyncFailure::new(format!("Nachladen fehlgeschlagen: {e}"), None, None))?;
+        let received = entries.len();
+        ingest_entries(worker, account_id, pull_generation, entries)
+            .await
+            .map_err(string_err)?;
+        loaded_total += received;
+    }
+    if loaded_total > 0 {
+        dbg_log(&format!("Nachgeladene Inhalte: {loaded_total} Artikel"));
+    }
+    Ok(loaded_total)
 }
 
 /// Lädt fehlende Inhalte gespeicherter oder ungelesener Artikel per `.mget` nach.
@@ -747,12 +867,64 @@ pub async fn load_missing_contents(
     Ok(received)
 }
 
-/// Prüft, ob der Server die gerade gesendete Absicht tatsächlich übernommen hat.
-pub fn confirmed(entry: &pf::Entry, field: &str, desired: bool) -> bool {
-    match field {
-        "read" => entry.unread.map(|u| u != desired).unwrap_or(false),
-        _ => entry.is_saved() == desired,
+/// Gleicht Abos und Gruppen mit dem Server ab. Wird von **beiden** Sync-Einstiegen
+/// verwendet; entfernte Quellen werden erst nach einer vollständigen Liste deaktiviert.
+pub async fn sync_subscriptions(
+    worker: &DbWorker,
+    client: &pf::FeedlyClient,
+    account_id: &str,
+) -> SyncResult<usize> {
+    let subs = client.subscriptions().await.map_err(io_err)?;
+    let cats = client.categories().await.map_err(io_err)?;
+    for c in &cats {
+        let name = c.label.clone().unwrap_or_else(|| "Gruppe".into());
+        db(worker, {
+            let account_id = account_id.to_string();
+            let c = c.clone();
+            move |db2| sr(db2.upsert_group_remote(&account_id, &c.id, &name))
+        })
+        .await?;
     }
+    let group_ids: std::collections::HashMap<String, i64> = db(worker, |db2| sr(db2.list_groups()))
+        .await?
+        .into_iter()
+        .filter_map(|g| g.remote_id.map(|r| (r, g.id)))
+        .collect();
+    for s in &subs {
+        let url = s.id.strip_prefix("feed/").unwrap_or(&s.id).to_string();
+        let title = s.title.clone().unwrap_or_else(|| url.clone());
+        let fid = db(worker, {
+            let account_id = account_id.to_string();
+            let s = s.clone();
+            let url = url.clone();
+            let title = title.clone();
+            move |db2| {
+                sr(db2.upsert_feed_remote(&account_id, &s.id, &url, &title, s.website.as_deref()))
+            }
+        })
+        .await?;
+        let gids: Vec<i64> = s
+            .categories
+            .iter()
+            .filter_map(|c| group_ids.get(&c.id).copied())
+            .collect();
+        db(worker, move |db2| sr(db2.set_feed_groups(fid, &gids))).await?;
+    }
+    // Vollständige Liste: nicht mehr enthaltene Quellen stilllegen, gespeicherte
+    // Artikel bleiben erhalten.
+    let present: Vec<String> = subs.iter().map(|s| s.id.clone()).collect();
+    let account_for_db = account_id.to_string();
+    let deactivated = db(worker, move |db2| {
+        sr(db2.deactivate_missing_feeds(&account_for_db, &present))
+    })
+    .await?;
+    if !deactivated.is_empty() {
+        dbg_log(&format!(
+            "Abgleich: {} Quellen nicht mehr abonniert (deaktiviert, gespeicherte Artikel bleiben)",
+            deactivated.len()
+        ));
+    }
+    Ok(subs.len())
 }
 
 pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
@@ -780,54 +952,9 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             if ctx.is_cancelled() {
                 return Err(SyncFailure::new("Lauf abgebrochen", None, None));
             }
-            let subs = client.subscriptions().await.map_err(io_err)?;
-            let cats = client.categories().await.map_err(io_err)?;
-            // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und
-            // Ereignisse dieses Laufs.
+            // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und Ereignisse.
             let account_id = profile.id.clone();
-            // Profilbindung im Schlüsselbund: Token und Konto gehören zusammen.
-            let _ = bind_account(&account_id);
-            for c in &cats {
-                let name = c.label.clone().unwrap_or_else(|| "Gruppe".into());
-                db(&worker, {
-                    let account_id = account_id.clone();
-                    let c = c.clone();
-                    move |db2| sr(db2.upsert_group_remote(&account_id, &c.id, &name))
-                })
-                .await?;
-            }
-            let group_ids: std::collections::HashMap<String, i64> =
-                db(&worker, |db2| sr(db2.list_groups()))
-                    .await?
-                    .into_iter()
-                    .filter_map(|g| g.remote_id.map(|r| (r, g.id)))
-                    .collect();
-            for s in &subs {
-                let url = s.id.strip_prefix("feed/").unwrap_or(&s.id).to_string();
-                let title = s.title.clone().unwrap_or_else(|| url.clone());
-                let fid = db(&worker, {
-                    let account_id = account_id.clone();
-                    let s = s.clone();
-                    let url = url.clone();
-                    let title = title.clone();
-                    move |db2| {
-                        sr(db2.upsert_feed_remote(
-                            &account_id,
-                            &s.id,
-                            &url,
-                            &title,
-                            s.website.as_deref(),
-                        ))
-                    }
-                })
-                .await?;
-                let gids: Vec<i64> = s
-                    .categories
-                    .iter()
-                    .filter_map(|c| group_ids.get(&c.id).copied())
-                    .collect();
-                db(&worker, move |db2| sr(db2.set_feed_groups(fid, &gids))).await?;
-            }
+            sync_subscriptions(&worker, &client, &account_id).await?;
             let stream = pf::global_all_stream(&profile.id);
             let newer_than = storage::now_ms() - 30 * 86_400_000;
             // Generation vor dem ersten Inhaltsabruf erfassen.
@@ -852,6 +979,11 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             let saved =
                 fetch_id_inventory(&client, &pf::saved_stream(&profile.id), MAX_ID_PAGES).await?;
             reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
+            let unread =
+                fetch_id_inventory(&client, &pf::unread_stream(&account_id), MAX_ID_PAGES).await?;
+            reconcile_unread(&worker, &account_id, &unread, pull_gen).await?;
+            let ids = inventory_ids(&saved, &unread);
+            load_contents(&worker, &client, &account_id, pull_gen, &ids, 200, &ctx).await?;
             dbg_log(&format!(
                 "Erst-Sync: {} Seiten, {added} Inhalte, Saved-Inventar {}",
                 summary.pages,
@@ -1263,6 +1395,12 @@ pub fn delta_sync(
                 }
             ));
             reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
+            // Vollständiger Leseabgleich: Unread-Inventar und fehlende Inhalte.
+            let unread =
+                fetch_id_inventory(&client, &pf::unread_stream(&account_id), MAX_ID_PAGES).await?;
+            reconcile_unread(&worker, &account_id, &unread, pull_gen).await?;
+            let ids = inventory_ids(&saved, &unread);
+            load_contents(&worker, &client, &account_id, pull_gen, &ids, 200, &ctx).await?;
             // Sicherer Checkpoint: der früheste Stand, den diese Phase
             // abgedeckt hat — der Sync-Start, nicht die lokale Endzeit.
             let checkpoint = summary
@@ -2064,6 +2202,364 @@ mod outbox_e2e_tests {
             !pending[0].1,
             "die neuere Absicht (unread) ist maßgeblich, nicht das alte read"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod read_sync_tests {
+    use super::*;
+
+    async fn worker_with_feedly(tag: &str) -> (DbWorker, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("lesefluss-readsync-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let worker = DbWorker::start(path.clone());
+        db(&worker, |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+            Ok::<_, storage::StorageError>(())
+        })
+        .await;
+        (worker, path)
+    }
+
+    /// A4: Lokal gelesene Artikel, die remote wieder ungelesen sind, werden
+    /// wieder ungelesen — revisionsgeschützt.
+    #[tokio::test]
+    async fn remote_wieder_ungelesen_wird_lokal_ungelesen() {
+        let (worker, path) = worker_with_feedly("neu-unread").await;
+        db(&worker, |db| {
+            let feed = db
+                .add_feed("feedly-1", "u1", "Feed", None, "#111111")
+                .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(feed, "a", "A", None, None, now, "e", None, now)
+                .unwrap();
+            db.raw()
+                .execute("UPDATE articles SET unread=0 WHERE id='a'", [])
+                .unwrap();
+            Ok::<_, storage::StorageError>(())
+        })
+        .await;
+        let inventory = pf::Inventory::Complete(vec!["a".into()]);
+        let changed = reconcile_unread(&worker, "feedly-1", &inventory, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let unread: i64 = db(&worker, |db| {
+            db.raw()
+                .query_row("SELECT unread FROM articles WHERE id='a'", [], |r| r.get(0))
+                .unwrap()
+        })
+        .await;
+        assert_eq!(unread, 1, "remote ungelesen wird lokal wieder ungelesen");
+        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+    }
+
+    /// Eine neuere lokale Änderung bleibt auch in der zweiten Richtung erhalten.
+    #[tokio::test]
+    async fn neuere_lokale_aenderung_gewinnt_gegen_die_zweite_richtung() {
+        let (worker, path) = worker_with_feedly("neu-unread-guard").await;
+        db(&worker, |db| {
+            let feed = db
+                .add_feed("feedly-1", "u1", "Feed", None, "#111111")
+                .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(feed, "a", "A", None, None, now, "e", None, now)
+                .unwrap();
+            db.raw()
+                .execute("UPDATE articles SET unread=0 WHERE id='a'", [])
+                .unwrap();
+            Ok::<_, storage::StorageError>(())
+        })
+        .await;
+        // Generation 0: danach wird lokal eine neue Absicht erzeugt.
+        let pull_gen = db(&worker, |db| db.pull_generation("feedly-1").unwrap()).await;
+        db(&worker, |db| {
+            let feed = db
+                .raw()
+                .query_row(
+                    "SELECT id FROM feeds WHERE account_id='feedly-1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            db.apply_status_with_outbox(feed, "a", Some(true), None)
+                .unwrap();
+            Ok::<_, storage::StorageError>(())
+        })
+        .await;
+        let inventory = pf::Inventory::Complete(vec!["a".into()]);
+        let _ = reconcile_unread(&worker, "feedly-1", &inventory, pull_gen)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+    }
+
+    /// A4: Unbekannte IDs aus dem Saved-Inventar werden per `.mget` nachgeladen,
+    /// auch wenn ihre Origin nicht (mehr) abonniert ist.
+    #[tokio::test]
+    async fn unbekannte_saved_ids_werden_inklusive_origin_angelegt() {
+        let (worker, path) = worker_with_feedly("unbekannt").await;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let body = serde_json::json!([{
+                    "id": "https://feedly.com/i/entry/alt",
+                    "unread": true,
+                    "origin": {"streamId": "feed/https://alt.example.org/rss", "title": "Alt"}
+                }])
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let client = pf::FeedlyClient::with_base("t".into(), format!("http://{addr}/v3/"));
+        let ids = vec!["https://feedly.com/i/entry/alt".to_string()];
+        let loaded = load_contents(
+            &worker,
+            &client,
+            "feedly-1",
+            i64::MAX,
+            &ids,
+            50,
+            &RunCtx::new("feedly-1", 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded, 1);
+        let (count, active) = db(&worker, |db| {
+            let row = db
+                .raw()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM articles WHERE id='https://feedly.com/i/entry/alt'),
+                            (SELECT active FROM feeds WHERE remote_id='feed/https://alt.example.org/rss')",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .unwrap();
+            row
+        })
+        .await;
+        assert_eq!(count, 1, "der Artikel wurde angelegt");
+        assert_eq!(active, 0, "die nicht abonnierte Quelle bleibt inaktiv");
+        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+    }
+
+    /// Abo-Abgleich: entfernte Quellen werden deaktiviert, gespeicherte Artikel
+    /// bleiben erhalten.
+    #[tokio::test]
+    async fn abgleich_deaktiviert_entfernte_quellen_nicht_gespeichertes() {
+        let (worker, path) = worker_with_feedly("abos").await;
+        db(&worker, |db| {
+            let feed = db
+                .add_feed("feedly-1", "u1", "Bleibt", None, "#111111")
+                .unwrap();
+            let gone = db
+                .add_feed("feedly-1", "u2", "Weg", None, "#222222")
+                .unwrap();
+            db.upsert_feed_remote(
+                "feedly-1",
+                "feed/bleibt",
+                "https://a.example/f",
+                "Bleibt",
+                None,
+            )
+            .unwrap();
+            db.upsert_feed_remote("feedly-1", "feed/weg", "https://b.example/f", "Weg", None)
+                .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(gone, "w1", "Weg", None, None, now, "e", None, now)
+                .unwrap();
+            db.set_saved_by_article_id("w1", true).unwrap();
+            let _ = feed;
+            Ok::<_, storage::StorageError>(())
+        })
+        .await;
+        let deactivated = db(&worker, |db| {
+            db.deactivate_missing_feeds("feedly-1", &["feed/bleibt".to_string()])
+                .unwrap()
+        })
+        .await;
+        assert_eq!(deactivated.len(), 1);
+        let (active, saved) = db(&worker, |db| {
+            let active = db
+                .raw()
+                .query_row(
+                    "SELECT active FROM feeds WHERE remote_id='feed/weg'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            let saved = db
+                .raw()
+                .query_row("SELECT saved FROM articles WHERE id='w1'", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            (active, saved)
+        })
+        .await;
+        assert_eq!(active, 0, "entfernte Quelle ist inaktiv");
+        assert_eq!(saved, 1, "gespeicherte Artikel bleiben erhalten");
+        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod delta_e2e_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn mock(
+        responder: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (code, body) = responder(&req);
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/v3/"), hits)
+    }
+
+    /// A4 über den echten Delta-Einstieg: vollständige Unread-/Saved-Inventare,
+    /// beide Statusrichtungen und Nachladen eines unbekannten gespeicherten
+    /// Artikels aus einer nicht (mehr) abonnierten Quelle.
+    #[test]
+    fn delta_sync_gleicht_beide_richtungen_und_laedt_unbekanntes_nach() {
+        let dir = std::env::temp_dir().join(format!("lesefluss-delta-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = DbWorker::start(dir.join("library.db"));
+        let entry = "https://feedly.com/i/entry/gespeichert";
+        let entry_owned = entry.to_string();
+        db_blocking(&worker, move |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+            let feed = db
+                .add_feed("feedly-1", "u1", "Feed", None, "#111111")
+                .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(feed, &entry_owned, "Titel", None, None, now, "e", None, now)
+                .unwrap();
+            // lokal gelesen, remote aber wieder ungelesen
+            db.raw()
+                .execute("UPDATE articles SET unread=0 WHERE id=?1", [&entry_owned])
+                .unwrap();
+        });
+
+        let e1 = entry.to_string();
+        let e2 = e1.clone();
+        let (base, _hits) = mock(move |req| {
+            if req.contains("markers/reads") {
+                (200, r#"{"entries":[]}"#.to_string())
+            } else if req.contains("global.all") {
+                (200, r#"{"items":[],"updated":1700000000}"#.to_string())
+            } else if req.contains("global.saved") {
+                (200, format!(r#"{{"ids":["{e1}"]}}"#))
+            } else if req.contains("global.unread") {
+                (200, format!(r#"{{"ids":["{e2}"]}}"#))
+            } else if req.contains("entries/.mget") {
+                (
+                    200,
+                    serde_json::json!([{
+                        "id": e1,
+                        "unread": true,
+                        "content": {"content": "<p>Inhalt</p>"},
+                        "origin": {"streamId": "feed/https://feedly.example/rss", "title": "Quelle"}
+                    }])
+                    .to_string(),
+                )
+            } else if req.contains("subscriptions") {
+                (200, "[]".to_string())
+            } else if req.contains("categories") {
+                (200, "[]".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        let last = storage::now_ms() - 60_000;
+        delta_sync(
+            worker.clone(),
+            &net,
+            "tok".to_string(),
+            "feedly-1".to_string(),
+            last,
+            ctx,
+        );
+
+        let mut done = false;
+        let mut failure = None;
+        for _ in 0..120 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncDone { .. }) => {
+                    done = true;
+                    break;
+                }
+                Ok(crate::net::NetEvent::FeedlySyncFailed { message, .. }) => {
+                    failure = Some(message);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(done, "der Lauf meldet Erfolg, Fehler: {failure:?}");
+
+        let (unread, has_content) = db_blocking(&worker, move |db| {
+            let unread = db
+                .raw()
+                .query_row("SELECT unread FROM articles WHERE id=?1", [&entry], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            let has_content = db
+                .raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM article_contents WHERE article_id=?1",
+                    [&entry],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            (unread, has_content)
+        });
+        assert_eq!(unread, 1, "remote ungelesen wurde lokal übernommen");
+        assert_eq!(has_content, 1, "der fehlende Inhalt wurde nachgeladen");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

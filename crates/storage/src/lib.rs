@@ -685,6 +685,31 @@ impl Database {
         )?)
     }
 
+    /// Welche der übergebenen IDs existieren lokal für dieses Konto?
+    pub fn known_article_ids(&self, account_id: &str, ids: &[String]) -> Result<Vec<String>> {
+        let mut found: Vec<String> = Vec::new();
+        for chunk in ids.chunks(200) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
+                 WHERE f.account_id=? AND a.id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut args: Vec<&dyn rusqlite::types::ToSql> = vec![&account_id];
+            for id in chunk {
+                args.push(id);
+            }
+            let rows = stmt
+                .query_map(args.as_slice(), |r| r.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            found.extend(rows);
+        }
+        Ok(found)
+    }
+
     /// IDs der lokal als ungelesen markierten Artikel eines Kontos.
     pub fn unread_ids_for_account(&self, account_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
@@ -772,6 +797,95 @@ impl Database {
     }
 
     /// Abbestellen: Feed stilllegen, Inhalte und gemerkte Artikel behalten.
+    /// Stellt sicher, dass ein Remote-Origin lokal einen Feed hat. Für Einträge
+    /// nicht (mehr) abonnierter Quellen wird der Feed inaktiv angelegt, damit der
+    /// Artikel sichtbar bleibt, ohne neue Abrufe auszulösen.
+    pub fn ensure_origin_feed(
+        &self,
+        account_id: &str,
+        stream_id: &str,
+        title: &str,
+    ) -> Result<i64> {
+        if let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM feeds WHERE account_id=?1 AND remote_id=?2",
+                params![account_id, stream_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+        let url = stream_id
+            .strip_prefix("feed/")
+            .unwrap_or(stream_id)
+            .to_string();
+        let id = self.add_feed(account_id, &url, title, None, "#7A8B99")?;
+        self.conn.execute(
+            "UPDATE feeds SET remote_id=?2, active=0 WHERE id=?1",
+            params![id, stream_id],
+        )?;
+        Ok(id)
+    }
+
+    /// Lokale Artikel, die als gelesen markiert sind, aber in `ids` vorkommen.
+    pub fn read_ids_within(&self, account_id: &str, ids: &[String]) -> Result<Vec<String>> {
+        let mut found: Vec<String> = Vec::new();
+        for chunk in ids.chunks(200) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
+                 WHERE f.account_id=? AND a.unread=0 AND a.id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut args: Vec<&dyn rusqlite::types::ToSql> = vec![&account_id];
+            for id in chunk {
+                args.push(id);
+            }
+            let rows = stmt
+                .query_map(args.as_slice(), |r| r.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+            found.extend(rows);
+        }
+        Ok(found)
+    }
+
+    /// Deaktiviert Feeds, deren Remote-ID in der vollständigen Abo-Liste fehlt.
+    /// Gespeicherte Artikel bleiben erhalten.
+    pub fn deactivate_missing_feeds(
+        &self,
+        account_id: &str,
+        present: &[String],
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM feeds WHERE account_id=?1 AND active=1 AND remote_id IS NOT NULL",
+        )?;
+        let candidates: Vec<i64> = stmt
+            .query_map(params![account_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let present: std::collections::HashSet<&str> = present.iter().map(String::as_str).collect();
+        let mut deactivated = Vec::new();
+        for feed_id in candidates {
+            let remote: Option<String> = self.conn.query_row(
+                "SELECT remote_id FROM feeds WHERE id=?1",
+                params![feed_id],
+                |r| r.get(0),
+            )?;
+            if let Some(remote) = remote {
+                if !present.contains(remote.as_str()) {
+                    self.deactivate_feed(feed_id)?;
+                    deactivated.push(feed_id);
+                }
+            }
+        }
+        Ok(deactivated)
+    }
+
     pub fn deactivate_feed(&self, feed_id: i64) -> Result<usize> {
         self.conn
             .execute("UPDATE feeds SET active=0 WHERE id=?1", params![feed_id])?;
