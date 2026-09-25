@@ -16,6 +16,7 @@ pub struct RunCtx {
 }
 
 impl RunCtx {
+    #[cfg(test)]
     pub fn new(account_id: &str, run_id: u64) -> Self {
         Self {
             account_id: account_id.to_string(),

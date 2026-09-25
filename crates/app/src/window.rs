@@ -446,6 +446,70 @@ mod router_tests {
 
     /// A1: Der Konto-Lookup darf keinen Borrow halten, während der Aufrufer den
     /// State verändert. Mit echter `RefCell` nachgewiesen.
+    /// B2 über den echten Zustand: A starten, B vormerken, A beenden (Erfolg),
+    /// B starten, B abbrechen, C starten.
+    #[test]
+    fn dispatcher_kette_vom_erfolg_bis_zum_wiederabbruch() {
+        let mut st = UiState::default();
+        st.coordinator.set_now(1_000);
+        // A starten
+        let a = match st.coordinator.request("k", sync_engine::Job::Initial) {
+            sync_engine::Decision::Start { run_id } => run_id,
+            other => panic!("A startet nicht: {other:?}"),
+        };
+        st.active_feedly_run = Some(FeedlyRun {
+            account_id: "k".to_string(),
+            run_id: a,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        st.feedly_sync_running = true;
+        // B während A vormerken
+        assert_eq!(
+            st.coordinator.request("k", sync_engine::Job::Refresh),
+            sync_engine::Decision::Queued
+        );
+        // A endet erfolgreich -> genau ein reservierter Folgelauf
+        let reserved = finish_run(&mut st, "k", a, None).expect("Abschluss gehört zu A");
+        let reserved = reserved.expect("B ist reserviert");
+        assert_eq!(reserved.job, sync_engine::Job::Refresh);
+        assert_ne!(reserved.run_id, a);
+        // Reservierter Start registriert den Lauf in der UI
+        st.active_feedly_run = Some(FeedlyRun {
+            account_id: "k".to_string(),
+            run_id: reserved.run_id,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        st.feedly_sync_running = true;
+        // Logout während B: Abbruch, keine Folgearbeit
+        st.active_feedly_run
+            .as_ref()
+            .expect("B läuft")
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        st.coordinator.abort("k");
+        st.coordinator.block("k");
+        st.active_feedly_run = None;
+        st.feedly_sync_running = false;
+        assert!(st.active_feedly_run.is_none());
+        assert_eq!(
+            st.coordinator.request("k", sync_engine::Job::Refresh),
+            sync_engine::Decision::Blocked
+        );
+        // Nach neuer Anmeldung wieder frei
+        st.coordinator.unblock("k");
+        st.coordinator.resume("k");
+        assert!(matches!(
+            st.coordinator.request("k", sync_engine::Job::Refresh),
+            sync_engine::Decision::Start { .. }
+        ));
+    }
+
+    /// B2 über den echten Zustand: A starten, B vormerken, A beenden (Erfolg),
+    /// B starten, B abbrechen, C starten.
+    #[test]
+    /// B2: Ein Ereignis gehört zum aktuellen Lauf; danach ist der Platz frei für
+    /// den nächsten (vom Coordinator reservierten) Lauf.
+    #[test]
     #[test]
     fn konto_lookup_haelt_keinen_borrow() {
         let accounts = vec![
@@ -708,6 +772,30 @@ pub fn data_dir() -> std::path::PathBuf {
 }
 
 const JS_CAPTURE_POS: &str = "(()=>{const g=document.querySelector('meta[name=lf-doc]');const gen=g?g.content:'-1';const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return gen+':-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return gen+':'+idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return gen+':'+idx+':'+Math.round(off);})()";
+
+/// Abschluss eines Laufs im Zustand: Laufidentität prüfen, Zustand zurücksetzen,
+/// Pause berücksichtigen und den Coordinator **genau einmal** abschließen.
+/// Gibt den reservierten Folgelauf zurück; der Aufrufer startet ihn direkt.
+pub fn finish_run(
+    st: &mut UiState,
+    account_id: &str,
+    run_id: u64,
+    pause: Option<sync_engine::Pause>,
+) -> Result<Option<sync_engine::ReservedRun>, ()> {
+    match &st.active_feedly_run {
+        Some(run) if run.account_id == account_id && run.run_id == run_id => {}
+        _ => return Err(()),
+    }
+    st.feedly_sync_running = false;
+    st.feedly_sync_queued = false;
+    st.active_feedly_run = None;
+    st.coordinator.set_now(now_ms());
+    if let Some(pause) = pause {
+        st.coordinator.stop_running(account_id);
+        st.coordinator.pause(account_id, pause);
+    }
+    Ok(st.coordinator.finish(account_id, now_ms()))
+}
 
 /// Fertige Medienergebnisse: Artikel (Feed, ID), Dokumentgeneration, Ersetzungen.
 pub type PendingMedia = ((i64, String), u64, Vec<(String, String)>);
@@ -1360,16 +1448,16 @@ impl App {
                 self.refresh_feedly_status();
                 let reserved = {
                     let mut st = self.state.borrow_mut();
-                    st.feedly_sync_running = false;
-                    st.feedly_sync_queued = false;
-                    st.active_feedly_run = None;
-                    st.coordinator.set_now(now_ms());
-                    st.coordinator.finish(&account_id, now_ms())
+                    finish_run(&mut st, &account_id, run_id, None)
                 };
-                if reserved.is_some() {
-                    // Der Coordinator hat den Folgelauf bereits reserviert; er wird
-                    // direkt gestartet und **nicht** erneut angemeldet.
-                    self.start_queued_feedly_run();
+                match reserved {
+                    Ok(Some(_)) => {
+                        // Der Coordinator hat den Folgelauf bereits reserviert; er wird
+                        // direkt gestartet und **nicht** erneut angemeldet.
+                        self.start_queued_feedly_run();
+                    }
+                    Ok(None) => {}
+                    Err(()) => dbg_log("Feedly: Erfolg zu einem ersetzten Lauf verworfen"),
                 }
                 let w = self.weak();
                 self.db_query(
@@ -1400,37 +1488,23 @@ impl App {
                     return;
                 }
                 self.refresh_feedly_status();
-                {
-                    let mut st = self.state.borrow_mut();
-                    st.feedly_sync_running = false;
-                    st.feedly_sync_queued = false;
-                    st.active_feedly_run = None;
-                    st.coordinator.set_now(now_ms());
-                    st.coordinator.finish(&account_id, now_ms());
-                    // Pausen aus dem Sync gelten für alle Wege, auch für den
-                    // manuellen Refresh.
-                    match status.as_deref() {
-                        Some("auth_required") => {
-                            st.coordinator.pause(&account_id, sync_engine::Pause::Auth)
-                        }
-                        Some("rate_limited") => {
-                            if let Some(until) = retry_after_ms {
-                                st.coordinator
-                                    .pause(&account_id, sync_engine::Pause::Quota(until));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
-                // Auch im Fehlerfall läuft ein reservierter Folgelauf weiter.
+                // Pausen zuerst: der Coordinator soll beim Abschluss schon wissen,
+                // dass kein Folgelauf starten darf. `finish` wird genau einmal
+                // aufgerufen und sein Ergebnis direkt ausgeführt.
+                let pause = match status.as_deref() {
+                    Some("auth_required") => Some(sync_engine::Pause::Auth),
+                    Some("rate_limited") => retry_after_ms.map(sync_engine::Pause::Quota),
+                    _ => None,
+                };
                 let reserved = {
                     let mut st = self.state.borrow_mut();
-                    st.coordinator.set_now(now_ms());
-                    st.coordinator.finish(&account_id, now_ms())
+                    finish_run(&mut st, &account_id, run_id, pause)
                 };
-                if reserved.is_some() {
-                    self.start_queued_feedly_run();
+                self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
+                match reserved {
+                    Ok(Some(_)) => self.start_queued_feedly_run(),
+                    Ok(None) => {}
+                    Err(()) => dbg_log("Feedly: Fehler zu einem ersetzten Lauf verworfen"),
                 }
             }
         }
@@ -3559,6 +3633,8 @@ impl App {
                 if job == sync_engine::Job::Refresh {
                     st.next_feedly_sync = 0;
                 }
+                // Der Lauf wird **vor** dem Spawn registriert: Konto, Laufkennung und
+                // Cancel-Handle gelten auch für reservierte Folgeläufe.
                 st.active_feedly_run = Some(FeedlyRun {
                     account_id: account_id.clone(),
                     run_id,
@@ -3618,17 +3694,43 @@ impl App {
         run_id: u64,
     ) {
         let ctx = {
-            let st = self.state.borrow();
-            match &st.active_feedly_run {
-                Some(run) if run.run_id == run_id => feedly_sync::RunCtx {
-                    account_id: run.account_id.clone(),
-                    run_id,
-                    cancel: std::sync::Arc::clone(&run.cancel),
-                    base: None,
-                },
-                _ => feedly_sync::RunCtx::new(&account_id, run_id),
+            let mut st = self.state.borrow_mut();
+            let run = st.active_feedly_run.take();
+            match run {
+                Some(run) if run.run_id == run_id => {
+                    let ctx = feedly_sync::RunCtx {
+                        account_id: run.account_id.clone(),
+                        run_id,
+                        cancel: std::sync::Arc::clone(&run.cancel),
+                        base: None,
+                    };
+                    st.active_feedly_run = Some(run);
+                    ctx
+                }
+                // Reservierter Start (kein oder ein anderer registrierter Lauf):
+                // der Coordinator hat die Laufkennung bereits vergeben.
+                _ => {
+                    let run = FeedlyRun {
+                        account_id: account_id.clone(),
+                        run_id,
+                        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    };
+                    st.feedly_sync_running = true;
+                    st.active_feedly_run = Some(FeedlyRun {
+                        account_id: run.account_id.clone(),
+                        run_id,
+                        cancel: std::sync::Arc::clone(&run.cancel),
+                    });
+                    feedly_sync::RunCtx {
+                        account_id: run.account_id,
+                        run_id,
+                        cancel: run.cancel,
+                        base: None,
+                    }
+                }
             }
         };
+        dbg_log(&format!("Feedly: Lauf {run_id} ({job:?}) gestartet"));
         match job {
             sync_engine::Job::Initial => {
                 feedly_sync::initial_sync(self.worker.clone(), &self.net, token, ctx)
