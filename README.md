@@ -14,9 +14,15 @@ sudo pacman -S --needed base-devel rust gtk4 libadwaita webkitgtk-6.0 sqlite
 
 ```sh
 cargo build --release --locked      # Binary: target/release/lesefluss-app
-cargo test --workspace --locked     # 15 Test-Suiten
-cargo clippy --workspace --all-targets --locked
+cargo test --workspace --locked     # 15 Test-Suiten, 163 Tests
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
 ```
+
+`rust-toolchain.toml` wählt **stable** (rustfmt + clippy) — ein bewegliches Ziel,
+keine gepinnte Version. Für reproduzierbare Builds das Lockfile verwenden und die
+Rust-Version beim Bauen protokollieren (`rustc --version`); CI (.github/workflows/ci.yml)
+baut und prüft denselben Stand in einem Arch-Container.
 
 Installation über das Arch-Paket in `packaging/` (Desktop-Eintrag, Icon, AppStream-Metadaten):
 

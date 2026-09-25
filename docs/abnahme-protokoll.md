@@ -17,7 +17,7 @@ nicht „vermutlich in Ordnung“.
 | Clippy | keine Fehler | 0 Fehler, 24 Warnungen (Typkomplexität, ungenutzte Hilfsmethoden) | `cargo clippy --workspace --all-targets --locked` | erfüllt mit Vorbehalt |
 | Formatierung | einheitlich | `cargo fmt --all -- --check` besteht seit 2026-09-25 (Bestand nachformatiert) | `cargo fmt --all -- --check` | erfüllt |
 | Paketbau | Arch-Paket aus dem Repository | `makepkg -f --noconfirm --nodeps` erzeugt 5,3 MiB (`lesefluss-git-0.1.0-2`); CI-Job installiert jetzt die GTK-/Adwaita-/WebKitGTK-Buildabhängigkeiten und prüft sie mit `pkg-config` | `packaging/PKGBUILD`, `.github/workflows/ci.yml` | erfüllt (CI-Lauf auf GitHub steht aus) |
-| Reproduzierbarkeit | feste Werkzeuge | `rust-toolchain.toml` (stable + rustfmt/clippy), Lockfile eingecheckt, CI-Workflow (Arch-Container) | `.github/workflows/ci.yml` | erfüllt |
+| Reproduzierbarkeit | nachvollziehbare Werkzeuge | `rust-toolchain.toml` = **stable** (bewegliches Ziel, keine feste Version), Lockfile eingecheckt, CI-Workflow (Arch-Container) mit allen Buildabhängigkeiten | `.github/workflows/ci.yml` | erfüllt mit Einschränkung |
 | Identität/Kontogrenzen | keine kontoübergreifende Wirkung | Tests: `identity_is_account_and_article_id`, `remote_status_updates_stay_inside_the_account`, `remote_pull_never_touches_local_articles` | `cargo test -p storage` | erfüllt |
 | Konflikte nach ACK | jüngere Absicht gewinnt | Test `stale_pull_cannot_overwrite_a_confirmed_local_intent` | dito | erfüllt |
 | Retention | Pending geschützt, Metadaten erhalten | Test `retention_keeps_metadata_and_protects_pending_outbox` | dito | erfüllt |
