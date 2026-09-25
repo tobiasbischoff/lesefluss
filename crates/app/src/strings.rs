@@ -45,7 +45,9 @@ pub struct Strings {
 
 impl Strings {
     pub fn detect() -> Self {
-        Self { lang: Lang::detect() }
+        Self {
+            lang: Lang::detect(),
+        }
     }
 
     pub fn get(&self, de: &str, en: &str) -> String {
@@ -67,7 +69,10 @@ mod tests {
     fn english_is_selected_for_english_environments() {
         std::env::set_var("LF_LANG", "en_GB.UTF-8");
         assert_eq!(Lang::detect(), Lang::En);
-        assert_eq!(Strings::detect().get("Einstellungen", "Settings"), "Settings");
+        assert_eq!(
+            Strings::detect().get("Einstellungen", "Settings"),
+            "Settings"
+        );
         std::env::set_var("LF_LANG", "de_DE.UTF-8");
         assert_eq!(Lang::detect(), Lang::De);
         std::env::remove_var("LF_LANG");

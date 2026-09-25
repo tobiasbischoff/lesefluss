@@ -32,7 +32,10 @@ pub fn omarchy_colors_path() -> Option<PathBuf> {
         } else if p.is_file() {
             if let Ok(name) = std::fs::read_to_string(&p) {
                 let name = name.trim().to_string();
-                for root in ["/usr/share/omarchy/themes", "/usr/local/share/omarchy/themes"] {
+                for root in [
+                    "/usr/share/omarchy/themes",
+                    "/usr/local/share/omarchy/themes",
+                ] {
                     let c = PathBuf::from(root).join(&name).join("colors.toml");
                     if c.is_file() {
                         return Some(c);
@@ -62,7 +65,9 @@ pub fn parse_colors_toml(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let v = v.trim().trim_matches('"').to_string();
         map.insert(k.trim().to_string(), v);
     }
@@ -79,7 +84,9 @@ pub fn omarchy_tokens() -> Option<Tokens> {
     let foreground = get("foreground")?;
     let accent = get("accent").unwrap_or(background);
     let selection = get("selection").unwrap_or(background);
-    let muted = get("muted").or_else(|| get("dark_foreground")).unwrap_or(foreground);
+    let muted = get("muted")
+        .or_else(|| get("dark_foreground"))
+        .unwrap_or(foreground);
     let raised = get("lighter_background").unwrap_or(background);
     let darker = get("dark_background").unwrap_or(background);
     Some(Tokens {

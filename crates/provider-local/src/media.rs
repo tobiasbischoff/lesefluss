@@ -1,6 +1,6 @@
 use crate::{HttpClient, ProviderError};
 use base64::Engine;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -13,6 +13,12 @@ pub struct MediaCache {
     dir: PathBuf,
     max_bytes: std::sync::atomic::AtomicU64,
     semaphore: tokio::sync::Semaphore,
+    /// Von der App gesetzte Pins (Schlüssel aus `key_of`). Jeder Prune prüft
+    /// diesen Stand, damit Bilder gespeicherter oder geteilter Artikel bleiben.
+    pins: std::sync::RwLock<HashSet<String>>,
+    /// Pro Schlüssel eine Sperre: parallele Abrufe derselben URL erzeugen nur
+    /// einen Netzabruf und niemals eine gemeinsame `.part`-Datei.
+    inflight: std::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn magic_mime(bytes: &[u8]) -> Option<&'static str> {
@@ -60,7 +66,8 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         let marker = bytes[i + 1];
         let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-        let is_sof = matches!(marker, 0xc0..=0xcf) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+        let is_sof =
+            matches!(marker, 0xc0..=0xcf) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
         if is_sof {
             let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
             let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
@@ -106,6 +113,11 @@ fn is_tracking_pixel(bytes: &[u8]) -> bool {
     bytes.len() <= 128
 }
 
+fn next_temp_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn key_of(url: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -121,6 +133,8 @@ impl MediaCache {
             dir,
             max_bytes: std::sync::atomic::AtomicU64::new(max_bytes),
             semaphore: tokio::sync::Semaphore::new(MAX_PARALLEL_IMAGE_FETCHES),
+            pins: std::sync::RwLock::new(HashSet::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -128,40 +142,79 @@ impl MediaCache {
         self.dir.join(key_of(url))
     }
 
+    /// Cachehit mit vollständiger Prüfung: auch Altbestände müssen die aktuellen
+    /// Grenzen erfüllen, sonst werden sie nicht verwendet.
     pub fn get_cached(&self, url: &str) -> Option<(Vec<u8>, &'static str)> {
         let p = self.path_for(url);
         let bytes = std::fs::read(&p).ok()?;
+        if !image_acceptable(&bytes) {
+            let _ = std::fs::remove_file(&p);
+            return None;
+        }
         let mime = magic_mime(&bytes)?;
         let _ = filetime_touch(&p);
         Some((bytes, mime))
     }
 
-    pub async fn get_or_fetch(&self, client: &HttpClient, url: &str) -> Option<(Vec<u8>, &'static str)> {
+    /// Pins aus der Datenbank übernehmen (Schlüssel aus `key_of`).
+    pub fn set_pins(&self, keys: HashSet<String>) {
+        if let Ok(mut current) = self.pins.write() {
+            *current = keys;
+        }
+    }
+
+    pub fn pinned(&self) -> HashSet<String> {
+        self.pins
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| HashSet::new())
+    }
+
+    pub async fn get_or_fetch(
+        &self,
+        client: &HttpClient,
+        url: &str,
+    ) -> Option<(Vec<u8>, &'static str)> {
+        if let Some(hit) = self.get_cached(url) {
+            return Some(hit);
+        }
+        let key = key_of(url);
+        let gate = {
+            let mut map = self.inflight.lock().ok()?;
+            map.entry(key.clone())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _serial = gate.lock().await;
         if let Some(hit) = self.get_cached(url) {
             return Some(hit);
         }
         let _slot = self.semaphore.acquire().await.ok()?;
-        if let Some(hit) = self.get_cached(url) {
-            return Some(hit);
-        }
         let (_, bytes) = client.fetch_image(url).await.ok()?;
         if !image_acceptable(&bytes) {
             return None;
         }
         let mime = magic_mime(&bytes)?;
         let p = self.path_for(url);
-        let tmp = p.with_extension("part");
+        let tmp = self.dir.join(format!(
+            "{key}.{}.{}.part",
+            std::process::id(),
+            next_temp_id()
+        ));
         let mut f = std::fs::File::create(&tmp).ok()?;
         f.write_all(&bytes).ok()?;
         f.sync_all().ok()?;
         drop(f);
         std::fs::rename(&tmp, &p).ok()?;
-        self.prune(&HashSet::new());
+        // Pins werden bei jedem Prune berücksichtigt, nicht nur beim Aufbewahren.
+        let pins = self.pinned();
+        self.prune(&pins);
         Some((bytes, mime))
     }
 
     pub fn set_max_bytes(&self, b: u64) {
-        self.max_bytes.store(b, std::sync::atomic::Ordering::Relaxed);
+        self.max_bytes
+            .store(b, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -175,9 +228,17 @@ impl MediaCache {
             .unwrap_or(0)
     }
 
+    /// Prune mit den aktuell gesetzten Pins.
+    pub fn prune_pinned(&self) {
+        let pins = self.pinned();
+        self.prune(&pins);
+    }
+
     pub fn prune(&self, pinned: &HashSet<String>) {
         let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
         for e in rd.filter_map(|e| e.ok()) {
             let Ok(m) = e.metadata() else { continue };
             let modified = m.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -194,7 +255,10 @@ impl MediaCache {
             if used <= cap {
                 break;
             }
-            let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             if pinned.contains(&name) {
                 continue;
             }
@@ -213,7 +277,10 @@ fn filetime_touch(p: &Path) -> std::io::Result<()> {
 
 pub fn placeholder_data_uri(alt: &str) -> String {
     let alt: String = alt.chars().take(60).collect();
-    let esc = alt.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let esc = alt
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let svg = format!(
         "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='96'><rect width='100%' height='100%' fill='#26272b'/><text x='50%' y='50%' fill='#9a9da6' font-family='sans-serif' font-size='13' text-anchor='middle' dominant-baseline='middle'>Bild nicht verfügbar — {esc}</text></svg>"
     );
@@ -245,7 +312,7 @@ fn err_unused(e: ProviderError) -> String {
 mod tests {
     use super::*;
 
-    fn png(w: u32, h: u32) -> Vec<u8> {
+    pub(super) fn png(w: u32, h: u32) -> Vec<u8> {
         let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         v.extend_from_slice(&13u32.to_be_bytes());
         v.extend_from_slice(b"IHDR");
@@ -276,5 +343,124 @@ mod tests {
     fn tracking_pixels_and_unknown_formats_are_rejected() {
         assert!(!image_acceptable(&[0u8; 32]));
         assert!(!image_acceptable(b"not an image at all"));
+    }
+}
+
+#[cfg(test)]
+mod pin_and_dedupe_tests {
+    use super::tests::png;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lesefluss-media-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn gepinntes_bild_ueberlebt_den_prune_bei_vollem_cache() {
+        let dir = tempdir("pins");
+        let cache = MediaCache::new(dir.clone(), 4 * 1024).unwrap();
+        let saved_url = "https://example.com/gespeichert.png";
+        let saved_key = key_of(saved_url);
+        std::fs::write(cache.path_for(saved_url), png(64, 64)).ok();
+        let mut pins = HashSet::new();
+        pins.insert(saved_key);
+        cache.set_pins(pins);
+
+        for i in 0..12 {
+            let url = format!("https://example.com/{i}.png");
+            std::fs::write(cache.path_for(&url), png(64, 64)).ok();
+        }
+        cache.prune_pinned();
+        assert!(
+            cache.path_for(saved_url).exists(),
+            "das Bild eines gespeicherten Artikels muss bleiben"
+        );
+        assert!(
+            cache.total_bytes() <= 4 * 1024 + 600,
+            "Cache bleibt begrenzt"
+        );
+
+        // Wird der Pin entfernt, darf die Datei bei erneut vollem Cache verschwinden.
+        cache.set_pins(HashSet::new());
+        for i in 0..12 {
+            let url = format!("https://example.com/neu-{i}.png");
+            std::fs::write(cache.path_for(&url), png(64, 64)).ok();
+        }
+        cache.prune_pinned();
+        assert!(
+            !cache.path_for(saved_url).exists(),
+            "ohne Pin ist die Datei wieder entfernbar"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallele_abrufe_derselben_url_laden_nur_einmal() {
+        let dir = tempdir("dedupe");
+        let cache = Arc::new(MediaCache::new(dir.clone(), 1024 * 1024).unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut s) = stream else { continue };
+                use std::io::{Read as _, Write as _};
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let mut body = png(32, 32);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+                body.clear();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let client = HttpClient::new().with_trusted_origin(&format!("http://{addr}"));
+        let url = format!("http://{addr}/bild.png");
+        let (a, b, c) = tokio::join!(
+            cache.get_or_fetch(&client, &url),
+            cache.get_or_fetch(&client, &url),
+            cache.get_or_fetch(&client, &url)
+        );
+        assert!(a.is_some() && b.is_some() && c.is_some());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "drei gleichzeitige Abrufe ergeben genau einen HTTP-Zugriff"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "keine geteilten .part-Dateien: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn cachehit_prueft_auch_altbestand() {
+        let dir = tempdir("altbestand");
+        let cache = MediaCache::new(dir.clone(), 1024 * 1024).unwrap();
+        let url = "https://example.com/kaputt.png";
+        // 100 MP: über der 40-MP-Grenze, aber formal ein PNG.
+        std::fs::write(cache.path_for(url), png(10_000, 10_000)).ok();
+        assert!(
+            cache.get_cached(url).is_none(),
+            "ein Altbestand oberhalb der Grenzen wird nicht verwendet"
+        );
+        assert!(!cache.path_for(url).exists(), "und wird entfernt");
     }
 }

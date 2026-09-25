@@ -32,7 +32,11 @@ fn build_sidebar(webview: &webkit6::WebView) -> gtk::Widget {
         .css_classes(vec!["navigation-sidebar".to_string()])
         .build();
     for label in ["Ungelesen", "Alle Artikel", "Gespeichert", "Beispielfeed"] {
-        list.append(&gtk::ListBoxRow::builder().child(&gtk::Label::new(Some(label))).build());
+        list.append(
+            &gtk::ListBoxRow::builder()
+                .child(&gtk::Label::new(Some(label)))
+                .build(),
+        );
     }
     list.connect_row_activated(move |_, row| {
         webview.load_html(&format!("<html><body style='background:#1C1D20;color:#F0F0F2;font:18px sans-serif'><h1>{}</h1><p>Native Auswahl wirkt auf WebView.</p></body></html>", row.child().and_then(|c| c.downcast::<gtk::Label>().ok()).map(|l| l.text()).unwrap_or_default()), None);
@@ -81,7 +85,10 @@ fn activate(app: &adw::Application) {
     controller.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::F6 {
             if let Some(w) = list_focus.ancestor(gtk::Window::static_type()) {
-                gtk::prelude::GtkWindowExt::set_focus(w.downcast_ref::<gtk::Window>().unwrap(), list_focus.parent().as_ref());
+                gtk::prelude::GtkWindowExt::set_focus(
+                    w.downcast_ref::<gtk::Window>().unwrap(),
+                    list_focus.parent().as_ref(),
+                );
             }
             return glib::Propagation::Stop;
         }

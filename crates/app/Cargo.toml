@@ -14,6 +14,7 @@ base64 = { workspace = true }
 domain = { workspace = true }
 reader = { workspace = true }
 storage = { workspace = true }
+sync-engine = { workspace = true }
 provider-local = { workspace = true }
 provider-feedly = { workspace = true }
 tokio = { workspace = true }
@@ -21,6 +22,9 @@ url = { workspace = true }
 quick-xml = { workspace = true }
 scraper = { workspace = true }
 glib = { workspace = true }
+gio = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
 gtk = { workspace = true }
 adw = { workspace = true }
 webkit6 = { workspace = true }

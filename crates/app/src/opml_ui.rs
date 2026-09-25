@@ -1,18 +1,19 @@
 //! OPML-Benutzerpfade: Dateiauswahl, Vorschau, Import und Export (§11).
 
 use crate::window::App;
-use gtk::gio;
-use std::path::PathBuf;
 use adw::prelude::*;
-use gtk::prelude::*;
-use std::rc::Rc;
+use gtk::gio;
 
 impl App {
     pub fn import_opml_dialog(&self) {
-        let dlg = gtk::FileDialog::builder().title("OPML-Datei wählen").build();
+        let dlg = gtk::FileDialog::builder()
+            .title("OPML-Datei wählen")
+            .build();
         let w = self.weak();
         glib::MainContext::default().spawn_local(async move {
-            let Ok(file) = dlg.open_future(None::<&gtk::Window>).await else { return };
+            let Ok(file) = dlg.open_future(None::<&gtk::Window>).await else {
+                return;
+            };
             let Some(path) = file.path() else { return };
             let bytes = match std::fs::read(&path) {
                 Ok(b) if b.len() <= crate::opml::MAX_OPML_BYTES => b,
@@ -51,9 +52,18 @@ impl App {
     }
 
     pub fn show_opml_preview(&self, draft: crate::opml::OpmlDraft) {
-        let known: std::collections::HashSet<String> =
-            self.state.borrow().feeds.iter().map(|f| f.feed_url.clone()).collect();
-        let new: Vec<&crate::opml::OpmlFeed> = draft.feeds.iter().filter(|f| !known.contains(&f.xml_url)).collect();
+        let known: std::collections::HashSet<String> = self
+            .state
+            .borrow()
+            .feeds
+            .iter()
+            .map(|f| f.feed_url.clone())
+            .collect();
+        let new: Vec<&crate::opml::OpmlFeed> = draft
+            .feeds
+            .iter()
+            .filter(|f| !known.contains(&f.xml_url))
+            .collect();
         let existing = draft.feeds.len() - new.len();
         let listing: String = new
             .iter()
@@ -106,7 +116,14 @@ impl App {
         let entries: Vec<(String, String, Option<String>, Vec<String>)> = draft
             .feeds
             .iter()
-            .map(|f| (f.title.clone(), f.xml_url.clone(), f.html_url.clone(), f.groups.clone()))
+            .map(|f| {
+                (
+                    f.title.clone(),
+                    f.xml_url.clone(),
+                    f.html_url.clone(),
+                    f.groups.clone(),
+                )
+            })
             .collect();
         let errors = draft.errors.len();
         self.db_query(
@@ -146,22 +163,36 @@ impl App {
                     groups: f
                         .groups
                         .iter()
-                        .filter_map(|g| st.groups.iter().find(|x| x.id == *g).map(|x| x.name.clone()))
+                        .filter_map(|g| {
+                            st.groups
+                                .iter()
+                                .find(|x| x.id == *g)
+                                .map(|x| x.name.clone())
+                        })
                         .collect(),
                 })
                 .collect()
         };
-        let dlg = gtk::FileDialog::builder().title("OPML-Export speichern unter").build();
+        let dlg = gtk::FileDialog::builder()
+            .title("OPML-Export speichern unter")
+            .build();
         dlg.set_initial_name(Some("lesefluss-abonnements.opml"));
         let w = self.weak();
         glib::MainContext::default().spawn_local(async move {
-            let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else { return };
+            let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else {
+                return;
+            };
             let Some(path) = file.path() else { return };
             let xml = crate::opml::build_opml(&feeds);
             let tmp = path.with_extension("opml.tmp");
-            let ok = std::fs::write(&tmp, xml.as_bytes()).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+            let ok = std::fs::write(&tmp, xml.as_bytes()).is_ok()
+                && std::fs::rename(&tmp, &path).is_ok();
             if let Some(app) = w.upgrade() {
-                app.show_toast(if ok { "OPML exportiert" } else { "Export fehlgeschlagen" });
+                app.show_toast(if ok {
+                    "OPML exportiert"
+                } else {
+                    "Export fehlgeschlagen"
+                });
             }
         });
     }

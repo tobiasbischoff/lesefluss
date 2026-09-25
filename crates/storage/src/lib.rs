@@ -117,9 +117,10 @@ pub struct FetchState {
     pub last_error: Option<String>,
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
 CREATE TABLE accounts (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -227,7 +228,6 @@ ALTER TABLE feeds ADD COLUMN remote_id TEXT;
 ALTER TABLE groups ADD COLUMN remote_id TEXT;
 "#,
     ),
-
     (
         4,
         r#"
@@ -339,13 +339,32 @@ ALTER TABLE feeds ADD COLUMN user_title TEXT;
 ALTER TABLE articles ADD COLUMN thumb TEXT;
 "#,
     ),
+    (
+        13,
+        r#"
+ALTER TABLE field_revisions ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE account_sequence (
+    account_id TEXT PRIMARY KEY,
+    counter INTEGER NOT NULL
+);
+UPDATE field_revisions SET sequence = revision;
+INSERT INTO account_sequence(account_id, counter)
+    SELECT account_id, MAX(revision) FROM field_revisions GROUP BY account_id;
+"#,
+    ),
 ];
+
+/// Höchste von dieser App verstandene Schemastufe.
+pub fn max_schema_version() -> i64 {
+    MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0)
+}
 
 pub struct Database {
     conn: Connection,
 }
 
-const OUTBOX_UPSERT: &str = "INSERT INTO outbox(account_id, entity_id, field, desired, revision, created_ms)
+const OUTBOX_UPSERT: &str =
+    "INSERT INTO outbox(account_id, entity_id, field, desired, revision, created_ms)
      VALUES (?1,?2,?3,?4,?5,?6)
      ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
        desired=excluded.desired,
@@ -362,12 +381,26 @@ fn bump_outbox(
     desired: bool,
 ) -> rusqlite::Result<i64> {
     let now = now_ms();
+    // Konto-globale, monoton steigende Sequenz: nur damit sind Revisionen
+    // verschiedener Artikel miteinander vergleichbar.
     tx.execute(
-        "INSERT INTO field_revisions(account_id, entity_id, field, revision, updated_ms)
-         VALUES (?1,?2,?3,1,?4)
+        "INSERT INTO account_sequence(account_id, counter) VALUES (?1, 1)
+         ON CONFLICT(account_id) DO UPDATE SET counter=account_sequence.counter+1",
+        params![account_id],
+    )?;
+    let sequence: i64 = tx.query_row(
+        "SELECT counter FROM account_sequence WHERE account_id=?1",
+        params![account_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO field_revisions(account_id, entity_id, field, revision, sequence, updated_ms)
+         VALUES (?1,?2,?3,1,?4,?5)
          ON CONFLICT(account_id, entity_id, field) DO UPDATE SET
-           revision=field_revisions.revision+1, updated_ms=?4",
-        params![account_id, entity_id, field, now],
+           revision=field_revisions.revision+1,
+           sequence=excluded.sequence,
+           updated_ms=?5",
+        params![account_id, entity_id, field, sequence, now],
     )?;
     let revision: i64 = tx.query_row(
         "SELECT revision FROM field_revisions WHERE account_id=?1 AND entity_id=?2 AND field=?3",
@@ -382,7 +415,11 @@ fn bump_outbox(
 }
 
 fn path_key(key: &(Option<i64>, String)) -> String {
-    format!("{}::{}", key.0.map(|v| v.to_string()).unwrap_or_default(), key.1)
+    format!(
+        "{}::{}",
+        key.0.map(|v| v.to_string()).unwrap_or_default(),
+        key.1
+    )
 }
 
 fn accent_for(url: &str) -> String {
@@ -400,6 +437,49 @@ fn clamp_future(ms: i64, now: i64) -> i64 {
     ms.min(now)
 }
 
+/// Spielt die Migrationen bis `version` in einer frischen Datenbank nach und liefert
+/// den daraus folgenden Tabellensatz. Damit kann die Prüfung nicht veralten.
+fn expected_schema(version: i64) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    for (v, sql) in MIGRATIONS {
+        if *v <= version {
+            conn.execute_batch(sql)?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version(version, applied_ms) VALUES (?1, ?2)",
+                params![v, now_ms()],
+            )?;
+        }
+    }
+    actual_schema(&conn)
+}
+
+fn actual_schema(conn: &Connection) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut tables: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for name in names {
+        let mut columns = Vec::new();
+        let mut info = conn.prepare(&format!("PRAGMA table_info({name})"))?;
+        let rows = info.query_map([], |r| r.get::<_, String>(1))?;
+        for column in rows {
+            columns.push(column?);
+        }
+        columns.sort();
+        tables.insert(name, columns);
+    }
+    Ok(tables)
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -410,8 +490,46 @@ impl Database {
         db.conn.pragma_update(None, "journal_mode", "WAL")?;
         db.conn.pragma_update(None, "foreign_keys", "ON")?;
         db.conn.pragma_update(None, "busy_timeout", "5000")?;
+        db.backup_before_migration(path)?;
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Vor jeder Schemaänderung wird eine konsistente Kopie (inklusive noch nicht
+    /// eingecheckter WAL-Daten) angelegt. Ohne diese Sicherung wird nicht migriert.
+    fn backup_before_migration(&self, path: &Path) -> Result<()> {
+        let has_version_table: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_version_table == 0 {
+            return Ok(());
+        }
+        let current: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
+        let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
+        if current == 0 || current >= max_known {
+            return Ok(());
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "library.db".to_string());
+        let backup = path.with_file_name(format!("{name}.pre-migrate-{}.db", now_ms()));
+        self.backup_to(&backup).map_err(|e| {
+            StorageError::Schema(format!(
+                "Vor der Schemaaktualisierung (Version {current} → {max_known}) konnte keine \
+                 Sicherung unter {} angelegt werden: {e}",
+                backup.display()
+            ))
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -426,9 +544,11 @@ impl Database {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL);",
         )?;
-        let current: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(MAX(version),0) FROM schema_version", [], |r| r.get(0))?;
+        let current: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
         let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
         if current > max_known {
             return Err(StorageError::Schema(format!(
@@ -459,8 +579,11 @@ impl Database {
     }
 
     pub fn list_accounts(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, kind, name FROM accounts ORDER BY kind, name")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, name FROM accounts ORDER BY kind, name")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
@@ -511,7 +634,12 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn upsert_group_remote(&self, account_id: &str, remote_id: &str, name: &str) -> Result<i64> {
+    pub fn upsert_group_remote(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+        name: &str,
+    ) -> Result<i64> {
         let existing: Option<i64> = self
             .conn
             .query_row(
@@ -521,7 +649,8 @@ impl Database {
             )
             .optional()?;
         if let Some(id) = existing {
-            self.conn.execute("UPDATE groups SET name=?2 WHERE id=?1", params![id, name])?;
+            self.conn
+                .execute("UPDATE groups SET name=?2 WHERE id=?1", params![id, name])?;
             return Ok(id);
         }
         self.conn.execute(
@@ -556,6 +685,34 @@ impl Database {
         )?)
     }
 
+    /// IDs der lokal als ungelesen markierten Artikel eines Kontos.
+    pub fn unread_ids_for_account(&self, account_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
+             WHERE f.account_id=?1 AND a.unread=1",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// IDs gespeicherter oder ungelesener Artikel des Kontos, deren Inhalt fehlt.
+    /// Sie werden per `.mget` nachgeladen, statt still zu fehlen.
+    pub fn articles_needing_content(&self, account_id: &str, limit: u32) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
+             WHERE f.account_id=?1 AND (a.saved=1 OR a.unread=1)
+               AND NOT EXISTS (SELECT 1 FROM article_contents c
+                               WHERE c.feed_id=a.feed_id AND c.article_id=a.id)
+             ORDER BY a.sort_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id, limit], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn saved_ids_for_account(&self, account_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
@@ -577,7 +734,14 @@ impl Database {
         Ok(id)
     }
 
-    pub fn add_feed(&self, account_id: &str, feed_url: &str, title: &str, website: Option<&str>, accent: &str) -> Result<i64> {
+    pub fn add_feed(
+        &self,
+        account_id: &str,
+        feed_url: &str,
+        title: &str,
+        website: Option<&str>,
+        accent: &str,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO feeds(account_id, feed_url, title, website, accent, added_ms)
              VALUES (?1,?2,?3,?4,?5,?6)",
@@ -654,7 +818,12 @@ impl Database {
         Ok(v != 0)
     }
 
-    pub fn update_feed_title(&self, feed_id: i64, title: &str, website: Option<&str>) -> Result<()> {
+    pub fn update_feed_title(
+        &self,
+        feed_id: i64,
+        title: &str,
+        website: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE feeds SET title=?2, website=COALESCE(?3, website) WHERE id=?1",
             params![feed_id, title, website],
@@ -681,12 +850,18 @@ impl Database {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
-        let mut gs = self.conn.prepare("SELECT feed_id, group_id FROM feed_groups")?;
+        let mut gs = self
+            .conn
+            .prepare("SELECT feed_id, group_id FROM feed_groups")?;
         let pairs: Vec<(i64, i64)> = gs
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
         for f in feeds.iter_mut() {
-            f.groups = pairs.iter().filter(|(fid, _)| *fid == f.id).map(|(_, g)| *g).collect();
+            f.groups = pairs
+                .iter()
+                .filter(|(fid, _)| *fid == f.id)
+                .map(|(_, g)| *g)
+                .collect();
         }
         Ok(feeds)
     }
@@ -701,7 +876,8 @@ impl Database {
         let tx = self.conn.unchecked_transaction()?;
         let mut group_ids: std::collections::HashMap<(Option<i64>, String), i64> =
             std::collections::HashMap::new();
-        let mut group_path: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut group_path: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         let mut new_feeds = 0usize;
         let mut merged = 0usize;
         for (title, url, website, groups) in entries {
@@ -748,7 +924,8 @@ impl Database {
             match existing_feed {
                 Some(fid) => {
                     let mut all: Vec<i64> = {
-                        let mut stmt = tx.prepare("SELECT group_id FROM feed_groups WHERE feed_id=?1")?;
+                        let mut stmt =
+                            tx.prepare("SELECT group_id FROM feed_groups WHERE feed_id=?1")?;
                         let rows = stmt
                             .query_map(params![fid], |r| r.get(0))?
                             .collect::<std::result::Result<Vec<i64>, _>>()?;
@@ -769,14 +946,7 @@ impl Database {
                     tx.execute(
                         "INSERT INTO feeds(account_id, feed_url, title, website, accent, added_ms)
                          VALUES (?1,?2,?3,?4,?5,?6)",
-                        params![
-                            account_id,
-                            url,
-                            title,
-                            website,
-                            &accent_for(url),
-                            now_ms()
-                        ],
+                        params![account_id, url, title, website, &accent_for(url), now_ms()],
                     )?;
                     let fid = tx.last_insert_rowid();
                     for g in gids {
@@ -834,7 +1004,11 @@ impl Database {
 
     pub fn feed_id_by_url(&self, url: &str) -> Result<Option<i64>> {
         self.conn
-            .query_row("SELECT id FROM feeds WHERE feed_url=?1", params![url], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM feeds WHERE feed_url=?1",
+                params![url],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -865,7 +1039,17 @@ impl Database {
             self.conn.execute(
                 "UPDATE articles SET title=?3, author=?4, url=?5, published_ms=?6, sort_ms=?7,
                  excerpt=?8, updated_ms=?9 WHERE feed_id=?1 AND id=?2",
-                params![feed_id, id, title, author, url, published_ms, sort, excerpt, now],
+                params![
+                    feed_id,
+                    id,
+                    title,
+                    author,
+                    url,
+                    published_ms,
+                    sort,
+                    excerpt,
+                    now
+                ],
             )?;
         } else {
             self.conn.execute(
@@ -887,9 +1071,11 @@ impl Database {
                 params![feed_id, id],
             )?;
         }
-        let feed_title: String = self
-            .conn
-            .query_row("SELECT title FROM feeds WHERE id=?1", params![feed_id], |r| r.get(0))?;
+        let feed_title: String = self.conn.query_row(
+            "SELECT title FROM feeds WHERE id=?1",
+            params![feed_id],
+            |r| r.get(0),
+        )?;
         let rowid: i64 = self.conn.query_row(
             "SELECT rowid FROM articles WHERE feed_id=?1 AND id=?2",
             params![feed_id, id],
@@ -904,7 +1090,8 @@ impl Database {
             )
             .optional()?
             .unwrap_or_default();
-        self.conn.execute("DELETE FROM article_fts WHERE rowid=?1", params![rowid])?;
+        self.conn
+            .execute("DELETE FROM article_fts WHERE rowid=?1", params![rowid])?;
         self.conn.execute(
             "INSERT INTO article_fts(rowid, title, author, feed_title, body) VALUES (?1,?2,?3,?4,?5)",
             params![rowid, title, author.unwrap_or(""), feed_title, body],
@@ -912,10 +1099,19 @@ impl Database {
         Ok(!exists)
     }
 
-    pub fn upsert_articles(&self, feed_id: i64, items: &[NewArticle], now: i64) -> Result<(usize, usize)> {
+    pub fn upsert_articles(
+        &self,
+        feed_id: i64,
+        items: &[NewArticle],
+        now: i64,
+    ) -> Result<(usize, usize)> {
         let tx = self.conn.unchecked_transaction()?;
         let (mut added, mut updated) = (0usize, 0usize);
-        let feed_title: String = tx.query_row("SELECT title FROM feeds WHERE id=?1", params![feed_id], |r| r.get(0))?;
+        let feed_title: String = tx.query_row(
+            "SELECT title FROM feeds WHERE id=?1",
+            params![feed_id],
+            |r| r.get(0),
+        )?;
         for item in items {
             let tomb: bool = tx.query_row(
                 "SELECT COUNT(*) FROM tombstones WHERE feed_id=?1 AND article_id=?2",
@@ -983,7 +1179,13 @@ impl Database {
         Ok((added, updated))
     }
 
-    pub fn set_status(&self, feed_id: i64, id: &str, read: Option<bool>, saved: Option<bool>) -> Result<()> {
+    pub fn set_status(
+        &self,
+        feed_id: i64,
+        id: &str,
+        read: Option<bool>,
+        saved: Option<bool>,
+    ) -> Result<()> {
         let mut sets = Vec::new();
         let mut vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(r) = read {
@@ -997,7 +1199,10 @@ impl Database {
         if sets.is_empty() {
             return Ok(());
         }
-        let sql = format!("UPDATE articles SET {} WHERE feed_id=? AND id=?", sets.join(","));
+        let sql = format!(
+            "UPDATE articles SET {} WHERE feed_id=? AND id=?",
+            sets.join(",")
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut all: Vec<&dyn rusqlite::types::ToSql> = vals.iter().map(|v| v.as_ref()).collect();
         all.push(&feed_id);
@@ -1032,19 +1237,19 @@ impl Database {
         &self,
         scope: &Scope,
         filter: Filter,
-        before: Option<(i64, &str)>,
+        before: Option<(i64, i64, &str)>,
         limit: u32,
     ) -> Result<Vec<ArticleRow>> {
         self.query_articles_ordered(scope, filter, before, limit, true)
     }
 
     /// `ascending=false` liefert älteste zuerst; der Cursor bleibt eindeutig,
-    /// weil (sort_ms, id) in beiden Richtungen total geordnet ist.
+    /// weil (sort_ms, feed_id, id) in beiden Richtungen total geordnet ist.
     pub fn query_articles_ordered(
         &self,
         scope: &Scope,
         filter: Filter,
-        before: Option<(i64, &str)>,
+        before: Option<(i64, i64, &str)>,
         limit: u32,
         newest_first: bool,
     ) -> Result<Vec<ArticleRow>> {
@@ -1082,14 +1287,19 @@ impl Database {
             where_clauses.push("fg.group_id=?".into());
             args.push(Box::new(*g));
         }
-        if let Some((sort_ms, id)) = before {
-            if newest_first {
-                where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
-            } else {
-                where_clauses.push("(a.sort_ms > ? OR (a.sort_ms = ? AND a.id > ?))".into());
-            }
+        if let Some((sort_ms, feed_id, id)) = before {
+            // (sort_ms, feed_id, id) ist total eindeutig: gleiche Zeit und gleiche
+            // GUID in zwei Feeds erzeugen keine Lücke und keinen Wiederholer.
+            let order = if newest_first { "<" } else { ">" };
+            where_clauses.push(format!(
+                "(a.sort_ms {order} ? OR (a.sort_ms = ? AND a.feed_id {order} ?) \
+                 OR (a.sort_ms = ? AND a.feed_id = ? AND a.id {order} ?))"
+            ));
             args.push(Box::new(sort_ms));
             args.push(Box::new(sort_ms));
+            args.push(Box::new(feed_id));
+            args.push(Box::new(sort_ms));
+            args.push(Box::new(feed_id));
             args.push(Box::new(id.to_string()));
         }
         if !where_clauses.is_empty() {
@@ -1100,9 +1310,9 @@ impl Database {
             sql.push_str(" GROUP BY a.id, a.feed_id");
         }
         if newest_first {
-            sql.push_str(" ORDER BY a.sort_ms DESC, a.id DESC LIMIT ?");
+            sql.push_str(" ORDER BY a.sort_ms DESC, a.feed_id DESC, a.id DESC LIMIT ?");
         } else {
-            sql.push_str(" ORDER BY a.sort_ms ASC, a.id ASC LIMIT ?");
+            sql.push_str(" ORDER BY a.sort_ms ASC, a.feed_id ASC, a.id ASC LIMIT ?");
         }
         args.push(Box::new(limit as i64));
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1135,7 +1345,7 @@ impl Database {
         query: &str,
         scope: &Scope,
         filter: Filter,
-        before: Option<(i64, &str)>,
+        before: Option<(i64, i64, &str)>,
         limit: u32,
     ) -> Result<Vec<ArticleRow>> {
         self.search_ordered(query, scope, filter, before, limit, true)
@@ -1146,7 +1356,7 @@ impl Database {
         query: &str,
         scope: &Scope,
         filter: Filter,
-        before: Option<(i64, &str)>,
+        before: Option<(i64, i64, &str)>,
         limit: u32,
         newest_first: bool,
     ) -> Result<Vec<ArticleRow>> {
@@ -1172,24 +1382,28 @@ impl Database {
                 args.push(Box::new(acc.clone()));
             }
             Scope::Group(g) => {
-                where_clauses.push("a.feed_id IN (SELECT feed_id FROM feed_groups WHERE group_id=?)".into());
+                where_clauses
+                    .push("a.feed_id IN (SELECT feed_id FROM feed_groups WHERE group_id=?)".into());
                 args.push(Box::new(*g));
             }
         }
-        if let Some((sort_ms, id)) = before {
-            if newest_first {
-                where_clauses.push("(a.sort_ms < ? OR (a.sort_ms = ? AND a.id < ?))".into());
-            } else {
-                where_clauses.push("(a.sort_ms > ? OR (a.sort_ms = ? AND a.id > ?))".into());
-            }
+        if let Some((sort_ms, feed_id, id)) = before {
+            let cmp = if newest_first { "<" } else { ">" };
+            where_clauses.push(format!(
+                "(a.sort_ms {cmp} ? OR (a.sort_ms = ? AND a.feed_id {cmp} ?) \
+                 OR (a.sort_ms = ? AND a.feed_id = ? AND a.id {cmp} ?))"
+            ));
             args.push(Box::new(sort_ms));
             args.push(Box::new(sort_ms));
+            args.push(Box::new(feed_id));
+            args.push(Box::new(sort_ms));
+            args.push(Box::new(feed_id));
             args.push(Box::new(id.to_string()));
         }
         let order = if newest_first {
-            "a.sort_ms DESC, a.id DESC"
+            "a.sort_ms DESC, a.feed_id DESC, a.id DESC"
         } else {
-            "a.sort_ms ASC, a.id ASC"
+            "a.sort_ms ASC, a.feed_id ASC, a.id ASC"
         };
         let sql = format!(
             "SELECT a.id, a.feed_id, f.title, f.accent, a.title, a.author, a.url, a.published_ms,
@@ -1234,20 +1448,28 @@ impl Database {
         c.unread = self.distinct_count("WHERE a.unread=1")?;
         c.saved = self.distinct_count("WHERE a.saved=1")?;
         c.total = self.distinct_count("")?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT feed_id, COUNT(DISTINCT id) FROM articles WHERE unread=1 GROUP BY feed_id")?;
-        c.per_feed = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut stmt = self.conn.prepare(
-            "SELECT fg.group_id, COUNT(DISTINCT a.id) FROM articles a
-             JOIN feed_groups fg ON fg.feed_id=a.feed_id WHERE a.unread=1 GROUP BY fg.group_id",
+            "SELECT feed_id, COUNT(DISTINCT id) FROM articles WHERE unread=1 GROUP BY feed_id",
         )?;
-        c.per_group = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        c.per_feed = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, COUNT(*) FROM (
+                 SELECT DISTINCT fg.group_id, a.feed_id, a.id FROM articles a
+                 JOIN feed_groups fg ON fg.feed_id=a.feed_id WHERE a.unread=1
+             ) GROUP BY group_id",
+        )?;
+        c.per_group = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
         let mut stmt = self.conn.prepare(
             "SELECT f.account_id, COUNT(DISTINCT a.id) FROM articles a JOIN feeds f ON f.id=a.feed_id
              WHERE a.unread=1 AND f.account_id != 'local' GROUP BY f.account_id",
         )?;
-        c.per_account = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        c.per_account = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(c)
     }
 
@@ -1354,7 +1576,12 @@ impl Database {
     }
 
     /// Kleine Vorschau als Daten-URI (PNG, max. 128 px); `None` entfernt sie.
-    pub fn set_article_thumb(&self, feed_id: i64, article_id: &str, thumb: Option<&str>) -> Result<()> {
+    pub fn set_article_thumb(
+        &self,
+        feed_id: i64,
+        article_id: &str,
+        thumb: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE articles SET thumb=?3 WHERE feed_id=?1 AND id=?2",
             params![feed_id, article_id, thumb],
@@ -1393,7 +1620,9 @@ impl Database {
             "SELECT DISTINCT m.url FROM article_media m JOIN articles a
              ON a.feed_id=m.feed_id AND a.id=m.article_id WHERE a.saved=1",
         )?;
-        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
 
@@ -1421,9 +1650,18 @@ impl Database {
             .query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
         for (feed_id, id) in &ids {
-            tx.execute("DELETE FROM article_contents WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
-            tx.execute("DELETE FROM article_media WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
-            tx.execute("DELETE FROM read_positions WHERE feed_id=?1 AND article_id=?2", params![feed_id, id])?;
+            tx.execute(
+                "DELETE FROM article_contents WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, id],
+            )?;
+            tx.execute(
+                "DELETE FROM article_media WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, id],
+            )?;
+            tx.execute(
+                "DELETE FROM read_positions WHERE feed_id=?1 AND article_id=?2",
+                params![feed_id, id],
+            )?;
             tx.execute(
                 "UPDATE articles SET pruned_ms=?3 WHERE feed_id=?1 AND id=?2",
                 params![feed_id, id, now_ms],
@@ -1437,7 +1675,14 @@ impl Database {
         Ok(ids.len())
     }
 
-    pub fn save_read_position(&self, feed_id: i64, article_id: &str, content_hash: Option<&str>, anchor_idx: i64, offset_px: i64) -> Result<()> {
+    pub fn save_read_position(
+        &self,
+        feed_id: i64,
+        article_id: &str,
+        content_hash: Option<&str>,
+        anchor_idx: i64,
+        offset_px: i64,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO read_positions(feed_id, article_id, content_hash, anchor_idx, offset_px, updated_ms)
              VALUES (?1,?2,?3,?4,?5,?6)
@@ -1449,7 +1694,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn read_position(&self, feed_id: i64, article_id: &str) -> Result<Option<(Option<String>, i64, i64)>> {
+    pub fn read_position(
+        &self,
+        feed_id: i64,
+        article_id: &str,
+    ) -> Result<Option<(Option<String>, i64, i64)>> {
         self.conn
             .query_row(
                 "SELECT content_hash, anchor_idx, offset_px FROM read_positions WHERE feed_id=?1 AND article_id=?2",
@@ -1471,11 +1720,16 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Vollständige strukturelle Prüfung eines Restore-Kandidaten: SQLite-Integrität,
+    /// versionstreue Tabellensätze samt Spalten, Fremdschlüssel und Schemastufe.
+    /// Formale Gültigkeit (vier Tabellennamen) genügt ausdrücklich nicht.
     pub fn validate_candidate(path: &std::path::Path) -> Result<i64> {
         let file = std::fs::File::open(path)?;
         let meta = file.metadata()?;
         if meta.len() < 512 {
-            return Err(StorageError::Schema("Datei ist keine SQLite-Datenbank".into()));
+            return Err(StorageError::Schema(
+                "Datei ist keine SQLite-Datenbank".into(),
+            ));
         }
         let conn = Connection::open_with_flags(
             path,
@@ -1483,7 +1737,7 @@ impl Database {
         )
         .map_err(|e| StorageError::Schema(format!("Keine SQLite-Datenbank: {e}")))?;
         let integrity: String = conn
-            .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
             .map_err(|e| StorageError::Schema(format!("Integritätsprüfung fehlgeschlagen: {e}")))?;
         if integrity != "ok" {
             return Err(StorageError::Schema(format!(
@@ -1505,9 +1759,11 @@ impl Database {
             }
         }
         let version: i64 = conn
-            .query_row("SELECT COALESCE(MAX(version),0) FROM schema_version", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
             .map_err(|e| StorageError::Schema(e.to_string()))?;
         let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
         if version > max_known {
@@ -1515,15 +1771,127 @@ impl Database {
                 "Schema-Version {version} ist neuer als diese App ({max_known})"
             )));
         }
+        if version < 1 {
+            return Err(StorageError::Schema(
+                "Die Datei enthält keine Lesefluss-Migration — keine Lesefluss-Bibliothek".into(),
+            ));
+        }
+        let expected = expected_schema(version)?;
+        let actual = actual_schema(&conn)?;
+        for (table, columns) in &expected {
+            match actual.get(table) {
+                None => {
+                    return Err(StorageError::Schema(format!(
+                        "Tabelle {table} fehlt — die Datei ist keine Lesefluss-Bibliothek"
+                    )))
+                }
+                Some(found) => {
+                    for column in columns {
+                        if !found.contains(column) {
+                            return Err(StorageError::Schema(format!(
+                                "Spalte {table}.{column} fehlt — unvollständiges Schema"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let violations: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}#{}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?.unwrap_or_default()
+                ))
+            })?
+            .filter_map(|row| row.ok())
+            .collect();
+        if !violations.is_empty() {
+            return Err(StorageError::Schema(format!(
+                "Fremdschlüssel verletzt: {}",
+                violations.join(", ")
+            )));
+        }
         Ok(version)
     }
 
+    /// Prüft einen Kandidaten vollständig, migriert ihn auf den aktuellen Stand und
+    /// hinterlässt eine einzelne, checkpointete Datei ohne WAL-Reste. Erst danach darf
+    /// der App-Code die Datei aktivieren.
+    pub fn prepare_restore_candidate(path: &std::path::Path) -> Result<i64> {
+        let version = Self::validate_candidate(path)?;
+        let max_known = max_schema_version();
+        let db = Database::open(path)?;
+        let migrated: i64 = db.conn.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
+        if version < max_known && migrated <= version {
+            return Err(StorageError::Schema(format!(
+                "Migration blieb bei Version {migrated} statt {version} zu erhöhen"
+            )));
+        }
+        let expected = expected_schema(migrated)?;
+        let actual = actual_schema(&db.conn)?;
+        for (table, columns) in &expected {
+            match actual.get(table) {
+                Some(found) if columns.iter().all(|c| found.contains(c)) => {}
+                Some(_) => {
+                    return Err(StorageError::Schema(format!(
+                        "Migration unvollständig: Spalten in {table} fehlen"
+                    )))
+                }
+                None => {
+                    return Err(StorageError::Schema(format!(
+                        "Migration unvollständig: Tabelle {table} fehlt"
+                    )))
+                }
+            }
+        }
+        let integrity: String = db
+            .conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(|e| StorageError::Schema(format!("Integritätsprüfung fehlgeschlagen: {e}")))?;
+        if integrity != "ok" {
+            return Err(StorageError::Schema(format!(
+                "Integritätsprüfung nach Migration: {integrity}"
+            )));
+        }
+        db.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        Ok(migrated)
+    }
+
     pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
-        self.conn.execute("VACUUM INTO ?1", params![path.to_string_lossy().to_string()])?;
+        self.conn.execute(
+            "VACUUM INTO ?1",
+            params![path.to_string_lossy().to_string()],
+        )?;
         Ok(())
     }
 
-    pub fn enqueue_outbox(&self, account_id: &str, entity_id: &str, field: &str, desired: bool) -> Result<()> {
+    /// Zugriff auf die rohe Verbindung für Werkzeuge und Integrationstests.
+    pub fn raw(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Schreibt alle bestätigten Transaktionen in die Hauptdatei zurück. Danach ist die
+    /// Hauptdatei für Austausch oder Kopie vollständig; WAL und SHM sind leer.
+    pub fn wal_checkpoint(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    pub fn enqueue_outbox(
+        &self,
+        account_id: &str,
+        entity_id: &str,
+        field: &str,
+        desired: bool,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         bump_outbox(&tx, account_id, entity_id, field, desired)?;
         tx.commit()?;
@@ -1532,9 +1900,11 @@ impl Database {
 
     pub fn account_id_for_feed(&self, feed_id: i64) -> Result<Option<String>> {
         self.conn
-            .query_row("SELECT account_id FROM feeds WHERE id=?1", params![feed_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT account_id FROM feeds WHERE id=?1",
+                params![feed_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -1548,9 +1918,11 @@ impl Database {
     ) -> Result<Option<String>> {
         let tx = self.conn.unchecked_transaction()?;
         let account: Option<String> = tx
-            .query_row("SELECT account_id FROM feeds WHERE id=?1", params![feed_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT account_id FROM feeds WHERE id=?1",
+                params![feed_id],
+                |r| r.get(0),
+            )
             .optional()?;
         if let Some(r) = read {
             tx.execute(
@@ -1576,20 +1948,34 @@ impl Database {
         Ok(account)
     }
 
-    pub fn set_read_for_account(&self, account_id: &str, article_id: &str, read: bool) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE articles SET unread=?2, updated_ms=?3
+    pub fn set_read_for_account(
+        &self,
+        account_id: &str,
+        article_id: &str,
+        read: bool,
+    ) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE articles SET unread=?2, updated_ms=?3
              WHERE id=?1 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?4)",
-            params![article_id, if read { 0 } else { 1 }, now_ms(), account_id],
-        ).map_err(Into::into)
+                params![article_id, if read { 0 } else { 1 }, now_ms(), account_id],
+            )
+            .map_err(Into::into)
     }
 
-    pub fn set_saved_for_account(&self, account_id: &str, article_id: &str, saved: bool) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE articles SET saved=?2, updated_ms=?3
+    pub fn set_saved_for_account(
+        &self,
+        account_id: &str,
+        article_id: &str,
+        saved: bool,
+    ) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE articles SET saved=?2, updated_ms=?3
              WHERE id=?1 AND feed_id IN (SELECT id FROM feeds WHERE account_id=?4)",
-            params![article_id, if saved { 1 } else { 0 }, now_ms(), account_id],
-        ).map_err(Into::into)
+                params![article_id, if saved { 1 } else { 0 }, now_ms(), account_id],
+            )
+            .map_err(Into::into)
     }
 
     /// Kontozustand nach §13.1: disconnected, initial_sync, ready, syncing,
@@ -1640,11 +2026,13 @@ impl Database {
         Ok(v)
     }
 
+    /// Zählerstand aller lokalen Mutationen des Kontos. Wird **vor** einem
+    /// HTTP-Abruf gelesen und bis zum Apply unverändert mitgeführt.
     pub fn pull_generation(&self, account_id: &str) -> Result<i64> {
         let v: Option<i64> = self
             .conn
             .query_row(
-                "SELECT MAX(revision) FROM field_revisions WHERE account_id=?1",
+                "SELECT counter FROM account_sequence WHERE account_id=?1",
                 params![account_id],
                 |r| r.get(0),
             )
@@ -1685,21 +2073,25 @@ impl Database {
         let mut skipped = false;
         for (field, value) in [("read", read), ("saved", saved)] {
             let Some(value) = value else { continue };
-            let revision: i64 = tx
+            let (revision, sequence): (i64, i64) = tx
                 .query_row(
-                    "SELECT revision FROM field_revisions WHERE account_id=?1 AND entity_id=?2 AND field=?3",
+                    "SELECT revision, sequence FROM field_revisions
+                     WHERE account_id=?1 AND entity_id=?2 AND field=?3",
                     params![account_id, article_id, field],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
             let pending: bool = tx.query_row(
                 "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND entity_id=?2 AND field=?3
                  AND status IN ('pending','inflight')",
                 params![account_id, article_id, field],
                 |r| Ok(r.get::<_, i64>(0)? > 0),
             )?;
-            if pending || revision > pull_generation {
+            // Nur eine Mutation, die **nach** dem Pull begann, darf den Pull
+            // nicht überschreiben. Der Vergleich läuft über die account-globale
+            // Sequenz, nicht über die feldweise Revision.
+            if pending || sequence > pull_generation {
                 skipped = true;
                 continue;
             }
@@ -1741,7 +2133,12 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn outbox_pending(&self, account_id: &str, now_ms: i64, limit: u32) -> Result<Vec<OutboxRow>> {
+    pub fn outbox_pending(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<OutboxRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, account_id, entity_id, field, desired, revision FROM outbox
              WHERE account_id=?1 AND status='pending' AND next_try_ms<=?2
@@ -1762,9 +2159,49 @@ impl Database {
         Ok(rows)
     }
 
+    /// Holt und beansprucht die fälligen Zeilen in **einer** Transaktion. Damit
+    /// können zwei Prozessoren dieselbe Zeile nicht gleichzeitig senden.
+    pub fn outbox_claim(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<OutboxRow>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT id, account_id, entity_id, field, desired, revision FROM outbox
+             WHERE account_id=?1 AND status='pending' AND next_try_ms<=?2
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows: Vec<OutboxRow> = stmt
+            .query_map(params![account_id, now_ms, limit], |r| {
+                Ok(OutboxRow {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    entity_id: r.get(2)?,
+                    field: r.get(3)?,
+                    desired: r.get::<_, i64>(4)? == 1,
+                    revision: r.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        for row in &rows {
+            tx.execute(
+                "UPDATE outbox SET status='inflight' WHERE id=?1 AND status='pending'",
+                params![row.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows)
+    }
+
     pub fn outbox_mark_inflight(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
-            self.conn.execute("UPDATE outbox SET status='inflight' WHERE id=?1", params![id])?;
+            self.conn.execute(
+                "UPDATE outbox SET status='inflight' WHERE id=?1",
+                params![id],
+            )?;
         }
         Ok(())
     }
@@ -1773,7 +2210,11 @@ impl Database {
         for (id, revision) in sent {
             let cur: Option<i64> = self
                 .conn
-                .query_row("SELECT revision FROM outbox WHERE id=?1", params![id], |r| r.get(0))
+                .query_row(
+                    "SELECT revision FROM outbox WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .optional()?;
             match cur {
                 Some(c) if c == *revision => {
@@ -1786,9 +2227,16 @@ impl Database {
                         )
                         .optional()?;
                     if let Some((acc, entity, field, desired)) = row {
-                        self.record_remote_confirmation(&acc, &entity, &field, desired != 0, *revision)?;
+                        self.record_remote_confirmation(
+                            &acc,
+                            &entity,
+                            &field,
+                            desired != 0,
+                            *revision,
+                        )?;
                     }
-                    self.conn.execute("DELETE FROM outbox WHERE id=?1", params![id])?;
+                    self.conn
+                        .execute("DELETE FROM outbox WHERE id=?1", params![id])?;
                 }
                 Some(_) => {
                     self.conn.execute(
@@ -1802,8 +2250,8 @@ impl Database {
         Ok(())
     }
 
-    pub fn outbox_fail_permanent(&self, ids: &[i64]) -> Result<()> {
-        self.outbox_fail(ids, 0, true)
+    pub fn outbox_fail_permanent(&self, sent: &[(i64, i64)]) -> Result<usize> {
+        self.outbox_fail(sent, 0, true)
     }
 
     pub fn outbox_stuck(&self, account_id: &str) -> Result<i64> {
@@ -1838,32 +2286,53 @@ impl Database {
         Ok(())
     }
 
-    pub fn outbox_fail(&self, ids: &[i64], next_try_ms: i64, permanent: bool) -> Result<()> {
-        for id in ids {
+    /// Fehlerbehandlung ausschließlich für die **gesendete** Revision. Eine inzwischen
+    /// neuere lokale Absicht wird weder zurückgestellt noch als dauerhaft fehlgeschlagen
+    /// markiert.
+    pub fn outbox_fail(
+        &self,
+        sent: &[(i64, i64)],
+        next_try_ms: i64,
+        permanent: bool,
+    ) -> Result<usize> {
+        let mut touched = 0usize;
+        for (id, revision) in sent {
             if permanent {
-                self.conn.execute("UPDATE outbox SET status='failed' WHERE id=?1", params![id])?;
+                touched += self.conn.execute(
+                    "UPDATE outbox SET status='failed' WHERE id=?1 AND revision=?2",
+                    params![id, revision],
+                )?;
                 self.conn.execute(
                     "UPDATE articles SET unsynced=1
-                     WHERE id IN (SELECT entity_id FROM outbox WHERE id=?1)
+                     WHERE id IN (SELECT entity_id FROM outbox WHERE id=?1 AND revision=?2)
                        AND feed_id IN (SELECT id FROM feeds WHERE account_id=(SELECT account_id FROM outbox WHERE id=?1))",
-                    params![id],
+                    params![id, revision],
                 )?;
             } else {
-                self.conn.execute(
-                    "UPDATE outbox SET status='pending', attempts=attempts+1, next_try_ms=?2 WHERE id=?1",
-                    params![id, next_try_ms],
+                touched += self.conn.execute(
+                    "UPDATE outbox SET status='pending', attempts=attempts+1, next_try_ms=?3
+                     WHERE id=?1 AND revision=?2",
+                    params![id, revision, next_try_ms],
                 )?;
             }
         }
-        Ok(())
+        Ok(touched)
     }
 
     pub fn outbox_reset_inflight(&self) -> Result<()> {
-        self.conn.execute("UPDATE outbox SET status='pending' WHERE status='inflight'", [])?;
+        self.conn.execute(
+            "UPDATE outbox SET status='pending' WHERE status='inflight'",
+            [],
+        )?;
         Ok(())
     }
 
-    pub fn outbox_has_pending(&self, account_id: &str, entity_id: &str, field: &str) -> Result<bool> {
+    pub fn outbox_has_pending(
+        &self,
+        account_id: &str,
+        entity_id: &str,
+        field: &str,
+    ) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND entity_id=?2 AND field=?3 AND status IN ('pending','inflight')",
             params![account_id, entity_id, field],
@@ -1877,7 +2346,11 @@ impl Database {
             [],
             |r| r.get(0),
         )?;
-        let failed: i64 = self.conn.query_row("SELECT COUNT(*) FROM outbox WHERE status='failed'", [], |r| r.get(0))?;
+        let failed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE status='failed'",
+            [],
+            |r| r.get(0),
+        )?;
         Ok((pending, failed))
     }
 
@@ -1894,9 +2367,26 @@ impl Database {
 
     pub fn get_pref(&self, key: &str) -> Result<Option<String>> {
         self.conn
-            .query_row("SELECT value FROM prefs WHERE key=?1", params![key], |r| r.get(0))
+            .query_row("SELECT value FROM prefs WHERE key=?1", params![key], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Sortierung eines Kontos; ohne eigenen Eintrag gilt die globale Vorgabe.
+    pub fn account_newest_first(&self, account_id: &str, fallback: bool) -> Result<bool> {
+        match self.get_pref(&format!("sort_{account_id}"))? {
+            Some(v) => Ok(v != "0"),
+            None => Ok(fallback),
+        }
+    }
+
+    pub fn set_account_newest_first(&self, account_id: &str, newest: bool) -> Result<()> {
+        self.set_pref(
+            &format!("sort_{account_id}"),
+            if newest { "1" } else { "0" },
+        )
     }
 
     pub fn set_pref(&self, key: &str, value: &str) -> Result<()> {
@@ -1911,12 +2401,22 @@ impl Database {
     pub fn mark_feeds_read(&self, feed_ids: &[i64]) -> Result<usize> {
         let mut n = 0usize;
         for fid in feed_ids {
-            n += self.conn.execute("UPDATE articles SET unread=0 WHERE feed_id=?1", params![fid])?;
+            n += self.conn.execute(
+                "UPDATE articles SET unread=0 WHERE feed_id=?1",
+                params![fid],
+            )?;
         }
         Ok(n)
     }
 
-    pub fn update_fetch_error(&self, feed_id: i64, error_count: i64, last_error: &str, next_fetch_ms: i64, last_fetch_ms: i64) -> Result<()> {
+    pub fn update_fetch_error(
+        &self,
+        feed_id: i64,
+        error_count: i64,
+        last_error: &str,
+        next_fetch_ms: i64,
+        last_fetch_ms: i64,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO feed_fetch_state(feed_id, error_count, last_error, next_fetch_ms, last_fetch_ms)
              VALUES (?1,?2,?3,?4,?5)
@@ -2012,8 +2512,14 @@ mod tests {
 
     fn seed(db: &Database) -> i64 {
         db.ensure_local_account().unwrap();
-        db.add_feed("local", "https://example.com/feed.xml", "Example", Some("https://example.com"), "#123456")
-            .unwrap()
+        db.add_feed(
+            "local",
+            "https://example.com/feed.xml",
+            "Example",
+            Some("https://example.com"),
+            "#123456",
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2021,15 +2527,37 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let feed = seed(&db);
         let now = now_ms();
-        db.upsert_article(feed, "a1", "Titel eins", None, None, now - 1000, "Auszug", Some("<p>Hallo Welt</p>"), now)
-            .unwrap();
+        db.upsert_article(
+            feed,
+            "a1",
+            "Titel eins",
+            None,
+            None,
+            now - 1000,
+            "Auszug",
+            Some("<p>Hallo Welt</p>"),
+            now,
+        )
+        .unwrap();
         db.set_status(feed, "a1", Some(true), Some(true)).unwrap();
-        db.upsert_article(feed, "a1", "Titel eins (update)", None, None, now - 1000, "Auszug neu", Some("<p>Hallo Welt 2</p>"), now + 5)
-            .unwrap();
+        db.upsert_article(
+            feed,
+            "a1",
+            "Titel eins (update)",
+            None,
+            None,
+            now - 1000,
+            "Auszug neu",
+            Some("<p>Hallo Welt 2</p>"),
+            now + 5,
+        )
+        .unwrap();
         let (unread, saved) = db.article_status(feed, "a1").unwrap().unwrap();
         assert!(!unread, "Re-Import darf nicht ungelesen machen");
         assert!(saved, "Re-Import darf Speicherstatus nicht verlieren");
-        let rows = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
+        let rows = db
+            .query_articles(&Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert_eq!(rows[0].title, "Titel eins (update)");
     }
 
@@ -2039,19 +2567,38 @@ mod tests {
         let feed = seed(&db);
         let now = now_ms();
         for i in 0..25 {
-            db.upsert_article(feed, &format!("a{i}"), &format!("T{i}"), None, None, now - i * 1000, "x", None, now)
-                .unwrap();
+            db.upsert_article(
+                feed,
+                &format!("a{i}"),
+                &format!("T{i}"),
+                None,
+                None,
+                now - i * 1000,
+                "x",
+                None,
+                now,
+            )
+            .unwrap();
         }
-        let page1 = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
+        let page1 = db
+            .query_articles(&Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert_eq!(page1.len(), 10);
         let last = page1.last().unwrap();
         let page2 = db
-            .query_articles(&Scope::Global, Filter::All, Some((last.published_ms, &last.id)), 10)
+            .query_articles(
+                &Scope::Global,
+                Filter::All,
+                Some((last.sort_ms, last.feed_id, &last.id)),
+                10,
+            )
             .unwrap();
         assert_eq!(page2.len(), 10);
         assert!(!page1.iter().any(|r| page2.iter().any(|s| s.id == r.id)));
         db.set_status(feed, "a3", Some(true), None).unwrap();
-        let unread = db.query_articles(&Scope::Global, Filter::Unread, None, 100).unwrap();
+        let unread = db
+            .query_articles(&Scope::Global, Filter::Unread, None, 100)
+            .unwrap();
         assert_eq!(unread.len(), 24);
         assert!(!unread.iter().any(|r| r.id == "a3"));
     }
@@ -2061,13 +2608,41 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let feed = seed(&db);
         let now = now_ms();
-        db.upsert_article(feed, "s1", "Grüße aus München", None, None, now, "Straße und Café", Some("<p>Straße und <b>Café</b></p>"), now).unwrap();
-        db.upsert_article(feed, "s2", "Other", None, None, now, "nothing", Some("<p>nothing</p>"), now).unwrap();
-        let hits = db.search("cafe", &Scope::Global, Filter::All, None, 10).unwrap();
+        db.upsert_article(
+            feed,
+            "s1",
+            "Grüße aus München",
+            None,
+            None,
+            now,
+            "Straße und Café",
+            Some("<p>Straße und <b>Café</b></p>"),
+            now,
+        )
+        .unwrap();
+        db.upsert_article(
+            feed,
+            "s2",
+            "Other",
+            None,
+            None,
+            now,
+            "nothing",
+            Some("<p>nothing</p>"),
+            now,
+        )
+        .unwrap();
+        let hits = db
+            .search("cafe", &Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert_eq!(hits.len(), 1, "remove_diacritics sollte Café finden");
-        let hits = db.search("münchen", &Scope::Global, Filter::All, None, 10).unwrap();
+        let hits = db
+            .search("münchen", &Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
-        let hits = db.search("\"\"", &Scope::Global, Filter::All, None, 10).unwrap();
+        let hits = db
+            .search("\"\"", &Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -2085,7 +2660,11 @@ mod tests {
         db.enqueue_outbox("acc", "e1", "read", true).unwrap();
         db.outbox_ack(&[(pending[0].id, 2)]).unwrap();
         let after = db.outbox_pending("acc", 10, 10).unwrap();
-        assert_eq!(after.len(), 1, "verspaetetes ACK darf neuere Mutation nicht loeschen");
+        assert_eq!(
+            after.len(),
+            1,
+            "verspaetetes ACK darf neuere Mutation nicht loeschen"
+        );
         assert_eq!(after[0].revision, 3);
         db.outbox_ack(&[(after[0].id, 3)]).unwrap();
         assert!(db.outbox_pending("acc", 10, 10).unwrap().is_empty());
@@ -2131,11 +2710,15 @@ mod tests {
         db.set_feed_groups(f1, &[g]).unwrap();
         db.set_feed_groups(f2, &[g]).unwrap();
         let now = now_ms();
-        db.upsert_article(f1, "x", "X", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(f2, "y", "Y", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f1, "x", "X", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(f2, "y", "Y", None, None, now, "e", None, now)
+            .unwrap();
         let c = db.counts().unwrap();
         assert_eq!(c.per_group, vec![(g, 2)]);
-        let rows = db.query_articles(&Scope::Group(g), Filter::Unread, None, 10).unwrap();
+        let rows = db
+            .query_articles(&Scope::Group(g), Filter::Unread, None, 10)
+            .unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -2153,10 +2736,16 @@ mod tests {
     fn user_title_survives_publisher_updates() {
         let db = Database::open_in_memory().unwrap();
         let acc = db.ensure_local_account().unwrap();
-        let feed = db.add_feed(&acc, "https://a.example/f.xml", "Original", None, "#111111").unwrap();
+        let feed = db
+            .add_feed(&acc, "https://a.example/f.xml", "Original", None, "#111111")
+            .unwrap();
         db.set_user_title(feed, "Mein Titel").unwrap();
-        db.update_feed_title(feed, "Neuer Publisher-Titel", None).unwrap();
-        assert_eq!(db.display_title(feed).unwrap().as_deref(), Some("Mein Titel"));
+        db.update_feed_title(feed, "Neuer Publisher-Titel", None)
+            .unwrap();
+        assert_eq!(
+            db.display_title(feed).unwrap().as_deref(),
+            Some("Mein Titel")
+        );
         let feeds = db.list_feeds().unwrap();
         assert_eq!(feeds[0].title, "Mein Titel");
     }
@@ -2165,21 +2754,54 @@ mod tests {
     fn unsubscribing_keeps_saved_articles_and_stops_fetching() {
         let db = Database::open_in_memory().unwrap();
         let acc = db.ensure_local_account().unwrap();
-        let feed = db.add_feed(&acc, "https://a.example/f.xml", "Feed", None, "#111111").unwrap();
+        let feed = db
+            .add_feed(&acc, "https://a.example/f.xml", "Feed", None, "#111111")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "kept", "Wichtig", None, None, now, "e", Some("<p>x</p>"), now).unwrap();
-        db.upsert_article(feed, "plain", "Normal", None, None, now, "e", Some("<p>y</p>"), now).unwrap();
+        db.upsert_article(
+            feed,
+            "kept",
+            "Wichtig",
+            None,
+            None,
+            now,
+            "e",
+            Some("<p>x</p>"),
+            now,
+        )
+        .unwrap();
+        db.upsert_article(
+            feed,
+            "plain",
+            "Normal",
+            None,
+            None,
+            now,
+            "e",
+            Some("<p>y</p>"),
+            now,
+        )
+        .unwrap();
         db.set_saved_by_article_id("kept", true).unwrap();
         assert!(db.feed_is_active(feed).unwrap());
         let kept = db.deactivate_feed(feed).unwrap();
         assert_eq!(kept, 1, "ein gespeicherter Artikel bleibt erhalten");
         assert!(!db.feed_is_active(feed).unwrap());
-        assert!(db.due_feeds(now).unwrap().is_empty(), "keine Abrufe mehr für stillgelegte Feeds");
-        let articles = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
+        assert!(
+            db.due_feeds(now).unwrap().is_empty(),
+            "keine Abrufe mehr für stillgelegte Feeds"
+        );
+        let articles = db
+            .query_articles(&Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert_eq!(articles.len(), 2, "Inhalte bleiben lesbar");
         assert!(articles.iter().any(|a| a.saved));
         db.set_feed_active(feed, true).unwrap();
-        assert_eq!(db.due_feeds(now).unwrap().len(), 1, "Reabo holt den Bestand wieder");
+        assert_eq!(
+            db.due_feeds(now).unwrap().len(),
+            1,
+            "Reabo holt den Bestand wieder"
+        );
     }
 
     #[test]
@@ -2202,10 +2824,18 @@ mod tests {
             ),
         ];
         let (new, merged) = db.import_opml_entries(&local, &entries).unwrap();
-        assert_eq!((new, merged), (1, 1), "zweiter Durchlauf führt nicht zu einem Duplikat");
+        assert_eq!(
+            (new, merged),
+            (1, 1),
+            "zweiter Durchlauf führt nicht zu einem Duplikat"
+        );
         let feeds = db.list_feeds().unwrap();
         assert_eq!(feeds.len(), 1);
-        assert_eq!(feeds[0].groups.len(), 2, "verschachtelte Gruppen bleiben erhalten");
+        assert_eq!(
+            feeds[0].groups.len(),
+            2,
+            "verschachtelte Gruppen bleiben erhalten"
+        );
         let groups = db.list_groups().unwrap();
         assert_eq!(groups.len(), 2);
         let child = groups.iter().find(|g| g.name == "Rust").unwrap();
@@ -2221,7 +2851,11 @@ mod tests {
             .into_iter()
             .filter(|g| g.account_id == "feedly-1")
             .collect();
-        assert_eq!(remote_groups.len(), 2, "Gruppen werden nicht kontoübergreifend wiederverwendet");
+        assert_eq!(
+            remote_groups.len(),
+            2,
+            "Gruppen werden nicht kontoübergreifend wiederverwendet"
+        );
     }
 
     #[test]
@@ -2231,13 +2865,30 @@ mod tests {
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
         for i in 0..6 {
-            db.upsert_article(feed, &format!("a{i}"), "Titel", None, None, now - (5 - i) * 60_000, "e", None, now).unwrap();
+            db.upsert_article(
+                feed,
+                &format!("a{i}"),
+                "Titel",
+                None,
+                None,
+                now - (5 - i) * 60_000,
+                "e",
+                None,
+                now,
+            )
+            .unwrap();
         }
         let mut seen: Vec<String> = Vec::new();
-        let mut cursor: Option<(i64, String)> = None;
+        let mut cursor: Option<(i64, i64, String)> = None;
         for _ in 0..4 {
             let rows = db
-                .query_articles_ordered(&Scope::Global, Filter::All, cursor.as_ref().map(|(m, i)| (*m, i.as_str())), 2, false)
+                .query_articles_ordered(
+                    &Scope::Global,
+                    Filter::All,
+                    cursor.as_ref().map(|(m, f, i)| (*m, *f, i.as_str())),
+                    2,
+                    false,
+                )
                 .unwrap();
             if rows.is_empty() {
                 break;
@@ -2246,10 +2897,14 @@ mod tests {
                 seen.push(r.id.clone());
             }
             let last = rows.last().unwrap();
-            cursor = Some((last.sort_ms, last.id.clone()));
+            cursor = Some((last.sort_ms, last.feed_id, last.id.clone()));
         }
         assert_eq!(seen.len(), 6, "jeder Artikel genau einmal: {seen:?}");
-        assert_eq!(seen.first().map(String::as_str), Some("a0"), "älteste zuerst");
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("a0"),
+            "älteste zuerst"
+        );
         assert_eq!(seen.last().map(String::as_str), Some("a5"));
     }
 
@@ -2260,7 +2915,18 @@ mod tests {
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
         for i in 0..3 {
-            db.upsert_article(feed, &format!("a{i}"), "Titel", None, None, now - (3 - i) * 1000, "e", Some("<p>zielwort</p>"), now).unwrap();
+            db.upsert_article(
+                feed,
+                &format!("a{i}"),
+                "Titel",
+                None,
+                None,
+                now - (3 - i) * 1000,
+                "e",
+                Some("<p>zielwort</p>"),
+                now,
+            )
+            .unwrap();
         }
         let rows = db
             .search_ordered("zielwort", &Scope::Global, Filter::All, None, 10, false)
@@ -2273,17 +2939,140 @@ mod tests {
     }
 
     #[test]
+    fn alter_pull_ueberschreibt_keine_juengere_aenderung_eines_anderen_artikels() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+        let feed = db
+            .add_feed("feedly-1", "u1", "Feed", None, "#111111")
+            .unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "a", "A", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(feed, "b", "B", None, None, now, "e", None, now)
+            .unwrap();
+
+        // Artikel A zehnmal ändern und quittieren: hohe feldweise Revision.
+        for i in 0..10 {
+            db.enqueue_outbox("feedly-1", "a", "read", i % 2 == 0)
+                .unwrap();
+            let rows = db.outbox_pending("feedly-1", now_ms(), 10).unwrap();
+            let sent: Vec<(i64, i64)> = rows.iter().map(|r| (r.id, r.revision)).collect();
+            let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            db.outbox_mark_inflight(&ids).unwrap();
+            db.outbox_ack(&sent).unwrap();
+        }
+        // Pull beginnt und merkt sich diesen Stand.
+        let pull_gen = db.pull_generation("feedly-1").unwrap();
+        assert!(pull_gen >= 10, "Sequenz zählt alle Mutationen");
+
+        // Artikel B wird danach lokal geändert und quittiert.
+        db.enqueue_outbox("feedly-1", "b", "read", true).unwrap();
+        let rows = db.outbox_pending("feedly-1", now_ms(), 10).unwrap();
+        let sent: Vec<(i64, i64)> = rows.iter().map(|r| (r.id, r.revision)).collect();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        db.outbox_mark_inflight(&ids).unwrap();
+        db.outbox_ack(&sent).unwrap();
+        db.raw()
+            .execute("UPDATE articles SET unread=0 WHERE id='b'", [])
+            .unwrap();
+
+        // Das alte Pull-Ernis darf B nicht zurücksetzen.
+        let applied = db
+            .apply_remote_status("feedly-1", "b", Some(false), None, pull_gen)
+            .unwrap();
+        assert!(
+            applied.skipped,
+            "B wurde als zwischenzeitlich geändert erkannt"
+        );
+        let unread_b: i64 = db
+            .raw()
+            .query_row("SELECT unread FROM articles WHERE id='b'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unread_b, 0, "die neuere lokale Absicht bleibt erhalten");
+    }
+
+    #[test]
+    fn gleiche_id_in_zwei_feeds_ueberspringt_keine_zeile() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let f1 = db.add_feed(&acc, "u1", "Feed A", None, "#111111").unwrap();
+        let f2 = db.add_feed(&acc, "u2", "Feed B", None, "#222222").unwrap();
+        let now = now_ms();
+        // Gleiche GUID und gleiche Zeit in beiden Feeds.
+        db.upsert_article(f1, "gleich", "A", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(f2, "gleich", "B", None, None, now, "e", None, now)
+            .unwrap();
+        let mut seen: Vec<(i64, String)> = Vec::new();
+        let mut cursor: Option<(i64, i64, String)> = None;
+        for _ in 0..4 {
+            let rows = db
+                .query_articles_ordered(
+                    &Scope::Global,
+                    Filter::All,
+                    cursor.as_ref().map(|(m, f, i)| (*m, *f, i.as_str())),
+                    1,
+                    true,
+                )
+                .unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                assert!(
+                    !seen.contains(&(r.feed_id, r.id.clone())),
+                    "Zeile darf nicht erneut geliefert werden"
+                );
+                seen.push((r.feed_id, r.id.clone()));
+            }
+            let last = rows.last().unwrap();
+            cursor = Some((last.sort_ms, last.feed_id, last.id.clone()));
+        }
+        assert_eq!(seen.len(), 2, "beide Zeilen werden geliefert: {seen:?}");
+    }
+
+    #[test]
+    fn gruppenzaehlung_zaehlt_gleiche_id_je_feed_getrennt() {
+        let db = Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        let f1 = db.add_feed(&acc, "u1", "Feed A", None, "#111111").unwrap();
+        let f2 = db.add_feed(&acc, "u2", "Feed B", None, "#222222").unwrap();
+        let group = db.add_group(&acc, "Gruppe", None).unwrap();
+        db.set_feed_groups(f1, &[group]).unwrap();
+        db.set_feed_groups(f2, &[group]).unwrap();
+        let now = now_ms();
+        db.upsert_article(f1, "gleich", "A", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(f2, "gleich", "B", None, None, now, "e", None, now)
+            .unwrap();
+        let counts = db.counts().unwrap();
+        assert_eq!(counts.unread, 2);
+        assert_eq!(
+            counts.per_group,
+            vec![(group, 2)],
+            "zwei Feeds mit derselben GUID sind zwei Artikel"
+        );
+    }
+
+    #[test]
     fn keyset_cursor_uses_sort_key_and_never_repeats() {
         let db = Database::open_in_memory().unwrap();
         let acc = db.ensure_local_account().unwrap();
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "a", "A", None, None, now - 1000, "e", None, now).unwrap();
-        db.upsert_article(feed, "b", "B", None, None, now - 1000, "e", None, now).unwrap();
-        db.upsert_article(feed, "c", "C", None, None, now - 1000, "e", None, now).unwrap();
-        let first = db.query_articles(&Scope::Global, Filter::All, None, 2).unwrap();
+        db.upsert_article(feed, "a", "A", None, None, now - 1000, "e", None, now)
+            .unwrap();
+        db.upsert_article(feed, "b", "B", None, None, now - 1000, "e", None, now)
+            .unwrap();
+        db.upsert_article(feed, "c", "C", None, None, now - 1000, "e", None, now)
+            .unwrap();
+        let first = db
+            .query_articles(&Scope::Global, Filter::All, None, 2)
+            .unwrap();
         assert_eq!(first.len(), 2);
-        let cursor = (first.last().unwrap().sort_ms, first.last().unwrap().id.as_str());
+        let last = first.last().unwrap();
+        let cursor = (last.sort_ms, last.feed_id, last.id.as_str());
         let second = db
             .query_articles(&Scope::Global, Filter::All, Some(cursor), 2)
             .unwrap();
@@ -2302,16 +3091,47 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "future", "Zukunft", None, None, now + 10_000_000_000, "e", None, now).unwrap();
-        db.upsert_article(feed, "normal", "Normal", None, None, now - 500, "e", None, now).unwrap();
-        let first = db.query_articles(&Scope::Global, Filter::All, None, 1).unwrap();
-        let cursor = (first[0].sort_ms, first[0].id.as_str());
-        assert!(cursor.0 <= now, "Sortierschlüssel ist begrenzt: {}", cursor.0);
+        db.upsert_article(
+            feed,
+            "future",
+            "Zukunft",
+            None,
+            None,
+            now + 10_000_000_000,
+            "e",
+            None,
+            now,
+        )
+        .unwrap();
+        db.upsert_article(
+            feed,
+            "normal",
+            "Normal",
+            None,
+            None,
+            now - 500,
+            "e",
+            None,
+            now,
+        )
+        .unwrap();
+        let first = db
+            .query_articles(&Scope::Global, Filter::All, None, 1)
+            .unwrap();
+        let cursor = (first[0].sort_ms, first[0].feed_id, first[0].id.as_str());
+        assert!(
+            cursor.0 <= now,
+            "Sortierschlüssel ist begrenzt: {}",
+            cursor.0
+        );
         let second = db
             .query_articles(&Scope::Global, Filter::All, Some(cursor), 1)
             .unwrap();
         assert_eq!(second.len(), 1);
-        assert_ne!(second[0].id, first[0].id, "derselbe Artikel darf nicht erneut erscheinen");
+        assert_ne!(
+            second[0].id, first[0].id,
+            "derselbe Artikel darf nicht erneut erscheinen"
+        );
     }
 
     #[test]
@@ -2322,8 +3142,30 @@ mod tests {
         let f2 = db.add_feed(&acc, "u2", "F2", None, "#222222").unwrap();
         let now = now_ms();
         for i in 0..5 {
-            db.upsert_article(f1, &format!("a{i}"), "Suchtreffer A", None, None, now - i * 1000, "e", Some("<p>zielwort</p>"), now).unwrap();
-            db.upsert_article(f2, &format!("b{i}"), "Suchtreffer B", None, None, now - i * 1000, "e", Some("<p>zielwort</p>"), now).unwrap();
+            db.upsert_article(
+                f1,
+                &format!("a{i}"),
+                "Suchtreffer A",
+                None,
+                None,
+                now - i * 1000,
+                "e",
+                Some("<p>zielwort</p>"),
+                now,
+            )
+            .unwrap();
+            db.upsert_article(
+                f2,
+                &format!("b{i}"),
+                "Suchtreffer B",
+                None,
+                None,
+                now - i * 1000,
+                "e",
+                Some("<p>zielwort</p>"),
+                now,
+            )
+            .unwrap();
         }
         db.set_status(f1, "a1", Some(true), None).unwrap();
         let scoped = db
@@ -2337,12 +3179,19 @@ mod tests {
         let page1 = db
             .search("zielwort", &Scope::Global, Filter::All, None, 4)
             .unwrap();
-        assert_eq!(page1.len(), 5, "4 Treffer plus eine Extrazeile signalisiert weitere");
-        let cursor = (page1[3].sort_ms, page1[3].id.as_str());
+        assert_eq!(
+            page1.len(),
+            5,
+            "4 Treffer plus eine Extrazeile signalisiert weitere"
+        );
+        let cursor = (page1[3].sort_ms, page1[3].feed_id, page1[3].id.as_str());
         let page2 = db
             .search("zielwort", &Scope::Global, Filter::All, Some(cursor), 4)
             .unwrap();
-        assert!(!page2.iter().any(|r| r.id == page1[3].id), "kein doppelter Treffer");
+        assert!(
+            !page2.iter().any(|r| r.id == page1[3].id),
+            "kein doppelter Treffer"
+        );
         let seen: std::collections::HashSet<&str> = page1
             .iter()
             .take(4)
@@ -2361,11 +3210,17 @@ mod tests {
         let f2 = db.add_feed(&acc, "u2", "F2", None, "#222222").unwrap();
         let f3 = db.add_feed(&remote, "u3", "F3", None, "#333333").unwrap();
         let now = now_ms();
-        db.upsert_article(f1, "same", "Titel", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(f2, "same", "Titel", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(f3, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f1, "same", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(f2, "same", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(f3, "same", "Titel", None, None, now, "e", None, now)
+            .unwrap();
         let c = db.counts().unwrap();
-        assert_eq!(c.total, 3, "zwei lokale Feeds plus Feedly sind drei Artikel");
+        assert_eq!(
+            c.total, 3,
+            "zwei lokale Feeds plus Feedly sind drei Artikel"
+        );
         assert_eq!(c.unread, 3);
         assert_eq!(c.per_feed, vec![(f1, 1), (f2, 1), (f3, 1)]);
         assert_eq!(c.per_account, vec![(remote, 1)]);
@@ -2377,10 +3232,24 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let remote = remote_account(&db);
         let local_feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
-        let remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let remote_feed = db
+            .add_feed(&remote, "u2", "Feedly", None, "#222222")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(local_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(remote_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(local_feed, "same", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(
+            remote_feed,
+            "same",
+            "Titel",
+            None,
+            None,
+            now,
+            "e",
+            None,
+            now,
+        )
+        .unwrap();
         assert_eq!(db.set_read_for_account(&remote, "same", true).unwrap(), 1);
         let (local_unread, _) = db.article_status(local_feed, "same").unwrap().unwrap();
         let (remote_unread, _) = db.article_status(remote_feed, "same").unwrap().unwrap();
@@ -2392,10 +3261,18 @@ mod tests {
     fn status_and_outbox_commit_together() {
         let db = Database::open_in_memory().unwrap();
         let remote = remote_account(&db);
-        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now).unwrap();
-        assert_eq!(db.apply_status_with_outbox(feed, "e1", Some(true), Some(true)).unwrap().as_deref(), Some("feedly-1"));
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        assert_eq!(
+            db.apply_status_with_outbox(feed, "e1", Some(true), Some(true))
+                .unwrap()
+                .as_deref(),
+            Some("feedly-1")
+        );
         let (unread, saved) = db.article_status(feed, "e1").unwrap().unwrap();
         assert!(!unread && saved);
         let pending = db.outbox_pending(&remote, now, 10).unwrap();
@@ -2404,23 +3281,117 @@ mod tests {
         let sent: Vec<(i64, i64)> = pending.iter().map(|p| (p.id, p.revision)).collect();
         db.outbox_ack(&sent).unwrap();
         assert!(db.outbox_pending(&remote, now, 10).unwrap().is_empty());
-        db.apply_status_with_outbox(feed, "e1", Some(false), None).unwrap();
-        assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 2, "Revision bleibt dauerhaft monoton");
+        db.apply_status_with_outbox(feed, "e1", Some(false), None)
+            .unwrap();
+        assert_eq!(
+            db.field_revision(&remote, "e1", "read").unwrap(),
+            2,
+            "Revision bleibt dauerhaft monoton"
+        );
+    }
+
+    #[test]
+    fn alter_requestfehler_legt_die_neue_revision_nicht_dauerhaft_still() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None)
+            .unwrap();
+        let claimed = db.outbox_claim(&remote, now, 10).unwrap();
+        let sent: Vec<(i64, i64)> = claimed.iter().map(|r| (r.id, r.revision)).collect();
+        // Während des Requests entsteht eine neue Absicht im selben Feld:
+        // höhere Revision, dieselbe Outbox-Zeile.
+        db.apply_status_with_outbox(feed, "e1", Some(false), None)
+            .unwrap();
+        let affected = db.outbox_fail_permanent(&sent).unwrap();
+        assert_eq!(affected, 0, "die alte Revision wird nicht mehr markiert");
+        assert_eq!(
+            db.outbox_stuck(&remote).unwrap(),
+            0,
+            "die neue Absicht bleibt sendbar"
+        );
+        let pending = db.outbox_pending(&remote, now, 10).unwrap();
+        assert_eq!(pending.len(), 1, "genau die neue Absicht wartet");
+        assert_eq!(pending[0].field, "read");
+        assert!(
+            !pending[0].desired,
+            "die neuere Absicht (unread) ist maßgeblich"
+        );
+    }
+
+    #[test]
+    fn claim_verhindert_doppeltes_senden_durch_zwei_prozessoren() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None)
+            .unwrap();
+        let first = db.outbox_claim(&remote, now, 10).unwrap();
+        let second = db.outbox_claim(&remote, now, 10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            second.is_empty(),
+            "eine beanspruchte Zeile wird nicht erneut ausgegeben"
+        );
+    }
+
+    #[test]
+    fn temporaerer_fehler_stellt_nur_die_gesendete_revision_zurueck() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None)
+            .unwrap();
+        let claimed = db.outbox_claim(&remote, now, 10).unwrap();
+        let sent: Vec<(i64, i64)> = claimed.iter().map(|r| (r.id, r.revision)).collect();
+        let later = now + 60_000;
+        let affected = db.outbox_fail(&sent, later, false).unwrap();
+        assert_eq!(affected, 1);
+        let retry = db.outbox_pending(&remote, later, 10).unwrap();
+        assert_eq!(retry.len(), 1, "nach Zeitablauf erneut fällig");
     }
 
     #[test]
     fn permanent_outbox_failure_is_kept_and_marked_unsynced() {
         let db = Database::open_in_memory().unwrap();
         let remote = remote_account(&db);
-        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now).unwrap();
-        db.apply_status_with_outbox(feed, "e1", Some(true), None).unwrap();
-        let rows = db.outbox_pending(&remote, now, 10).unwrap();
-        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-        db.outbox_fail_permanent(&ids).unwrap();
-        assert!(db.outbox_pending(&remote, now + 86_400_000, 10).unwrap().is_empty(), "kein erneuter Versuch");
-        assert_eq!(db.outbox_stuck(&remote).unwrap(), 1, "bleibt sichtbar erhalten");
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None)
+            .unwrap();
+        let rows = db.outbox_claim(&remote, now, 10).unwrap();
+        let sent: Vec<(i64, i64)> = rows.iter().map(|r| (r.id, r.revision)).collect();
+        db.outbox_fail_permanent(&sent).unwrap();
+        assert!(
+            db.outbox_pending(&remote, now + 86_400_000, 10)
+                .unwrap()
+                .is_empty(),
+            "kein erneuter Versuch"
+        );
+        assert_eq!(
+            db.outbox_stuck(&remote).unwrap(),
+            1,
+            "bleibt sichtbar erhalten"
+        );
         assert_eq!(db.article_unsynced(feed, "e1").unwrap(), true);
     }
 
@@ -2429,7 +3400,10 @@ mod tests {
         let dir = tempdir("validate");
         let garbage = dir.join("garbage.db");
         std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
-        assert!(Database::validate_candidate(&garbage).is_err(), "kein SQLite");
+        assert!(
+            Database::validate_candidate(&garbage).is_err(),
+            "kein SQLite"
+        );
 
         let truncated = dir.join("truncated.db");
         let db = Database::open(&dir.join("live.db")).unwrap();
@@ -2450,7 +3424,10 @@ mod tests {
         let conn = Connection::open(&foreign).unwrap();
         conn.execute_batch("CREATE TABLE unrelated(x);").unwrap();
         drop(conn);
-        assert!(Database::validate_candidate(&foreign).is_err(), "fremde Datenbank");
+        assert!(
+            Database::validate_candidate(&foreign).is_err(),
+            "fremde Datenbank"
+        );
 
         let good = dir.join("good.db");
         db.backup_to(&good).unwrap();
@@ -2483,14 +3460,31 @@ mod tests {
         let target = dir.join("backup.db");
         let db = Database::open(&live).unwrap();
         let remote = remote_account(&db);
-        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", Some("<p>x</p>"), now).unwrap();
-        db.apply_status_with_outbox(feed, "e1", Some(true), Some(true)).unwrap();
+        db.upsert_article(
+            feed,
+            "e1",
+            "Titel",
+            None,
+            None,
+            now,
+            "e",
+            Some("<p>x</p>"),
+            now,
+        )
+        .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), Some(true))
+            .unwrap();
         db.set_pref("theme", "omarchy").unwrap();
         db.backup_to(&target).unwrap();
         let restored = Database::open(&target).unwrap();
-        assert_eq!(restored.get_pref("theme").unwrap().as_deref(), Some("omarchy"));
+        assert_eq!(
+            restored.get_pref("theme").unwrap().as_deref(),
+            Some("omarchy")
+        );
         assert_eq!(restored.outbox_pending(&remote, now, 10).unwrap().len(), 2);
         assert_eq!(
             restored.article_status(feed, "e1").unwrap(),
@@ -2502,14 +3496,28 @@ mod tests {
     fn stale_pull_cannot_overwrite_a_confirmed_local_intent() {
         let db = Database::open_in_memory().unwrap();
         let remote = remote_account(&db);
-        let feed = db.add_feed(&remote, "u1", "Feedly", None, "#111111").unwrap();
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", Some("<p>x</p>"), now).unwrap();
+        db.upsert_article(
+            feed,
+            "e1",
+            "Titel",
+            None,
+            None,
+            now,
+            "e",
+            Some("<p>x</p>"),
+            now,
+        )
+        .unwrap();
 
         let pull_gen = db.pull_generation(&remote).unwrap();
         let pending = db.outbox_pending(&remote, now, 10).unwrap();
 
-        db.apply_status_with_outbox(feed, "e1", Some(false), None).unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(false), None)
+            .unwrap();
         assert_eq!(db.field_revision(&remote, "e1", "read").unwrap(), 1);
         let rows = db.outbox_pending(&remote, now, 10).unwrap();
         let ids: Vec<(i64, i64)> = rows.iter().map(|r| (r.id, r.revision)).collect();
@@ -2537,12 +3545,27 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let remote = remote_account(&db);
         let local_feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
-        let remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let remote_feed = db
+            .add_feed(&remote, "u2", "Feedly", None, "#222222")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(local_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(remote_feed, "same", "Titel", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(local_feed, "same", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(
+            remote_feed,
+            "same",
+            "Titel",
+            None,
+            None,
+            now,
+            "e",
+            None,
+            now,
+        )
+        .unwrap();
         let gen = db.pull_generation(&remote).unwrap();
-        db.apply_remote_status(&remote, "same", Some(true), None, gen).unwrap();
+        db.apply_remote_status(&remote, "same", Some(true), None, gen)
+            .unwrap();
         let (local_unread, _) = db.article_status(local_feed, "same").unwrap().unwrap();
         let (remote_unread, _) = db.article_status(remote_feed, "same").unwrap().unwrap();
         assert!(local_unread, "lokaler Artikel bleibt unberührt");
@@ -2555,8 +3578,14 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "a1", "Titel", None, None, now, "e", None, now).unwrap();
-        assert_eq!(db.apply_status_with_outbox(feed, "a1", Some(true), None).unwrap().as_deref(), Some("local"));
+        db.upsert_article(feed, "a1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        assert_eq!(
+            db.apply_status_with_outbox(feed, "a1", Some(true), None)
+                .unwrap()
+                .as_deref(),
+            Some("local")
+        );
         assert!(db.outbox_pending(&acc, now, 10).unwrap().is_empty());
     }
 
@@ -2566,9 +3595,15 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let remote = remote_account(&db);
         let local = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
-        let _remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
-        let inactive = db.add_feed(&acc, "u3", "Archiviert", None, "#333333").unwrap();
-        db.conn.execute("UPDATE feeds SET active=0 WHERE id=?1", params![inactive]).unwrap();
+        let _remote_feed = db
+            .add_feed(&remote, "u2", "Feedly", None, "#222222")
+            .unwrap();
+        let inactive = db
+            .add_feed(&acc, "u3", "Archiviert", None, "#333333")
+            .unwrap();
+        db.conn
+            .execute("UPDATE feeds SET active=0 WHERE id=?1", params![inactive])
+            .unwrap();
         let due = db.due_feeds(now_ms()).unwrap();
         assert_eq!(due, vec![(local, "u1".to_string())]);
     }
@@ -2579,29 +3614,76 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let remote = remote_account(&db);
         let local_feed = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
-        let remote_feed = db.add_feed(&remote, "u2", "Feedly", None, "#222222").unwrap();
+        let remote_feed = db
+            .add_feed(&remote, "u2", "Feedly", None, "#222222")
+            .unwrap();
         let now = now_ms();
         let old = now - 200 * 86_400_000;
-        db.upsert_article(local_feed, "old-local", "Alt lokal", None, None, old, "e", Some("<p>alt</p>"), now).unwrap();
-        db.upsert_article(remote_feed, "old-remote", "Alt remote", None, None, old, "e", Some("<p>alt</p>"), now).unwrap();
-        db.set_status(local_feed, "old-local", Some(true), None).unwrap();
-        db.set_status(remote_feed, "old-remote", Some(true), None).unwrap();
-        db.conn
-            .execute(
-                "UPDATE articles SET first_seen_ms=?2",
-                params![0, old],
-            )
+        db.upsert_article(
+            local_feed,
+            "old-local",
+            "Alt lokal",
+            None,
+            None,
+            old,
+            "e",
+            Some("<p>alt</p>"),
+            now,
+        )
+        .unwrap();
+        db.upsert_article(
+            remote_feed,
+            "old-remote",
+            "Alt remote",
+            None,
+            None,
+            old,
+            "e",
+            Some("<p>alt</p>"),
+            now,
+        )
+        .unwrap();
+        db.set_status(local_feed, "old-local", Some(true), None)
             .unwrap();
-        db.enqueue_outbox(&remote, "old-remote", "read", true).unwrap();
+        db.set_status(remote_feed, "old-remote", Some(true), None)
+            .unwrap();
+        db.conn
+            .execute("UPDATE articles SET first_seen_ms=?2", params![0, old])
+            .unwrap();
+        db.enqueue_outbox(&remote, "old-remote", "read", true)
+            .unwrap();
         let pruned = db.prune_old_read(now, 90).unwrap();
         assert_eq!(pruned, 1, "nur der Artikel ohne ausstehende Mutation");
-        assert!(db.article_status(local_feed, "old-local").unwrap().is_some(), "Metadaten bleiben erhalten");
-        let rows = db.query_articles(&Scope::Global, Filter::All, None, 10).unwrap();
-        let local_row = rows.iter().find(|r| r.id == "old-local").expect("Zeile bleibt in der Liste");
-        let remote_row = rows.iter().find(|r| r.id == "old-remote").expect("Zeile bleibt in der Liste");
-        assert!(!local_row.has_content, "Inhalt des lokalen Altartikels wurde bereinigt");
-        assert!(remote_row.has_content, "Artikel mit ausstehender Mutation bleibt vollständig");
-        assert!(db.search("alt", &Scope::Global, Filter::All, None, 10).unwrap().iter().any(|r| r.id == "old-remote"));
+        assert!(
+            db.article_status(local_feed, "old-local")
+                .unwrap()
+                .is_some(),
+            "Metadaten bleiben erhalten"
+        );
+        let rows = db
+            .query_articles(&Scope::Global, Filter::All, None, 10)
+            .unwrap();
+        let local_row = rows
+            .iter()
+            .find(|r| r.id == "old-local")
+            .expect("Zeile bleibt in der Liste");
+        let remote_row = rows
+            .iter()
+            .find(|r| r.id == "old-remote")
+            .expect("Zeile bleibt in der Liste");
+        assert!(
+            !local_row.has_content,
+            "Inhalt des lokalen Altartikels wurde bereinigt"
+        );
+        assert!(
+            remote_row.has_content,
+            "Artikel mit ausstehender Mutation bleibt vollständig"
+        );
+        assert!(db
+            .search("alt", &Scope::Global, Filter::All, None, 10)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == "old-remote"));
     }
 
     #[test]
@@ -2610,13 +3692,60 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "gone", "Verschwindet", None, None, now, "e", Some("<p>oldsecretword</p>"), now).unwrap();
-        assert_eq!(db.search("oldsecretword", &Scope::Global, Filter::All, None, 10).unwrap().len(), 1);
-        db.conn.execute("DELETE FROM articles WHERE feed_id=?1 AND id='gone'", params![feed]).unwrap();
-        db.conn.execute("DELETE FROM article_contents WHERE feed_id=?1 AND article_id='gone'", params![feed]).unwrap();
-        db.upsert_article(feed, "neu", "Neuer Artikel", None, None, now, "e", Some("<p>anderes wort</p>"), now).unwrap();
-        assert!(db.search("oldsecretword", &Scope::Global, Filter::All, None, 10).unwrap().is_empty(), "verwaiste FTS-Zeile darf nicht treffen");
-        assert_eq!(db.search("anderes", &Scope::Global, Filter::All, None, 10).unwrap().len(), 1);
+        db.upsert_article(
+            feed,
+            "gone",
+            "Verschwindet",
+            None,
+            None,
+            now,
+            "e",
+            Some("<p>oldsecretword</p>"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            db.search("oldsecretword", &Scope::Global, Filter::All, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        db.conn
+            .execute(
+                "DELETE FROM articles WHERE feed_id=?1 AND id='gone'",
+                params![feed],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM article_contents WHERE feed_id=?1 AND article_id='gone'",
+                params![feed],
+            )
+            .unwrap();
+        db.upsert_article(
+            feed,
+            "neu",
+            "Neuer Artikel",
+            None,
+            None,
+            now,
+            "e",
+            Some("<p>anderes wort</p>"),
+            now,
+        )
+        .unwrap();
+        assert!(
+            db.search("oldsecretword", &Scope::Global, Filter::All, None, 10)
+                .unwrap()
+                .is_empty(),
+            "verwaiste FTS-Zeile darf nicht treffen"
+        );
+        assert_eq!(
+            db.search("anderes", &Scope::Global, Filter::All, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2625,10 +3754,156 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         let feed = db.add_feed(&acc, "u1", "Feed", None, "#111111").unwrap();
         let now = now_ms();
-        db.upsert_article(feed, "a", "Sondertitel Quaternionen", Some("Autorin"), None, now, "e", None, now).unwrap();
-        let hits = db.search("sondertitel", &Scope::Global, Filter::All, None, 10).unwrap();
+        db.upsert_article(
+            feed,
+            "a",
+            "Sondertitel Quaternionen",
+            Some("Autorin"),
+            None,
+            now,
+            "e",
+            None,
+            now,
+        )
+        .unwrap();
+        let hits = db
+            .search("sondertitel", &Scope::Global, Filter::All, None, 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].has_content, "kein Inhalt, aber Treffer");
+    }
+
+    /// Legt eine Bibliothek mit genau dem Schemastand `version` an, wie ein altes Backup.
+    fn old_version_db(path: &std::path::Path, version: i64) {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS {
+            if *v <= version {
+                conn.execute_batch(sql).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_version(version, applied_ms) VALUES (?1, ?2)",
+                    params![v, 0],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn restore_kandidat_aelterer_version_wird_vor_der_aktivierung_migriert() {
+        let dir = tempdir("restore-migriert");
+        let candidate = dir.join("backup.db");
+        old_version_db(&candidate, 2);
+        let version = Database::prepare_restore_candidate(&candidate).unwrap();
+        assert_eq!(version, max_schema_version());
+        let db = Database::open(&candidate).unwrap();
+        let columns: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('feeds')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"remote_id".to_string()));
+        assert!(columns.contains(&"user_title".to_string()));
+    }
+
+    #[test]
+    fn schema_aenderung_sichert_vorher_konsistent() {
+        let dir = tempdir("pre-migrate");
+        let path = dir.join("library.db");
+        old_version_db(&path, 3);
+        {
+            let db = Database::open(&path).unwrap();
+            db.ensure_local_account().unwrap();
+        }
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("pre-migrate"))
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "vor der Migration existiert eine Sicherung: {backups:?}"
+        );
+        let conn =
+            Connection::open_with_flags(&dir.join(&backups[0]), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version, 3,
+            "die Sicherung enthält den Stand vor der Änderung"
+        );
+    }
+
+    #[test]
+    fn fremde_datenbank_mit_gleichem_namen_wird_abgewiesen() {
+        let dir = tempdir("fremd");
+        let path = dir.join("fremd.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts(id TEXT, name TEXT);
+                 CREATE TABLE feeds(id TEXT);
+                 CREATE TABLE articles(id TEXT);
+                 CREATE TABLE schema_version(version INTEGER);",
+            )
+            .unwrap();
+        }
+        let err = Database::validate_candidate(&path).unwrap_err();
+        assert!(err.to_string().contains("Lesefluss"), "{err}");
+    }
+
+    #[test]
+    fn kandidat_mit_verletzten_fremdschluesseln_wird_abgewiesen() {
+        let dir = tempdir("fk");
+        let path = dir.join("kaputt.db");
+        let db = Database::open(&path).unwrap();
+        db.raw().execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        db.raw()
+            .execute(
+                "INSERT INTO articles(id, feed_id, title, published_ms, sort_ms, first_seen_ms, updated_ms)
+                 VALUES ('verwaist', 9999, 'T', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.raw().execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let err = Database::validate_candidate(&path).unwrap_err();
+        assert!(err.to_string().contains("Fremdschlüssel"), "{err}");
+    }
+
+    #[test]
+    fn sortierung_ist_je_konto_und_faellt_zurueck() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+        assert!(db.account_newest_first("feedly-1", true).unwrap());
+        assert!(!db.account_newest_first("feedly-1", false).unwrap());
+        db.set_account_newest_first("feedly-1", false).unwrap();
+        assert!(
+            !db.account_newest_first("feedly-1", true).unwrap(),
+            "eigene Einstellung des Kontos gewinnt"
+        );
+        assert!(
+            !db.account_newest_first("local", false).unwrap(),
+            "andere Konten behalten die Vorgabe"
+        );
+        assert!(
+            db.account_newest_first("local", true).unwrap(),
+            "die Vorgabe ist wirklich die Vorgabe"
+        );
     }
 
     #[test]
@@ -2637,13 +3912,23 @@ mod tests {
         let acc = db.ensure_local_account().unwrap();
         db.conn.execute("INSERT INTO accounts(id,kind,name,created_ms) VALUES ('feedly-1','feedly','Feedly',0)", []).unwrap();
         let f_local = db.add_feed(&acc, "u1", "Lokal", None, "#111111").unwrap();
-        let f_remote = db.add_feed("feedly-1", "u2", "Feedly", None, "#222222").unwrap();
+        let f_remote = db
+            .add_feed("feedly-1", "u2", "Feedly", None, "#222222")
+            .unwrap();
         let now = now_ms();
-        db.upsert_article(f_local, "a", "A", None, None, now, "e", None, now).unwrap();
-        db.upsert_article(f_remote, "b", "B", None, None, now, "e", None, now).unwrap();
+        db.upsert_article(f_local, "a", "A", None, None, now, "e", None, now)
+            .unwrap();
+        db.upsert_article(f_remote, "b", "B", None, None, now, "e", None, now)
+            .unwrap();
         db.set_saved_by_article_id("a", true).unwrap();
         db.set_saved_by_article_id("b", true).unwrap();
-        assert_eq!(db.saved_ids_for_account(&acc).unwrap(), vec!["a".to_string()]);
-        assert_eq!(db.saved_ids_for_account("feedly-1").unwrap(), vec!["b".to_string()]);
+        assert_eq!(
+            db.saved_ids_for_account(&acc).unwrap(),
+            vec!["a".to_string()]
+        );
+        assert_eq!(
+            db.saved_ids_for_account("feedly-1").unwrap(),
+            vec!["b".to_string()]
+        );
     }
 }

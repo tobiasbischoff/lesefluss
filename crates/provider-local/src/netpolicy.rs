@@ -95,7 +95,9 @@ pub fn check_url(raw: &str, trusted_origins: &[String]) -> Result<Url, PolicyErr
         return Ok(url);
     }
     if host_literal_blocked(&url) {
-        return Err(PolicyError::HostBlocked(url.host_str().unwrap_or("?").to_string()));
+        return Err(PolicyError::HostBlocked(
+            url.host_str().unwrap_or("?").to_string(),
+        ));
     }
     let host = url.host_str().unwrap_or_default();
     if host.parse::<IpAddr>().is_err() && !host_resolves_public(host) {
@@ -112,16 +114,75 @@ pub fn origin_of(url: &Url) -> String {
     }
 }
 
+/// Löst im Client auf und gibt **nur** policy-konforme Adressen weiter. Damit kann
+/// eine abweichende zweite DNS-Antwort die Vorprüfung nicht umgehen: was hier
+/// herausfällt, ist die einzige Menge, mit der überhaupt verbunden wird.
+pub struct PolicyResolver {
+    trusted: Vec<String>,
+}
+
+impl PolicyResolver {
+    pub fn new(trusted: Vec<String>) -> Self {
+        Self { trusted }
+    }
+
+    fn host_trusted(&self, host: &str) -> bool {
+        self.trusted
+            .iter()
+            .filter_map(|o| Url::parse(o).ok())
+            .any(|u| {
+                u.host_str()
+                    .map(|h| h.eq_ignore_ascii_case(host))
+                    .unwrap_or(false)
+            })
+    }
+}
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let trusted = self.host_trusted(&host);
+        Box::pin(async move {
+            use std::net::ToSocketAddrs;
+            type BoxError = Box<dyn std::error::Error + Send + Sync>;
+            let resolved = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|iter| iter.collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })?;
+            let addrs = resolved.map_err(|e| -> BoxError { Box::new(e) })?;
+            let allowed: Vec<std::net::SocketAddr> = addrs
+                .into_iter()
+                .filter(|a| trusted || public_ip(a.ip()))
+                .collect();
+            if allowed.is_empty() {
+                return Err(Box::new(PolicyError::HostBlocked(
+                    "DNS lieferte nur nicht freigegebene Adressen".to_string(),
+                )) as BoxError);
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn only_http_schemes_pass() {
-        assert!(scheme_allowed(&Url::parse("https://example.com/f.xml").unwrap()));
-        assert!(scheme_allowed(&Url::parse("http://example.com/f.xml").unwrap()));
+        assert!(scheme_allowed(
+            &Url::parse("https://example.com/f.xml").unwrap()
+        ));
+        assert!(scheme_allowed(
+            &Url::parse("http://example.com/f.xml").unwrap()
+        ));
         assert!(!scheme_allowed(&Url::parse("file:///etc/passwd").unwrap()));
-        assert!(!scheme_allowed(&Url::parse("ftp://example.com/f.xml").unwrap()));
+        assert!(!scheme_allowed(
+            &Url::parse("ftp://example.com/f.xml").unwrap()
+        ));
         assert!(!scheme_allowed(&Url::parse("javascript:alert(1)").unwrap()));
         assert!(check_url("file:///etc/passwd", &[]).is_err());
     }
@@ -147,7 +208,10 @@ mod tests {
         let trusted = vec!["http://192.168.1.10:8080".to_string()];
         assert!(check_url("http://192.168.1.10:8080/feed.xml", &trusted).is_ok());
         assert!(check_url("http://192.168.1.11:8080/feed.xml", &trusted).is_err());
-        assert!(check_url("http://example.com/feed.xml", &trusted).is_ok(), "öffentliche Ziele bleiben erlaubt");
+        assert!(
+            check_url("http://example.com/feed.xml", &trusted).is_ok(),
+            "öffentliche Ziele bleiben erlaubt"
+        );
     }
 
     #[test]

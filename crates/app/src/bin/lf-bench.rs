@@ -97,7 +97,7 @@ fn main() {
             .query_articles(
                 &Scope::Global,
                 Filter::Unread,
-                Some((last.published_ms, &last.id)),
+                Some((last.sort_ms, last.feed_id, &last.id)),
                 200,
             )
             .expect("query");

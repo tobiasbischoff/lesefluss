@@ -43,6 +43,10 @@ pub enum NetEvent {
     },
     FeedlySyncFailed {
         message: String,
+        /// Kontozustand laut Sync (`auth_required`, `rate_limited`, …), falls bekannt.
+        status: Option<String>,
+        /// ms, ab dem erneut versucht werden soll (bei Drosselung).
+        retry_after_ms: Option<i64>,
     },
 }
 
@@ -63,7 +67,9 @@ fn host_sem(host: &str) -> Arc<Semaphore> {
     static M: OnceLock<Mutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
     let map = M.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = map.lock().expect("host sem map");
-    g.entry(host.to_string()).or_insert_with(|| Arc::new(Semaphore::new(2))).clone()
+    g.entry(host.to_string())
+        .or_insert_with(|| Arc::new(Semaphore::new(2)))
+        .clone()
 }
 
 fn jitter(ms: i64) -> i64 {
@@ -161,8 +167,10 @@ impl Net {
     }
 
     pub fn set_refresh_minutes(&self, minutes: i64) {
-        self.interval_ms
-            .store(interval_from_minutes(minutes), std::sync::atomic::Ordering::Relaxed);
+        self.interval_ms.store(
+            interval_from_minutes(minutes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn spawn<F>(&self, fut: F)
@@ -182,7 +190,10 @@ impl Net {
                     let _ = tx.send(NetEvent::DiscoveryDone { input, candidates });
                 }
                 Err(e) => {
-                    let _ = tx.send(NetEvent::DiscoveryFailed { input, message: e.to_string() });
+                    let _ = tx.send(NetEvent::DiscoveryFailed {
+                        input,
+                        message: e.to_string(),
+                    });
                 }
             }
         });
@@ -216,9 +227,11 @@ where
     F: FnOnce(&storage::Database) -> T + Send + 'static,
 {
     let worker = worker.clone();
-    tokio::task::spawn_blocking(move || worker.send(f).recv().ok()?.downcast::<T>().ok().map(|b| *b))
-        .await
-        .ok()?
+    tokio::task::spawn_blocking(move || {
+        worker.send(f).recv().ok()?.downcast::<T>().ok().map(|b| *b)
+    })
+    .await
+    .ok()?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,7 +245,10 @@ async fn fetch_and_store(
     base_interval_ms: i64,
 ) {
     let _ = tx.send(NetEvent::FetchStarted(feed_id));
-    let host = url::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let host = url::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
     let _global = match global_sem().acquire().await {
         Ok(g) => g,
         Err(_) => return,
@@ -257,9 +273,15 @@ async fn fetch_and_store(
     }
 
     let requested_url = url.clone();
-    let outcome = http.fetch_feed(&url, st.etag.as_deref(), st.last_modified.as_deref()).await;
+    let outcome = http
+        .fetch_feed(&url, st.etag.as_deref(), st.last_modified.as_deref())
+        .await;
     let now = storage::now_ms();
-    let interval_ms = if force { MIN_INTERVAL_MS } else { base_interval_ms };
+    let interval_ms = if force {
+        MIN_INTERVAL_MS
+    } else {
+        base_interval_ms
+    };
     match outcome {
         Ok(FetchOutcome::NotModified) => {
             let next = now + jitter(interval_ms);
@@ -280,14 +302,20 @@ async fn fetch_and_store(
             .await;
             let _ = tx.send(NetEvent::FetchNotModified(feed_id));
         }
-        Ok(FetchOutcome::Fetched { bytes, etag, last_modified, final_url }) => {
+        Ok(FetchOutcome::Fetched {
+            bytes,
+            etag,
+            last_modified,
+            final_url,
+        }) => {
             let _ = db_call(&worker, {
                 let requested = requested_url.clone();
                 let final_for_alias = final_url.clone();
                 move |db| db.record_feed_alias(feed_id, &requested, &final_for_alias)
             })
             .await;
-            let parsed = tokio::task::spawn_blocking(move || provider_local::parse_feed(&bytes)).await;
+            let parsed =
+                tokio::task::spawn_blocking(move || provider_local::parse_feed(&bytes)).await;
             match parsed {
                 Ok(Ok(pf)) => {
                     let site = pf.website.clone();
@@ -346,13 +374,25 @@ async fn fetch_and_store(
                     .await;
                     match res {
                         Some(Ok((added, updated))) => {
-                            let _ = tx.send(NetEvent::FetchDone { feed_id, added, updated, title, website });
+                            let _ = tx.send(NetEvent::FetchDone {
+                                feed_id,
+                                added,
+                                updated,
+                                title,
+                                website,
+                            });
                         }
                         Some(Err(e)) => {
-                            let _ = tx.send(NetEvent::FetchFailed { feed_id, message: e.to_string() });
+                            let _ = tx.send(NetEvent::FetchFailed {
+                                feed_id,
+                                message: e.to_string(),
+                            });
                         }
                         None => {
-                            let _ = tx.send(NetEvent::FetchFailed { feed_id, message: "db".into() });
+                            let _ = tx.send(NetEvent::FetchFailed {
+                                feed_id,
+                                message: "db".into(),
+                            });
                         }
                     }
                 }
@@ -375,6 +415,9 @@ async fn fail(
     let errors = prev_errors + 1;
     let next = now + jitter(backoff_ms(interval_from_minutes(30), errors));
     let msg2 = message.clone();
-    let _ = db_call(worker, move |db| db.update_fetch_error(feed_id, errors, &msg2, next, now)).await;
+    let _ = db_call(worker, move |db| {
+        db.update_fetch_error(feed_id, errors, &msg2, next, now)
+    })
+    .await;
     let _ = tx.send(NetEvent::FetchFailed { feed_id, message });
 }

@@ -10,17 +10,70 @@ pub struct CleanResult {
 }
 
 const TAGS: &[&str] = &[
-    "p", "div", "span", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "dl",
-    "dt", "dd", "blockquote", "pre", "code", "table", "thead", "tbody", "tfoot", "tr", "th", "td",
-    "caption", "figure", "figcaption", "img", "a", "em", "strong", "b", "i", "u", "s", "sub",
-    "sup", "small", "mark", "abbr", "q", "cite", "kbd", "samp", "var", "time", "wbr", "ruby",
-    "rt", "rp", "bdi", "bdo",
+    "p",
+    "div",
+    "span",
+    "br",
+    "hr",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "blockquote",
+    "pre",
+    "code",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "caption",
+    "figure",
+    "figcaption",
+    "img",
+    "a",
+    "em",
+    "strong",
+    "b",
+    "i",
+    "u",
+    "s",
+    "sub",
+    "sup",
+    "small",
+    "mark",
+    "abbr",
+    "q",
+    "cite",
+    "kbd",
+    "samp",
+    "var",
+    "time",
+    "wbr",
+    "ruby",
+    "rt",
+    "rp",
+    "bdi",
+    "bdo",
 ];
 
 fn tag_attributes() -> HashMap<&'static str, HashSet<&'static str>> {
     let mut m: HashMap<&'static str, HashSet<&'static str>> = HashMap::new();
     m.insert("a", HashSet::from(["href", "title"]));
-    m.insert("img", HashSet::from(["src", "alt", "title", "width", "height"]));
+    m.insert(
+        "img",
+        HashSet::from(["src", "alt", "title", "width", "height"]),
+    );
     m.insert("td", HashSet::from(["colspan", "rowspan"]));
     m.insert("th", HashSet::from(["colspan", "rowspan"]));
     m.insert("time", HashSet::from(["datetime"]));
@@ -123,7 +176,10 @@ pub fn sanitize(raw: &str, base_url: Option<&str>) -> CleanResult {
             }
         }
     }
-    CleanResult { html: cleaned, images }
+    CleanResult {
+        html: cleaned,
+        images,
+    }
 }
 
 pub fn image_sources(html: &str) -> Vec<String> {
@@ -172,8 +228,12 @@ mod tests {
     fn resolves_relative_urls() {
         let raw = r#"<img src="/img/a.png"><a href="../b.html">b</a><img src="c.png">"#;
         let r = sanitize(raw, Some("https://blog.example/x/feed.xml"));
-        assert!(r.images.contains(&"https://blog.example/img/a.png".to_string()));
-        assert!(r.images.contains(&"https://blog.example/x/c.png".to_string()));
+        assert!(r
+            .images
+            .contains(&"https://blog.example/img/a.png".to_string()));
+        assert!(r
+            .images
+            .contains(&"https://blog.example/x/c.png".to_string()));
         assert!(r.html.contains("https://blog.example/b.html"));
     }
 
@@ -182,7 +242,17 @@ mod tests {
         let raw = r#"<h2>T</h2><ul><li>eins</li></ul><blockquote>zitat</blockquote>
 <pre><code>code</code></pre><table><tr><th>a</th><td>b</td></tr></table>"#;
         let r = sanitize(raw, None);
-        for needle in ["<h2>", "<ul>", "<li>", "<blockquote>", "<pre>", "<code>", "<table>", "<th>", "<td>"] {
+        for needle in [
+            "<h2>",
+            "<ul>",
+            "<li>",
+            "<blockquote>",
+            "<pre>",
+            "<code>",
+            "<table>",
+            "<th>",
+            "<td>",
+        ] {
             assert!(r.html.contains(needle), "fehlt {needle} in {}", r.html);
         }
     }
@@ -190,7 +260,11 @@ mod tests {
     #[test]
     fn link_rel_hardening() {
         let r = sanitize(r#"<a href="https://a.example">a</a>"#, None);
-        assert!(r.html.contains("rel=\"noopener noreferrer nofollow\""), "{}", r.html);
+        assert!(
+            r.html.contains("rel=\"noopener noreferrer nofollow\""),
+            "{}",
+            r.html
+        );
     }
 }
 
@@ -204,7 +278,11 @@ pub fn rewrite_images(html: &str, placeholder: &str) -> String {
     let mut i = 0usize;
     while i < bytes.len() {
         let rest = &html[i..];
-        if !rest.get(..4).map(|t| t.eq_ignore_ascii_case("<img")).unwrap_or(false) {
+        if !rest
+            .get(..4)
+            .map(|t| t.eq_ignore_ascii_case("<img"))
+            .unwrap_or(false)
+        {
             let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
             out.push_str(&rest[..ch_len]);
             i += ch_len;
@@ -231,7 +309,10 @@ pub fn rewrite_images(html: &str, placeholder: &str) -> String {
                     replaced.push_str(&tag[pos + 3..]);
                 } else {
                     replaced.push_str(&tag[4..]);
-                    replaced.push_str(&format!(" data-lf-src=\"{escaped}\" src=\"{}\"", escape_attr(placeholder)));
+                    replaced.push_str(&format!(
+                        " data-lf-src=\"{escaped}\" src=\"{}\"",
+                        escape_attr(placeholder)
+                    ));
                 }
                 out.push_str(&replaced);
             }
@@ -280,7 +361,11 @@ fn rewrite_images_one(html: &str, url: &str, data_uri: &str) -> String {
     let mut i = 0usize;
     while i < bytes.len() {
         let rest = &html[i..];
-        if !rest.get(..4).map(|t| t.eq_ignore_ascii_case("<img")).unwrap_or(false) {
+        if !rest
+            .get(..4)
+            .map(|t| t.eq_ignore_ascii_case("<img"))
+            .unwrap_or(false)
+        {
             let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
             out.push_str(&rest[..ch_len]);
             i += ch_len;
@@ -321,9 +406,12 @@ pub fn image_alt_texts(html: &str) -> Vec<(String, String)> {
     scraper::Html::parse_fragment(html)
         .select(&selector)
         .filter_map(|el| {
-            el.value()
-                .attr("data-lf-src")
-                .map(|src| (src.to_string(), el.value().attr("alt").unwrap_or("Bild").to_string()))
+            el.value().attr("data-lf-src").map(|src| {
+                (
+                    src.to_string(),
+                    el.value().attr("alt").unwrap_or("Bild").to_string(),
+                )
+            })
         })
         .collect()
 }
@@ -339,11 +427,17 @@ mod image_tests {
             <img src="https://cdn.example/a.png" alt="Bild">"#;
         let out = rewrite_images(html, "data:image/gif;base64,R0lGODlhAQABAAAAACw=");
         assert!(!out.contains("Linktext mit https://cdn.example/a.png"));
-        assert!(out.contains(r#"<a href="https://cdn.example/a.png">"#), "Linkziel bleibt");
+        assert!(
+            out.contains(r#"<a href="https://cdn.example/a.png">"#),
+            "Linkziel bleibt"
+        );
         assert!(out.contains(r#"data-lf-src="https://cdn.example/a.png""#));
         assert!(out.contains(r#"src="data:image/gif;base64,R0lGODlhAQABAAAAACw=""#));
         let alts = image_alt_texts(&out);
-        assert_eq!(alts, vec![("https://cdn.example/a.png".to_string(), "Bild".to_string())]);
+        assert_eq!(
+            alts,
+            vec![("https://cdn.example/a.png".to_string(), "Bild".to_string())]
+        );
     }
 
     #[test]
@@ -352,7 +446,10 @@ mod image_tests {
             <img data-lf-src="https://a.example/2.png" src="PH" alt="zwei">"#;
         let out = replace_marker(html, "https://a.example/1.png", "data:image/png;base64,AAA");
         assert!(out.contains(r#"src="data:image/png;base64,AAA""#));
-        assert!(out.contains(r#"data-lf-src="https://a.example/2.png" src="PH""#), "zweites Bild bleibt");
+        assert!(
+            out.contains(r#"data-lf-src="https://a.example/2.png" src="PH""#),
+            "zweites Bild bleibt"
+        );
     }
 
     #[test]

@@ -6,7 +6,12 @@ pub enum FeedlyError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
     #[error("api {status}: {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+        /// Ausgewertetes `Retry-After` in Millisekunden, falls der Server es mitsendet.
+        retry_after_ms: Option<i64>,
+    },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Antwort zu groß: {got} Bytes (Limit {limit})")]
@@ -115,7 +120,9 @@ impl Entry {
     }
 
     pub fn is_saved(&self) -> bool {
-        self.tags.iter().any(|t| t.id.ends_with("/tag/global.saved"))
+        self.tags
+            .iter()
+            .any(|t| t.id.ends_with("/tag/global.saved"))
     }
 
     pub fn feed_stream_id(&self) -> Option<String> {
@@ -123,12 +130,26 @@ impl Entry {
     }
 }
 
+/// Ergebnis eines Pagerschritts nach einer geholten Seite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAction {
+    /// Es gibt einen neuen, noch nicht gesehenen Cursor: weiterladen.
+    Continue,
+    /// Kein Cursor mehr: die Phase ist vollständig.
+    Done,
+    /// Abbruch wegen Zyklus oder Sicherheitslimit; die Phase ist **unvollständig**.
+    Aborted,
+}
+
 /// Fortschrittsmaschine für opake Cursor.
-/// Behandelt leere Seiten mit Cursor, wiederkehrende Cursor und ein
-/// Sicherheitslimit als **unvollständig** statt als Erfolg.
+///
+/// Aufrufregel: erst die Seite holen, dann **genau einmal** `after_page` mit deren
+/// Continuation aufrufen. Leere Seiten mit neuem Cursor werden weiterverfolgt;
+/// wiederkehrende Cursor und das Sicherheitslimit gelten als Abbruch, nie als Erfolg.
 #[derive(Debug, Default)]
 pub struct Pager {
     seen: std::collections::HashSet<String>,
+    started: bool,
     pub pages: usize,
     pub items: usize,
     pub complete: bool,
@@ -141,39 +162,60 @@ pub enum PagerError {
     Incomplete(String),
 }
 
+/// Ergebnis eines Inventarlaufs. Nur `Complete` darf Reconciliation auslösen.
+#[derive(Debug)]
+pub enum Inventory {
+    /// Alle Seiten verarbeitet; für Abgleich verwendbar.
+    Complete(Vec<String>),
+    /// Nicht alle Seiten verarbeitet; darf **nichts** zurücksetzen.
+    Incomplete(String),
+}
+
 impl Pager {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Registriert eine weitergereichte Continuation. `false` bedeutet: weitermachen.
-    pub fn accept(&mut self, continuation: Option<&str>, page_items: usize, max_pages: usize) -> bool {
+    /// Nach jeder geholten Seite genau einmal aufrufen.
+    pub fn after_page(
+        &mut self,
+        continuation: Option<&str>,
+        page_items: usize,
+        max_pages: usize,
+    ) -> PageAction {
+        self.started = true;
         self.pages += 1;
         self.items += page_items;
         let Some(cursor) = continuation.filter(|c| !c.is_empty()) else {
             self.complete = true;
-            return false;
+            return PageAction::Done;
         };
-        if page_items == 0 && self.pages > 1 && !self.seen.is_empty() && self.seen.contains(cursor) {
-            self.stopped_because = Some("Cursor wiederholt sich".to_string());
-            return false;
-        }
         if !self.seen.insert(cursor.to_string()) {
             self.stopped_because = Some(format!("Cursor-Zyklus bei {cursor}"));
-            return false;
+            return PageAction::Aborted;
         }
         if self.pages >= max_pages {
             self.stopped_because = Some(format!("Sicherheitslimit {max_pages} Seiten erreicht"));
-            return false;
+            return PageAction::Aborted;
         }
-        true
+        PageAction::Continue
     }
 
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Eine Phase ohne jede Seite gilt nie als Erfolg.
     pub fn into_result(self) -> Result<()> {
-        match self.stopped_because {
-            Some(reason) => Err(PagerError::Incomplete(reason).into()),
-            None => Ok(()),
+        if let Some(reason) = self.stopped_because {
+            return Err(PagerError::Incomplete(reason).into());
         }
+        if !self.complete {
+            return Err(
+                PagerError::Incomplete("keine Seite vollständig verarbeitet".into()).into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -205,6 +247,7 @@ pub struct ReadsPage {
     pub entries: Vec<ReadMarker>,
     pub feeds: Vec<ReadMarker>,
     pub updated: Option<i64>,
+    pub continuation: Option<String>,
 }
 
 impl FeedlyClient {
@@ -229,9 +272,10 @@ impl FeedlyClient {
 
     async fn json<T: for<'de> Deserialize<'de>>(&self, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
+        let retry_after = retry_after_of(resp.headers(), storage_now_ms());
         let bytes = read_bounded(resp, MAX_JSON_BYTES).await?;
         if !status.is_success() {
-            return Err(api_error(status, &bytes));
+            return Err(api_error(status, &bytes, retry_after));
         }
         Ok(serde_json::from_slice(&bytes)?)
     }
@@ -294,19 +338,52 @@ impl FeedlyClient {
         self.json(self.get(&url).send().await?).await
     }
 
+    /// Batch-Inhalte. Feedly akzeptiert die Objektform; manche Konten/Versionen
+    /// verlangen das nackte JSON-Array (so sendet es NetNewsWire). Wir probieren
+    /// die dokumentierte Form und fallen einmalig auf das Array zurück.
     pub async fn entries_mget(&self, ids: &[String]) -> Result<Vec<Entry>> {
-        let resp = self
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}entries/.mget", self.base);
+        let object = self
             .http
-            .post(format!("{}entries/.mget", self.base))
+            .post(&url)
             .bearer_auth(&self.token)
             .json(&serde_json::json!({ "ids": ids }))
+            .send()
+            .await;
+        if let Ok(resp) = object {
+            let status = resp.status();
+            if status.is_success() {
+                return self.json(resp).await;
+            }
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(ids)
             .send()
             .await?;
         self.json(resp).await
     }
 
     pub async fn markers_reads(&self, newer_than: i64, count: u32) -> Result<ReadsPage> {
-        let url = format!("markers/reads?newerThan={newer_than}&count={count}");
+        self.markers_reads_page(newer_than, count, None).await
+    }
+
+    /// Eine Seite des Read-Deltas inklusive opakem Continuation.
+    pub async fn markers_reads_page(
+        &self,
+        newer_than: i64,
+        count: u32,
+        continuation: Option<&str>,
+    ) -> Result<ReadsPage> {
+        let mut url = format!("markers/reads?newerThan={newer_than}&count={count}");
+        if let Some(c) = continuation {
+            url.push_str(&format!("&continuation={}", encode_component(c)));
+        }
         self.json(self.get(&url).send().await?).await
     }
 
@@ -319,9 +396,10 @@ impl FeedlyClient {
             .send()
             .await?;
         let status = resp.status();
+        let retry_after = retry_after_of(resp.headers(), storage_now_ms());
         let bytes = read_bounded(resp, MAX_JSON_BYTES).await?;
         if !status.is_success() {
-            return Err(api_error(status, &bytes));
+            return Err(api_error(status, &bytes, retry_after));
         }
         Ok(())
     }
@@ -335,9 +413,10 @@ impl FeedlyClient {
             .send()
             .await?;
         let status = resp.status();
+        let retry_after = retry_after_of(resp.headers(), storage_now_ms());
         let bytes = read_bounded(resp, MAX_JSON_BYTES).await?;
         if !status.is_success() {
-            return Err(api_error(status, &bytes));
+            return Err(api_error(status, &bytes, retry_after));
         }
         Ok(())
     }
@@ -349,7 +428,12 @@ impl FeedlyClient {
 
 fn encode(q: &[(String, String)]) -> String {
     q.iter()
-        .map(|(k, v)| format!("{k}={}", url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>()))
+        .map(|(k, v)| {
+            format!(
+                "{k}={}",
+                url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>()
+            )
+        })
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -359,14 +443,20 @@ pub const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
 async fn read_bounded(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if let Some(len) = resp.content_length() {
         if len as usize > limit {
-            return Err(FeedlyError::TooLarge { got: len as usize, limit });
+            return Err(FeedlyError::TooLarge {
+                got: len as usize,
+                limit,
+            });
         }
     }
     let mut out: Vec<u8> = Vec::new();
     let mut resp = resp;
     while let Some(chunk) = resp.chunk().await? {
         if out.len() + chunk.len() > limit {
-            return Err(FeedlyError::TooLarge { got: out.len() + chunk.len(), limit });
+            return Err(FeedlyError::TooLarge {
+                got: out.len() + chunk.len(),
+                limit,
+            });
         }
         out.extend_from_slice(&chunk);
     }
@@ -374,17 +464,34 @@ async fn read_bounded(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> 
 }
 
 /// Redigiert Serverantworten: nur Fehlertext, keine vollständigen Nutzdaten.
-fn api_error(status: reqwest::StatusCode, body: &[u8]) -> FeedlyError {
+fn api_error(status: reqwest::StatusCode, body: &[u8], retry_after_ms: Option<i64>) -> FeedlyError {
     let text = String::from_utf8_lossy(body);
     let message = text
         .chars()
         .filter(|c| !c.is_control())
         .take(200)
         .collect::<String>();
-    FeedlyError::Api { status: status.as_u16(), message }
+    FeedlyError::Api {
+        status: status.as_u16(),
+        message,
+        retry_after_ms,
+    }
+}
+
+/// Liest `Retry-After` aus einer Antwort, bevor der Body verbraucht wird.
+fn retry_after_of(headers: &reqwest::header::HeaderMap, now_ms: i64) -> Option<i64> {
+    let value = headers.get("retry-after")?.to_str().ok()?;
+    parse_retry_after(Some(value), now_ms)
 }
 
 /// `Retry-After` als Sekunden oder HTTP-Datum; `None` bei fehlendem/ungültigem Wert.
+fn storage_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn parse_retry_after(value: Option<&str>, now_ms: i64) -> Option<i64> {
     let raw = value?.trim();
     if let Ok(seconds) = raw.parse::<i64>() {
@@ -425,12 +532,32 @@ mod budget_tests {
     }
 }
 
+/// Kodiert einen opaken Cursor für die Query-Liste; IDs werden nie per
+/// Stringverkettung zerlegt (Spec §9.1/§12.4).
+pub fn encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 pub fn global_all_stream(user_id: &str) -> String {
     format!("user/{user_id}/category/global.all")
 }
 
 pub fn saved_stream(user_id: &str) -> String {
     format!("user/{user_id}/tag/global.saved")
+}
+
+/// Unread-Inventar als eigener Strom; getrennt vom Gespeichert-Inventar.
+pub fn unread_stream(user_id: &str) -> String {
+    format!("user/{user_id}/category/global.unread")
 }
 
 #[cfg(test)]
@@ -455,54 +582,151 @@ mod tests {
         assert_eq!(e.html().as_deref(), Some("<p>hi</p>"));
         assert_eq!(e.url().as_deref(), Some("https://example.com/a"));
         assert!(e.is_saved());
-        assert_eq!(e.feed_stream_id().as_deref(), Some("feed/https://example.com/feed"));
+        assert_eq!(
+            e.feed_stream_id().as_deref(),
+            Some("feed/https://example.com/feed")
+        );
         assert_eq!(e.unread, Some(true));
     }
 
     #[test]
     fn pager_follows_cursor_over_empty_pages() {
         let mut p = Pager::new();
-        assert!(p.accept(Some("c1"), 100, 50));
-        assert!(p.accept(Some("c2"), 0, 50), "leere Seite mit Cursor wird weiterverfolgt");
-        assert!(!p.accept(None, 0, 50));
+        assert_eq!(p.after_page(Some("c1"), 100, 50), PageAction::Continue);
+        assert_eq!(
+            p.after_page(Some("c2"), 0, 50),
+            PageAction::Continue,
+            "leere Seite mit neuem Cursor wird weiterverfolgt"
+        );
+        assert_eq!(p.after_page(None, 0, 50), PageAction::Done);
         assert!(p.complete);
         assert_eq!(p.items, 100);
         assert!(p.into_result().is_ok());
     }
 
-    #[test]
-    fn pager_detects_cursor_cycles() {
+    fn pager_stops_on_cursor_cycles() {
         let mut p = Pager::new();
-        assert!(p.accept(Some("a"), 10, 50));
-        assert!(p.accept(Some("b"), 10, 50));
-        assert!(!p.accept(Some("a"), 10, 50), "wiederkehrender Cursor bricht ab");
-        assert!(!p.complete);
+        assert_eq!(p.after_page(Some("a"), 10, 50), PageAction::Continue);
+        assert_eq!(p.after_page(Some("b"), 10, 50), PageAction::Continue);
+        assert_eq!(p.after_page(Some("a"), 10, 50), PageAction::Aborted);
         let err = p.into_result().unwrap_err();
         assert!(err.to_string().contains("Zyklus"), "{err}");
     }
 
-    #[test]
     fn pager_reports_safety_limit_as_incomplete() {
         let mut p = Pager::new();
-        for i in 0..2 {
-            assert!(p.accept(Some(&format!("c{i}")), 10, 3));
-        }
-        assert!(!p.accept(Some("c2"), 10, 3), "Limit beendet die Schleife");
+        assert_eq!(p.after_page(Some("c0"), 10, 3), PageAction::Continue);
+        assert_eq!(p.after_page(Some("c1"), 10, 3), PageAction::Continue);
+        assert_eq!(p.after_page(Some("c2"), 10, 3), PageAction::Aborted);
         let err = p.into_result().unwrap_err();
         assert!(err.to_string().contains("Sicherheitslimit"), "{err}");
     }
 
-    #[test]
+    fn pager_without_any_page_is_not_success() {
+        let p = Pager::new();
+        assert!(!p.started());
+        let err = p.into_result().unwrap_err();
+        assert!(err.to_string().contains("unvollständig"), "{err}");
+    }
+
     fn empty_json_is_not_a_valid_inventory() {
         assert!(serde_json::from_str::<IdsPage>("{}").is_err(), "ids fehlen");
         assert!(serde_json::from_str::<IdsPage>(r#"{"ids":[]}"#).is_ok());
-        assert!(serde_json::from_str::<StreamPage>(r#"{"id":"s"}"#).is_err(), "items fehlen");
+        assert!(
+            serde_json::from_str::<StreamPage>(r#"{"id":"s"}"#).is_err(),
+            "items fehlen"
+        );
     }
 
+    #[test]
     fn stream_page_continuation() {
         let json = r#"{"id":"s","updated":1,"continuation":"c1","items":[]}"#;
         let p: StreamPage = serde_json::from_str(json).unwrap();
         assert_eq!(p.continuation.as_deref(), Some("c1"));
+    }
+
+    #[tokio::test]
+    async fn mget_fällt_auf_die_arrayform_zurück() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let counter = bodies.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Objektform wird abgelehnt, wie es manche Konten tun.
+                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = s.write_all(resp);
+                    continue;
+                }
+                let body = r#"[{"id":"https://feedly.com/i/entry/x","title":"T","origin":{"streamId":"feed/https://example.org/f.xml"}}]"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = req;
+            }
+        });
+        let client = FeedlyClient::with_base("t".into(), format!("http://{addr}/v3/"));
+        let entries = client
+            .entries_mget(&["https://feedly.com/i/entry/x".to_string()])
+            .await
+            .expect("Arrayform muss funktionieren");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            bodies.load(Ordering::SeqCst),
+            2,
+            "erst Objektform, dann Array"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_fehler_beitreten_kein_retry_after() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let body = "{}";
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 42\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let client = FeedlyClient::with_base("t".into(), format!("http://{addr}/v3/"));
+        let err = client
+            .stream_ids("user/x/tag/global.saved", 10, None, false)
+            .await
+            .unwrap_err();
+        match err {
+            FeedlyError::Api {
+                status: 429,
+                retry_after_ms,
+                ..
+            } => {
+                assert!(retry_after_ms.is_some(), "Retry-After wird ausgewertet");
+                assert!(retry_after_ms.unwrap() > 0);
+            }
+            other => panic!("erwartet 429, bekam {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -531,7 +755,10 @@ mod tests {
             }
         });
         let client = FeedlyClient::with_base("tok".into(), format!("http://{addr}/v3/"));
-        let p1 = client.stream_contents("user/x/category/global.all", 100, None, None, false).await.unwrap();
+        let p1 = client
+            .stream_contents("user/x/category/global.all", 100, None, None, false)
+            .await
+            .unwrap();
         assert_eq!(p1.items.len(), 1);
         let c = p1.continuation.clone().unwrap();
         let p2 = client

@@ -1,6 +1,6 @@
 # Bekannte Grenzen
 
-**Stand:** 24.09.2026 · Lesefluss 0.1.0
+**Stand:** 25.09.2026 · Lesefluss 0.1.0
 
 ## Funktional
 
@@ -8,7 +8,8 @@
   Kurzfassung mit Weiterlesen-Link angezeigt; Originalseiten werden bewusst nicht nachgeladen
   (kein Scraping, keine Umgehung von Paywalls).
 - **Feedly-Schreibpfad** ist auf Marker (gelesen/gemerkt) und Delta-Lesen beschränkt. Abonnements,
-  Ordner und Tags werden importiert, aber nicht verändert.
+  Ordner und Tags werden beim Verbinden importiert, aber nicht verändert; ein Delta-Lauf gleicht
+  Abos nicht erneut ab. Eine öffentliche OAuth-Anmeldung gibt es nicht (siehe `m7-offen.md`, X1).
 - **Feedly Saved-Inventar** benötigt die Berechtigung des Kontos; antwortet die API mit einem
   Fehler, bleibt der lokale Merk-Status unverändert (Sync meldet den Fehler als Toast).
 - **Konflikte** werden übersprungen statt überschrieben: existiert für einen Artikel eine
@@ -18,7 +19,13 @@
 - **Wiederherstellung** aus einem Backup greift beim nächsten Start; das Fenster wird nicht
   während des Betriebs neu geladen.
 - **Mediencache** lädt Bilder von Feed-CDNs; sehr große Bilder landen als Platzhalter. Die
-  Cachegrenze wird erst beim nächsten Besuch eines Artikels durchgesetzt.
+  Cachegrenze wird erst beim nächsten Besuch eines Artikels durchgesetzt. Bilder gespeicherter
+  Artikel sind gegen das Pruning geschützt; wer sie auslagern will, muss die Merkung lösen.
+  Mit „Externe Bilder blockieren“ in den Einstellungen wird gar nichts nachgeladen.
+- **Netzwerkpolicy und Proxys:** Weiterleitungen werden Hop für Hop geprüft und die
+  Verbindung bindet nur an geprüfte Adressen. Läuft ein HTTP-Proxy in der Umgebung, kann
+  dieser die Zielprüfung nicht beeinflussen, aber Verbindungen über ihn sind nicht
+  abgesichert; Intranet-Ziele bleiben ohne ausdrückliche Freigabe gesperrt.
 - **Hochskalierung/Textskalierung:** Messungen erfolgten bei Skalierung 1.667 und 60 Hz; 125 %/
   150 % und gemischte Monitorlayouts sind nicht Teil der Messung (siehe `perf-report.md`).
 - **Scrollbudget bei Dauerbetätigung** wurde über einen Stresstest (Artikelnavigation) belegt, nicht

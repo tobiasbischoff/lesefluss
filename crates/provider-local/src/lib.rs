@@ -24,10 +24,7 @@ pub type Result<T> = std::result::Result<T, ProviderError>;
 pub const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_DISCOVERY_BYTES: usize = 4 * 1024 * 1024;
 
-pub async fn read_bounded(
-    resp: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>> {
+pub async fn read_bounded(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if let Some(len) = resp.content_length() {
         if len as usize > limit {
             return Err(ProviderError::TooLarge(len as usize));
@@ -83,16 +80,69 @@ impl Default for HttpClient {
     }
 }
 
+const MAX_REDIRECTS: usize = 5;
+
 impl HttpClient {
     pub fn new() -> Self {
+        Self::with_trusted(Vec::new())
+    }
+
+    fn with_trusted(trusted_origins: Vec<String>) -> Self {
+        // Redirects werden nicht automatisch verfolgt: jeder Hop wird vorher geprüft.
+        // Der Resolver gibt ausschließlich policy-konforme Adressen an den Connector.
+        let resolver = std::sync::Arc::new(netpolicy::PolicyResolver::new(trusted_origins.clone()));
         let inner = reqwest::Client::builder()
             .user_agent("Lesefluss/0.1 (+https://example.org; lokaler RSS-Reader)")
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(resolver)
             .build()
             .expect("reqwest client");
-        Self { inner, trusted_origins: Vec::new(), allow_private_hosts: false }
+        Self {
+            inner,
+            trusted_origins,
+            allow_private_hosts: false,
+        }
+    }
+
+    /// Ein GET, bei dem jede Weiterleitung vor dem Kontaktieren des Ziels geprüft wird.
+    async fn get_checked(&self, url: &str, headers: &[(&str, &str)]) -> Result<reqwest::Response> {
+        let mut current = self.guard(url)?;
+        for _ in 0..=MAX_REDIRECTS {
+            let mut req = self.inner.get(current.clone());
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let is_redirect = matches!(
+                status,
+                reqwest::StatusCode::MOVED_PERMANENTLY
+                    | reqwest::StatusCode::FOUND
+                    | reqwest::StatusCode::SEE_OTHER
+                    | reqwest::StatusCode::TEMPORARY_REDIRECT
+                    | reqwest::StatusCode::PERMANENT_REDIRECT
+            );
+            if !is_redirect {
+                return Ok(resp);
+            }
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    ProviderError::Blocked(format!("Weiterleitung ohne Ziel ({status})"))
+                })?
+                .to_string();
+            let next = current.join(&location).map_err(|_| {
+                ProviderError::Blocked(format!("Ungültiges Weiterleitungsziel: {location}"))
+            })?;
+            current = self.guard(next.as_str())?;
+        }
+        Err(ProviderError::Blocked(format!(
+            "Zu viele Weiterleitungen (>{MAX_REDIRECTS})"
+        )))
     }
 
     pub async fn fetch_feed(
@@ -101,22 +151,24 @@ impl HttpClient {
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<FetchOutcome> {
-        self.guard(url)?;
-        let mut req = self.inner.get(url);
+        let mut conditional: Vec<(&str, &str)> = Vec::new();
         if let Some(e) = etag {
-            req = req.header("If-None-Match", e);
+            conditional.push(("If-None-Match", e));
         }
         if let Some(lm) = last_modified {
-            req = req.header("If-Modified-Since", lm);
+            conditional.push(("If-Modified-Since", lm));
         }
-        let resp = req.send().await?;
+        let resp = self.get_checked(url, &conditional).await?;
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(FetchOutcome::NotModified);
         }
         if !resp.status().is_success() {
             return Err(ProviderError::Parse(format!("HTTP {}", resp.status())));
         }
-        let new_etag = resp.headers().get("etag").and_then(|v| v.to_str().ok().map(str::to_string));
+        let new_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok().map(str::to_string));
         let new_lm = resp
             .headers()
             .get("last-modified")
@@ -133,8 +185,7 @@ impl HttpClient {
     }
 
     pub async fn fetch_image(&self, url: &str) -> Result<(String, Vec<u8>)> {
-        self.guard(url)?;
-        let resp = self.inner.get(url).send().await?;
+        let resp = self.get_checked(url, &[]).await?;
         if !resp.status().is_success() {
             return Err(ProviderError::Parse(format!("HTTP {}", resp.status())));
         }
@@ -145,8 +196,7 @@ impl HttpClient {
     }
 
     pub async fn fetch_raw(&self, url: &str) -> Result<(String, Vec<u8>)> {
-        self.guard(url)?;
-        let resp = self.inner.get(url).send().await?;
+        let resp = self.get_checked(url, &[]).await?;
         if !resp.status().is_success() {
             return Err(ProviderError::Parse(format!("HTTP {}", resp.status())));
         }
@@ -204,10 +254,21 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
             .summary
             .map(|s| storage_plain(&s.content))
             .unwrap_or_default();
-        let identity = identity_of(&e.id, link.as_deref(), &e.title.as_ref().map(|t| t.content.clone()).unwrap_or_default(), published);
+        let identity = identity_of(
+            &e.id,
+            link.as_deref(),
+            &e.title
+                .as_ref()
+                .map(|t| t.content.clone())
+                .unwrap_or_default(),
+            published,
+        );
         out.items.push(ParsedItem {
             identity,
-            title: e.title.map(|t| t.content).unwrap_or_else(|| "(ohne Titel)".into()),
+            title: e
+                .title
+                .map(|t| t.content)
+                .unwrap_or_else(|| "(ohne Titel)".into()),
             author: e.authors.first().map(|a| a.name.clone()),
             url: link,
             published_ms: published,
@@ -229,10 +290,20 @@ fn storage_plain(html: &str) -> String {
             c => out.push(c),
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect()
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(400)
+        .collect()
 }
 
-pub fn identity_of(guid: &str, url: Option<&str>, title: &str, published_ms: Option<i64>) -> String {
+pub fn identity_of(
+    guid: &str,
+    url: Option<&str>,
+    title: &str,
+    published_ms: Option<i64>,
+) -> String {
     let g = guid.trim();
     if !g.is_empty() && g.len() <= 512 {
         return g.to_string();
@@ -253,7 +324,9 @@ pub fn identity_of(guid: &str, url: Option<&str>, title: &str, published_ms: Opt
 }
 
 pub fn normalize_url(raw: &str) -> String {
-    let Ok(mut u) = url::Url::parse(raw) else { return raw.to_string() };
+    let Ok(mut u) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
     u.set_fragment(None);
     let host = u.host_str().map(|h| h.to_lowercase());
     let _ = u.set_host(host.as_deref());
@@ -293,10 +366,20 @@ pub async fn discover(client: &HttpClient, input: &str) -> Result<Vec<DiscoverCa
             .and_then(|b| b.join(&href))
             .map(|u| u.to_string())
             .unwrap_or(href);
-        cands.push(DiscoverCandidate { url: normalize_url(&abs), title });
+        cands.push(DiscoverCandidate {
+            url: normalize_url(&abs),
+            title,
+        });
     }
     if cands.is_empty() {
-        for guess in ["/feed", "/rss", "/feed.xml", "/rss.xml", "/atom.xml", "/index.xml"] {
+        for guess in [
+            "/feed",
+            "/rss",
+            "/feed.xml",
+            "/rss.xml",
+            "/atom.xml",
+            "/index.xml",
+        ] {
             let candidate = url::Url::parse(&final_url)
                 .and_then(|b| b.join(guess))
                 .map(|u| u.to_string())
@@ -306,7 +389,9 @@ pub async fn discover(client: &HttpClient, input: &str) -> Result<Vec<DiscoverCa
                     let parsed = parse_feed(&b2)?;
                     cands.push(DiscoverCandidate {
                         url: normalize_url(&candidate),
-                        title: parsed.title.unwrap_or_else(|| host_of(&candidate).to_string()),
+                        title: parsed
+                            .title
+                            .unwrap_or_else(|| host_of(&candidate).to_string()),
                     });
                 }
             }
@@ -331,7 +416,11 @@ fn host_of(url: &str) -> String {
 
 fn looks_like_feed(bytes: &[u8]) -> bool {
     // ASCII-Kleinschreibung ist längenstabil; Unicode-Kleinschreibung ist es nicht.
-    let head: Vec<u8> = bytes.iter().take(2048).map(|b| b.to_ascii_lowercase()).collect();
+    let head: Vec<u8> = bytes
+        .iter()
+        .take(2048)
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
     let head = String::from_utf8_lossy(&head);
     head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf")
 }
@@ -360,7 +449,9 @@ fn extract_alternate_links(html: &str) -> Vec<(String, String)> {
         ) {
             continue;
         }
-        let Some(href) = value.attr("href") else { continue };
+        let Some(href) = value.attr("href") else {
+            continue;
+        };
         let href = href.trim();
         if href.is_empty() {
             continue;
@@ -428,7 +519,11 @@ mod tests {
         assert_eq!(f.items[0].identity, "item-1");
         assert_eq!(f.items[0].title, "Erster & Co");
         assert!(f.items[0].published_ms.is_some());
-        assert!(f.items[0].content_html.as_deref().unwrap().contains("Volltext"));
+        assert!(f.items[0]
+            .content_html
+            .as_deref()
+            .unwrap()
+            .contains("Volltext"));
         assert!(
             !f.items[1].identity.is_empty() && !f.items[1].identity.contains('#'),
             "Identität ohne Fragment: {}",
@@ -440,7 +535,10 @@ mod tests {
     fn parse_atom_fields() {
         let f = parse_feed(ATOM.as_bytes()).unwrap();
         assert_eq!(f.items[0].identity, "urn:uuid:1234");
-        assert_eq!(f.items[0].url.as_deref(), Some("https://example.com/atom/1"));
+        assert_eq!(
+            f.items[0].url.as_deref(),
+            Some("https://example.com/atom/1")
+        );
         assert!(f.items[0].published_ms.is_some());
     }
 
@@ -456,7 +554,10 @@ mod tests {
 
     #[test]
     fn normalize_url_rules() {
-        assert_eq!(normalize_url("https://Example.com:443/a/"), "https://example.com/a/");
+        assert_eq!(
+            normalize_url("https://Example.com:443/a/"),
+            "https://example.com/a/"
+        );
         assert_eq!(normalize_url("http://x.de:80/p"), "http://x.de/p");
         assert_eq!(normalize_url("https://x.de/p#sec"), "https://x.de/p");
         assert_eq!(normalize_url("https://x.de/P/"), "https://x.de/P/");
@@ -484,9 +585,15 @@ mod tests {
         let cands = extract_alternate_links(html);
         assert_eq!(cands.len(), 1, "nur https bleibt: {cands:?}");
         assert_eq!(cands[0].0, "https://ok.example/f.xml");
-        assert!(!looks_like_feed(b"<?xml version=\"1.0\"?><html><body>kein Feed</body></html>"));
-        assert!(looks_like_feed(b"<?xml version=\"1.0\"?><rss version=\"2.0\"></rss>"));
-        assert!(looks_like_feed("<feed xmlns=\"http://www.w3.org/2005/Atom\">".as_bytes()));
+        assert!(!looks_like_feed(
+            b"<?xml version=\"1.0\"?><html><body>kein Feed</body></html>"
+        ));
+        assert!(looks_like_feed(
+            b"<?xml version=\"1.0\"?><rss version=\"2.0\"></rss>"
+        ));
+        assert!(looks_like_feed(
+            "<feed xmlns=\"http://www.w3.org/2005/Atom\">".as_bytes()
+        ));
     }
 
     #[tokio::test]
@@ -504,7 +611,9 @@ mod tests {
                 let _ = s.write_all(head.as_bytes());
                 let block = vec![b'a'; 64 * 1024];
                 for _ in 0..400 {
-                    if s.write_all(format!("{:x}\r\n", block.len()).as_bytes()).is_err() {
+                    if s.write_all(format!("{:x}\r\n", block.len()).as_bytes())
+                        .is_err()
+                    {
                         return;
                     }
                     if s.write_all(&block).is_err() {
@@ -527,15 +636,138 @@ mod tests {
 
     #[tokio::test]
     async fn private_targets_are_rejected_before_any_request() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
         let client = HttpClient::new();
+        let url = format!("http://{addr}/feed.xml");
         assert!(matches!(
-            client.fetch_feed("http://127.0.0.1:9/feed.xml", None, None).await,
+            client.fetch_feed(&url, None, None).await,
             Err(ProviderError::Blocked(_))
         ));
         assert!(matches!(
-            client.fetch_raw("http://169.254.169.254/latest").await,
+            client.fetch_raw(&url).await,
             Err(ProviderError::Blocked(_))
         ));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "der lokale Mock darf überhaupt keinen Request erhalten"
+        );
+    }
+
+    #[tokio::test]
+    async fn weiterleitung_auf_ungueltiges_ziel_wird_vor_dem_request_geprueft() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let ziel = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ziel_addr = ziel.local_addr().unwrap();
+        let ziel_hits = Arc::new(AtomicUsize::new(0));
+        let ziel_counter = ziel_hits.clone();
+        std::thread::spawn(move || {
+            for stream in ziel.incoming() {
+                ziel_counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        let quelle = TcpListener::bind("127.0.0.1:0").unwrap();
+        let quelle_addr = quelle.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in quelle.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let location = format!("http://{ziel_addr}/ziel");
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes());
+            }
+        });
+        // Nur die Quell-Origin ist bewusst freigegeben, das Weiterleitungsziel nicht.
+        let client = HttpClient::new().with_trusted_origin(&format!("http://{quelle_addr}"));
+        let url = format!("http://{quelle_addr}/start");
+        let res = client.fetch_raw(&url).await;
+        assert!(
+            matches!(res, Err(ProviderError::Blocked(_))),
+            "Weiterleitungsziel muss abgewiesen werden: {res:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            ziel_hits.load(Ordering::SeqCst),
+            0,
+            "das Weiterleitungsziel erhält keinen Request"
+        );
+    }
+
+    #[tokio::test]
+    async fn erlaubte_weiterleitung_wird_verfolgt() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let ziel = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ziel_addr = ziel.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in ziel.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        let quelle = TcpListener::bind("127.0.0.1:0").unwrap();
+        let quelle_addr = quelle.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in quelle.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let location = format!("http://{ziel_addr}/ziel");
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes());
+            }
+        });
+        let client = HttpClient::new()
+            .with_trusted_origin(&format!("http://{quelle_addr}"))
+            .with_trusted_origin(&format!("http://{ziel_addr}"));
+        let url = format!("http://{quelle_addr}/start");
+        let (final_url, body) = client.fetch_raw(&url).await.unwrap();
+        assert_eq!(body, b"ok");
+        assert!(final_url.contains(&format!("{ziel_addr}")));
+    }
+
+    #[tokio::test]
+    async fn resolver_liefert_keine_gesperrten_adressen() {
+        use reqwest::dns::Resolve as _;
+        use std::str::FromStr;
+        let resolver = netpolicy::PolicyResolver::new(vec!["http://127.0.0.1:8080".to_string()]);
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let outcome = resolver.resolve(name).await;
+        assert!(
+            outcome.is_err(),
+            "localhost liefert keine freigegebenen Adressen, sondern einen Fehler"
+        );
     }
 
     #[tokio::test]
@@ -575,9 +807,16 @@ mod tests {
             FetchOutcome::Fetched { etag, .. } => assert_eq!(etag.as_deref(), Some(r#""v1""#)),
             _ => panic!("erwartete Fetched"),
         }
-        match client.fetch_feed(&url, Some(r#""v1""#), None).await.unwrap() {
+        match client
+            .fetch_feed(&url, Some(r#""v1""#), None)
+            .await
+            .unwrap()
+        {
             FetchOutcome::NotModified => {}
-            _ => panic!("erwartete NotModified, Request war: {}", std::fs::read_to_string("/tmp/mock-req.log").unwrap_or_default()),
+            _ => panic!(
+                "erwartete NotModified, Request war: {}",
+                std::fs::read_to_string("/tmp/mock-req.log").unwrap_or_default()
+            ),
         }
     }
 }

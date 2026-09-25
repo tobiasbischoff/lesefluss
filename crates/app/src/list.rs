@@ -17,7 +17,11 @@ pub struct RowHandles {
 fn meta_markup(a: &ArticleRow) -> String {
     format!(
         "<span weight=\"bold\" foreground=\"{}\">{}</span><span> · {}</span>",
-        if a.unread { a.accent.clone() } else { "#8a8d96".into() },
+        if a.unread {
+            a.accent.clone()
+        } else {
+            "#8a8d96".into()
+        },
         glib::markup_escape_text(&a.feed_title),
         fmt_time(a.published_ms)
     )
@@ -31,7 +35,11 @@ impl RowHandles {
             "lf-article-title-read"
         }]);
         self.meta.set_markup(&meta_markup(a));
-        self.meta.set_css_classes(&[if a.unread { "lf-article-meta" } else { "lf-article-meta-read" }]);
+        self.meta.set_css_classes(&[if a.unread {
+            "lf-article-meta"
+        } else {
+            "lf-article-meta-read"
+        }]);
         self.excerpt.set_css_classes(&[if a.unread {
             "lf-article-excerpt"
         } else {
@@ -48,7 +56,10 @@ pub struct RowCell {
 
 impl RowCell {
     pub fn new(a: ArticleRow) -> Self {
-        Self { data: RefCell::new(a), bound: RefCell::new(Vec::new()) }
+        Self {
+            data: RefCell::new(a),
+            bound: RefCell::new(Vec::new()),
+        }
     }
 
     pub fn article(&self) -> ArticleRow {
@@ -116,7 +127,9 @@ pub fn unregister(row: &ListRow, widget: &gtk::Widget) {
 fn data_uri_texture(data: &str) -> Option<gtk::gdk::Texture> {
     use base64::Engine;
     let payload = data.strip_prefix("data:image/png;base64,")?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
     gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
 }
 
@@ -156,7 +169,11 @@ fn article_row(a: &ArticleRow, thumbs: bool) -> (gtk::Box, RowHandles) {
     let meta = gtk::Label::builder()
         .use_markup(true)
         .label(&meta_markup(a))
-        .css_classes(vec![if a.unread { "lf-article-meta".to_string() } else { "lf-article-meta-read".to_string() }])
+        .css_classes(vec![if a.unread {
+            "lf-article-meta".to_string()
+        } else {
+            "lf-article-meta-read".to_string()
+        }])
         .ellipsize(pango::EllipsizeMode::End)
         .xalign(0.0)
         .hexpand(true)

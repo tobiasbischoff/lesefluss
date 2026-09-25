@@ -9,7 +9,11 @@ pub struct ReaderStyleState {
 
 impl Default for ReaderStyleState {
     fn default() -> Self {
-        Self { font_size: 18.0, measure_ch: 68, line_height: 1.6 }
+        Self {
+            font_size: 18.0,
+            measure_ch: 68,
+            line_height: 1.6,
+        }
     }
 }
 

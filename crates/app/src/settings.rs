@@ -1,31 +1,82 @@
 //! Einstellungen als eigenes Modul: Seiten, Bedienelemente und Persistenz (§16).
 
-use crate::window::{status_label, App};
+use crate::window::{data_dir, status_label, App};
 use adw::prelude::*;
-use gtk::prelude::*;
-use std::rc::Rc;
+use std::time::Duration;
 
 impl App {
     pub fn settings_dialog(&self) {
-        let win = adw::PreferencesWindow::builder().modal(true).transient_for(&self.window).build();
+        let win = adw::PreferencesWindow::builder()
+            .modal(true)
+            .transient_for(&self.window)
+            .build();
         let p = self.prefs.borrow().clone();
 
-        let page_read = adw::PreferencesPage::builder().title("Lesen").icon_name("text-x-generic-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Leseverhalten").build();
-        let auto = adw::SwitchRow::builder().title("Automatisch als gelesen markieren").subtitle("Nach 0,8 s sichtbarem Artikel").active(p.auto_read).build();
+        let page_read = adw::PreferencesPage::builder()
+            .title("Lesen")
+            .icon_name("text-x-generic-symbolic")
+            .build();
+        let grp = adw::PreferencesGroup::builder()
+            .title("Leseverhalten")
+            .build();
+        let auto = adw::SwitchRow::builder()
+            .title("Automatisch als gelesen markieren")
+            .subtitle("Nach 0,8 s sichtbarem Artikel")
+            .active(p.auto_read)
+            .build();
         grp.add(&auto);
-        let font = adw::SpinRow::builder().title("Schriftgröße Reader").adjustment(&gtk::Adjustment::new(p.reader_font, 14.0, 28.0, 1.0, 2.0, 0.0)).build();
+        let font = adw::SpinRow::builder()
+            .title("Schriftgröße Reader")
+            .adjustment(&gtk::Adjustment::new(
+                p.reader_font,
+                14.0,
+                28.0,
+                1.0,
+                2.0,
+                0.0,
+            ))
+            .build();
         grp.add(&font);
-        let measure = adw::SpinRow::builder().title("Zeilenbreite (Zeichen)").adjustment(&gtk::Adjustment::new(p.reader_measure as f64, 55.0, 85.0, 1.0, 5.0, 0.0)).build();
+        let measure = adw::SpinRow::builder()
+            .title("Zeilenbreite (Zeichen)")
+            .adjustment(&gtk::Adjustment::new(
+                p.reader_measure as f64,
+                55.0,
+                85.0,
+                1.0,
+                5.0,
+                0.0,
+            ))
+            .build();
         grp.add(&measure);
-        let lh = adw::SpinRow::builder().title("Zeilenhöhe").adjustment(&gtk::Adjustment::new(p.reader_line_height, 1.4, 2.0, 0.05, 0.1, 0.0)).build();
+        let lh = adw::SpinRow::builder()
+            .title("Zeilenhöhe")
+            .adjustment(&gtk::Adjustment::new(
+                p.reader_line_height,
+                1.4,
+                2.0,
+                0.05,
+                0.1,
+                0.0,
+            ))
+            .build();
         grp.add(&lh);
         page_read.add(&grp);
         win.add(&page_read);
 
-        let page_view = adw::PreferencesPage::builder().title("Darstellung").icon_name("preferences-desktop-appearance-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Erscheinungsbild").build();
-        let theme = adw::ComboRow::builder().title("Theme").model(&gtk::StringList::new(&["system", "dark", "light", "omarchy"])).build();
+        let page_view = adw::PreferencesPage::builder()
+            .title("Darstellung")
+            .icon_name("preferences-desktop-appearance-symbolic")
+            .build();
+        let grp = adw::PreferencesGroup::builder()
+            .title("Erscheinungsbild")
+            .build();
+        let theme = adw::ComboRow::builder()
+            .title("Theme")
+            .model(&gtk::StringList::new(&[
+                "system", "dark", "light", "omarchy",
+            ]))
+            .build();
         let idx = match p.theme.as_str() {
             "dark" => 1,
             "light" => 2,
@@ -34,11 +85,26 @@ impl App {
         };
         theme.set_selected(idx);
         grp.add(&theme);
-        let compact = adw::SwitchRow::builder().title("Kompakte Liste").active(p.compact).build();
+        let compact = adw::SwitchRow::builder()
+            .title("Kompakte Liste")
+            .active(p.compact)
+            .build();
         grp.add(&compact);
-        let thumbs = adw::SwitchRow::builder().title("Bildvorschauen in der Liste").active(p.thumbs).build();
+        let block_images = adw::SwitchRow::builder()
+            .title("Externe Bilder blockieren")
+            .subtitle("Keine Bilder nachladen; nur Platzhalter mit Bildbeschreibung")
+            .active(p.block_images)
+            .build();
+        grp.add(&block_images);
+        let thumbs = adw::SwitchRow::builder()
+            .title("Bildvorschauen in der Liste")
+            .active(p.thumbs)
+            .build();
         grp.add(&thumbs);
-        let letters = adw::SwitchRow::builder().title("Buchstabenkürzel (j/k/n/p/m/s/o)").active(p.letter_shortcuts).build();
+        let letters = adw::SwitchRow::builder()
+            .title("Buchstabenkürzel (j/k/n/p/m/s/o)")
+            .active(p.letter_shortcuts)
+            .build();
         grp.add(&letters);
         let order = adw::ComboRow::builder()
             .title("Reihenfolge")
@@ -50,25 +116,134 @@ impl App {
         page_view.add(&grp);
         win.add(&page_view);
 
-        let page_sync = adw::PreferencesPage::builder().title("Aktualisierung").icon_name("view-refresh-symbolic").build();
+        let page_sync = adw::PreferencesPage::builder()
+            .title("Aktualisierung")
+            .icon_name("view-refresh-symbolic")
+            .build();
         let grp = adw::PreferencesGroup::builder().title("Abruf").build();
-        let refresh = adw::SpinRow::builder().title("Intervall (Minuten)").adjustment(&gtk::Adjustment::new(p.refresh_min as f64, 5.0, 1440.0, 5.0, 30.0, 0.0)).build();
+        let refresh = adw::SpinRow::builder()
+            .title("Intervall (Minuten)")
+            .adjustment(&gtk::Adjustment::new(
+                p.refresh_min as f64,
+                5.0,
+                1440.0,
+                5.0,
+                30.0,
+                0.0,
+            ))
+            .build();
         grp.add(&refresh);
         page_sync.add(&grp);
         win.add(&page_sync);
 
-        let page_store = adw::PreferencesPage::builder().title("Speicher & Datenschutz").icon_name("drive-harddisk-symbolic").build();
-        let grp = adw::PreferencesGroup::builder().title("Aufbewahrung").build();
-        let retention = adw::SpinRow::builder().title("Gelesene Inhalte behalten (Tage)").subtitle("Danach Bereinigung; Gespeicherte bleiben").adjustment(&gtk::Adjustment::new(p.retention_days as f64, 7.0, 3650.0, 1.0, 30.0, 0.0)).build();
+        let page_store = adw::PreferencesPage::builder()
+            .title("Speicher & Datenschutz")
+            .icon_name("drive-harddisk-symbolic")
+            .build();
+        let grp = adw::PreferencesGroup::builder()
+            .title("Aufbewahrung")
+            .build();
+        let retention = adw::SpinRow::builder()
+            .title("Gelesene Inhalte behalten (Tage)")
+            .subtitle("Danach Bereinigung; Gespeicherte bleiben")
+            .adjustment(&gtk::Adjustment::new(
+                p.retention_days as f64,
+                7.0,
+                3650.0,
+                1.0,
+                30.0,
+                0.0,
+            ))
+            .build();
         grp.add(&retention);
-        let media = adw::SpinRow::builder().title("Bildcache (MiB)").adjustment(&gtk::Adjustment::new(p.media_mb as f64, 64.0, 4096.0, 64.0, 256.0, 0.0)).build();
+        let media = adw::SpinRow::builder()
+            .title("Bildcache (MiB)")
+            .adjustment(&gtk::Adjustment::new(
+                p.media_mb as f64,
+                64.0,
+                4096.0,
+                64.0,
+                256.0,
+                0.0,
+            ))
+            .build();
         grp.add(&media);
+
+        // Speicherübersicht: Datenbank, Bildcache und gepinnte Dateien getrennt.
+        let db_row = adw::ActionRow::builder()
+            .title("Datenbank")
+            .subtitle("wird berechnet …")
+            .build();
+        let cache_row = adw::ActionRow::builder()
+            .title("Bildcache")
+            .subtitle("wird berechnet …")
+            .build();
+        let pinned_row = adw::ActionRow::builder()
+            .title("Gepinnte Bilder (gespeicherte Artikel)")
+            .subtitle("werden nie automatisch gelöscht")
+            .build();
+        let grp_usage = adw::PreferencesGroup::builder()
+            .title("Belegung")
+            .description("Getrennt nach Datenbank, Cache und geschützten Dateien")
+            .build();
+        grp_usage.add(&db_row);
+        grp_usage.add(&cache_row);
+        grp_usage.add(&pinned_row);
+        page_store.add(&grp_usage);
+        {
+            let pinned_row = pinned_row.clone();
+            let cache = std::sync::Arc::clone(&self.media);
+            self.db_query(
+                move |db| {
+                    let pinned = db.pinned_media_urls()?;
+                    let pinned_bytes: i64 = pinned
+                        .iter()
+                        .filter_map(|u| {
+                            std::fs::metadata(cache.path_for(u))
+                                .ok()
+                                .and_then(|m| i64::try_from(m.len()).ok())
+                        })
+                        .sum();
+                    Ok::<_, storage::StorageError>((pinned.len() as i64, pinned_bytes))
+                },
+                move |_app, res| {
+                    if let Ok((count, bytes)) = res {
+                        pinned_row.set_subtitle(&format!("{count} Dateien · {} KiB", bytes / 1024));
+                    }
+                },
+            );
+        }
+        glib::timeout_add_local_once(Duration::from_millis(50), {
+            let db_row = db_row.clone();
+            let cache_row = cache_row.clone();
+            let cache = std::sync::Arc::clone(&self.media);
+            move || {
+                let db_bytes = std::fs::metadata(data_dir().join("library.db"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let db_wal = std::fs::metadata(data_dir().join("library.db-wal"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                db_row.set_subtitle(&format!(
+                    "{} MiB (+ {} KiB WAL)",
+                    (db_bytes + db_wal) / (1024 * 1024),
+                    db_wal / 1024
+                ));
+                cache_row.set_subtitle(&format!("{} MiB", cache.total_bytes() / (1024 * 1024)));
+            }
+        });
         page_store.add(&grp);
         win.add(&page_store);
 
-        let page_acc = adw::PreferencesPage::builder().title("Konten").icon_name("system-users-symbolic").build();
+        let page_acc = adw::PreferencesPage::builder()
+            .title("Konten")
+            .icon_name("system-users-symbolic")
+            .build();
         let grp = adw::PreferencesGroup::builder().title("Konten").build();
-        let local = adw::ActionRow::builder().title("Lokale Bibliothek").subtitle("Aktiv — Feeds, OPML, Suche, Offline").build();
+        let local = adw::ActionRow::builder()
+            .title("Lokale Bibliothek")
+            .subtitle("Aktiv — Feeds, OPML, Suche, Offline")
+            .build();
         grp.add(&local);
         let feedly_state = {
             let st = self.state.borrow();
@@ -100,7 +275,10 @@ impl App {
                 }
             }
         };
-        let feedly = adw::ActionRow::builder().title("Feedly").subtitle(feedly_state).build();
+        let feedly = adw::ActionRow::builder()
+            .title("Feedly")
+            .subtitle(feedly_state)
+            .build();
         grp.add(&feedly);
         page_acc.add(&grp);
         win.add(&page_acc);
@@ -157,6 +335,15 @@ impl App {
                 app.prefs.borrow_mut().compact = row.is_active();
                 app.save_pref("compact", if row.is_active() { "1" } else { "0" });
                 app.apply_prefs_live();
+            }
+        });
+        let w = self.weak();
+        let w = self.weak();
+        block_images.connect_active_notify(move |row| {
+            if let Some(app) = w.upgrade() {
+                app.prefs.borrow_mut().block_images = row.is_active();
+                app.save_pref("block_images", if row.is_active() { "1" } else { "0" });
+                app.reload_current(false);
             }
         });
         let w = self.weak();

@@ -18,13 +18,17 @@ pub struct DbWorker {
 
 impl Clone for DbWorker {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), failure: self.failure.clone() }
+        Self {
+            tx: self.tx.clone(),
+            failure: self.failure.clone(),
+        }
     }
 }
 
 impl DbWorker {
     pub fn start(path: PathBuf) -> Self {
-        let (tx, rx): (std::sync::mpsc::Sender<Envelope>, Receiver<Envelope>) = std::sync::mpsc::channel();
+        let (tx, rx): (std::sync::mpsc::Sender<Envelope>, Receiver<Envelope>) =
+            std::sync::mpsc::channel();
         let failure: std::sync::Arc<std::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let failure_thread = failure.clone();

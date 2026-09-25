@@ -12,6 +12,8 @@ pub struct Prefs {
     pub refresh_min: i64,
     pub retention_days: i64,
     pub media_mb: i64,
+    /// Externe Bilder werden nicht geladen; nur Platzhalter erscheinen.
+    pub block_images: bool,
 }
 
 impl Default for Prefs {
@@ -29,6 +31,7 @@ impl Default for Prefs {
             refresh_min: 15,
             retention_days: 90,
             media_mb: 512,
+            block_images: false,
         }
     }
 }
@@ -92,6 +95,9 @@ impl Prefs {
                 p.retention_days = f;
             }
         }
+        if let Some(v) = get("block_images") {
+            p.block_images = v != "0";
+        }
         if let Some(v) = get("media_mb") {
             if let Ok(f) = v.parse() {
                 p.media_mb = f;
@@ -109,9 +115,13 @@ impl Prefs {
         set("reader_line_height", &self.reader_line_height.to_string());
         set("theme", &self.theme);
         set("newest_first", if self.newest_first { "1" } else { "0" });
-        set("letter_shortcuts", if self.letter_shortcuts { "1" } else { "0" });
+        set(
+            "letter_shortcuts",
+            if self.letter_shortcuts { "1" } else { "0" },
+        );
         set("refresh_min", &self.refresh_min.to_string());
         set("retention_days", &self.retention_days.to_string());
         set("media_mb", &self.media_mb.to_string());
+        set("block_images", if self.block_images { "1" } else { "0" });
     }
 }

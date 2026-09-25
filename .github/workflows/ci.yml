@@ -6,18 +6,31 @@ on:
 
 jobs:
   test:
-    name: Test und Clippy (Linux)
+    name: Test und Clippy (Arch)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
       - uses: actions/checkout@v4
+      # GTK4, libadwaita, WebKitGTK 6 und die Header der Systembibliotheken werden
+      # von pkg-config zur Übersetzungszeit gebraucht; ohne sie kann cargo nicht bauen.
       - name: Abhängigkeiten
         run: |
           pacman -Syu --noconfirm --needed git
+          pacman -S --noconfirm --needed \
+            gtk4 libadwaita webkitgtk-6.0 \
+            glib2-devel pango cairo gdk-pixbuf2 atk at-spi2-atk \
+            libx11 libxext libxrender libxi libxcursor libxdamage libxfixes libxrandr \
+            wayland wayland-protocols libxkbcommon \
+            sqlite libsecret openssl
           sed -i 's/^#\?\(MAKEFLAGS\).*/\1="-j$(nproc)"/' /etc/makepkg.conf
-      - name: Rust-Werkzeuge
-        uses: dtolnay/rust-toolchain@stable
+      - name: Werkzeugketten prüfen
+        run: |
+          pkg-config --exists gtk4 && echo "gtk4 ok"
+          pkg-config --exists libadwaita-1 && echo "libadwaita ok"
+          pkg-config --exists webkit6gtk-4.1 && echo "webkitgtk-6.0 ok"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Bauen
         run: cargo build --workspace --locked
@@ -27,3 +40,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked
       - name: Formatierung
         run: cargo fmt --all -- --check
+      - name: Installationspaket
+        run: |
+          cd packaging
+          makepkg -f --noconfirm --nodeps
+          ls -l ./*.pkg.tar.zst

@@ -7,7 +7,11 @@ pub struct Color {
 
 impl Color {
     const fn hex(v: u32) -> Self {
-        Self { r: ((v >> 16) & 0xFF) as u8, g: ((v >> 8) & 0xFF) as u8, b: (v & 0xFF) as u8 }
+        Self {
+            r: ((v >> 16) & 0xFF) as u8,
+            g: ((v >> 8) & 0xFF) as u8,
+            b: (v & 0xFF) as u8,
+        }
     }
     pub fn css(self) -> String {
         format!("#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
@@ -79,7 +83,10 @@ impl Tokens {
             format!("none, {}", self.surface_list.css())
         };
         let sidebar_bg_decl = if sidebar_gradient {
-            format!("background-image: {}; background-color: transparent;", sidebar_bg)
+            format!(
+                "background-image: {}; background-color: transparent;",
+                sidebar_bg
+            )
         } else {
             format!("background-color: {};", self.surface_list.css())
         };
@@ -128,7 +135,7 @@ searchbar > revealer > box {{ background-color: {sl}; border-color: {sep}; box-s
             tp = self.text_primary.css(),
             ts = self.text_secondary.css(),
             ts2 = self.text_secondary.rgba(0.9),
-                        sep = self.separator.css(),
+            sep = self.separator.css(),
             sep2 = self.separator.rgba(0.55),
             sel = self.selection.css(),
             ac = self.accent.css(),

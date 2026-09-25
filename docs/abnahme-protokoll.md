@@ -1,6 +1,8 @@
 # Abnahmeprotokoll
 
-**Stand:** 24.09.2026 · Build: `cargo build --release --locked` · Commits bis `e76802c`
+**Stand:** 25.09.2026 · Build: `cargo build --release --locked` · Feedly-Statuszeilen dieses
+Tages nachträglich als offen gekennzeichnet (R1); Messwerte vom 24.09.2026 stammen aus
+dem Commit `e76802c` und sind seither nicht neu gemessen
 **Referenzmaschine:** Intel Core 5 320, 15 GiB RAM, Omarchy/Hyprland, 2560×1600 @ 60 Hz,
 Skalierung 1.667, GTK 4, WebKitGTK 6.
 
@@ -11,9 +13,10 @@ nicht „vermutlich in Ordnung“.
 
 | Fall | Soll | Ist | Beleg | Status |
 |---|---|---|---|---|
-| Testsuite | alle grün | 15 Suiten / 82 Tests grün | `cargo test --workspace --locked` | erfüllt |
+| Testsuite | alle grün | 15 Suiten / 139 Tests grün (2026-09-25: Restore/WAL-Recovery, Netzwerkpolicy mit Mock-Nachweis, Tokenpfad, Identität/Paging, Reader-JS via `node --check`, Cache-Pins/Dedupe, Undo/Redo, Sync-Mocks, Outbox-Revisionen, Coordinator) | `cargo test --workspace` | erfüllt |
 | Clippy | keine Fehler | 0 Fehler, 24 Warnungen (Typkomplexität, ungenutzte Hilfsmethoden) | `cargo clippy --workspace --all-targets --locked` | erfüllt mit Vorbehalt |
-| Formatierung | einheitlich | neue Dateien formatiert, Bestand uneinheitlich (kein `rustfmt.toml`) | `cargo fmt --all -- --check` | teilweise |
+| Formatierung | einheitlich | `cargo fmt --all -- --check` besteht seit 2026-09-25 (Bestand nachformatiert) | `cargo fmt --all -- --check` | erfüllt |
+| Paketbau | Arch-Paket aus dem Repository | `makepkg -f --noconfirm --nodeps` erzeugt 5,3 MiB (`lesefluss-git-0.1.0-2`); CI-Job installiert jetzt die GTK-/Adwaita-/WebKitGTK-Buildabhängigkeiten und prüft sie mit `pkg-config` | `packaging/PKGBUILD`, `.github/workflows/ci.yml` | erfüllt (CI-Lauf auf GitHub steht aus) |
 | Reproduzierbarkeit | feste Werkzeuge | `rust-toolchain.toml` (stable + rustfmt/clippy), Lockfile eingecheckt, CI-Workflow (Arch-Container) | `.github/workflows/ci.yml` | erfüllt |
 | Identität/Kontogrenzen | keine kontoübergreifende Wirkung | Tests: `identity_is_account_and_article_id`, `remote_status_updates_stay_inside_the_account`, `remote_pull_never_touches_local_articles` | `cargo test -p storage` | erfüllt |
 | Konflikte nach ACK | jüngere Absicht gewinnt | Test `stale_pull_cannot_overwrite_a_confirmed_local_intent` | dito | erfüllt |
@@ -45,8 +48,8 @@ Details und Rohwerte: `docs/perf-report.md`.
 
 | Fall | Soll | Ist | Status |
 |---|---|---|---|
-| Feedly zwei Richtungen | Read/Unread und Saved/Unsaved je Richtung | live verifiziert (Marker-Write bestätigt, Saved-Stream antwortet 200) | erfüllt |
-| Feedly Delta-Sync | wiederkehrender Abgleich | läuft im Betrieb (Watermark wird fortgeschrieben) | erfüllt |
+| Feedly zwei Richtungen | Read/Unread und Saved/Unsaved je Richtung | Die älteren Läufe sind keine Nachweise (R1: der Stream-Pager lud keine Seite). Seit 2026-09-25 automatisiert abgesichert: 12 App-Pfad-Tests gegen einen Mockserver mit echter DB (Paginierung, Saved-/Unread-Abgleich, Nachladen, Bestätigung), 8 Provider-Tests, 8 Coordinator-Tests. Eine Live-Abnahme steht aus | **offen** (X2) |
+| Feedly Delta-Sync | wiederkehrender Abgleich | Phasen laufen über `fetch_stream_inventory`/`fetch_id_inventory`, Abbrüche propagieren, Watermark = sicherer Checkpoint (Start/Serverstand). Koordination, Quotenpause, Auth-Stopp und Bestätigung per `.mget` sind implementiert und getestet; nicht live geprüft | **offen** (X2) |
 | Keyring | Token im Secret Service | `secret-tool lookup` liefert Token, Datei entfernt | erfüllt |
 | Outbox nach Neustart | Änderungen gehen raus | Outbox-Zeilen bleiben persistent, `outbox_reset_inflight` beim Start | erfüllt (Test), live nach Neustart bestätigt |
 | Dauerhafte Fehler | sichtbar, kein Massenwechsel | 404 → `status='failed'` + `unsynced`, Meldung an die Oberfläche | erfüllt |
