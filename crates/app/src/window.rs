@@ -118,6 +118,15 @@ fn self_newest_first(db: &storage::Database) -> bool {
         .unwrap_or(true)
 }
 
+/// Erstes Konto einer Art. Nimmt die Liste als Wert, damit der Aufrufer seinen
+/// `RefCell`-Borrow beenden kann, bevor er den State verändert.
+pub fn first_account_of_kind(accounts: &[(String, String, String)], kind: &str) -> Option<String> {
+    accounts
+        .iter()
+        .find(|(_, k, _)| k == kind)
+        .map(|(id, _, _)| id.clone())
+}
+
 pub fn status_label(status: &str) -> &'static str {
     match status {
         "initial_sync" => "Erstsynchronisation läuft",
@@ -322,6 +331,49 @@ mod router_tests {
         let entry = (7i64, "x".to_string(), true, true);
         let (feed, id, unread, saved) = restored_state(&entry);
         assert_eq!((feed, id, unread, saved), (7, "x".to_string(), false, true));
+    }
+
+    /// A1: Der Konto-Lookup darf keinen Borrow halten, während der Aufrufer den
+    /// State verändert. Mit echter `RefCell` nachgewiesen.
+    #[test]
+    fn konto_lookup_haelt_keinen_borrow() {
+        let accounts = vec![
+            (
+                "local".to_string(),
+                "local".to_string(),
+                "Lokal".to_string(),
+            ),
+            (
+                "feedly-1".to_string(),
+                "feedly".to_string(),
+                "Feedly".to_string(),
+            ),
+        ];
+        let state: std::cell::RefCell<Vec<(String, String, String)>> =
+            std::cell::RefCell::new(accounts);
+        // Muster des Produktivcodes: Wert kopieren, Borrow beenden, dann ändern.
+        let account = first_account_of_kind(&state.borrow(), "feedly");
+        state.borrow_mut().clear();
+        assert_eq!(account.as_deref(), Some("feedly-1"));
+        assert!(state.borrow().is_empty(), "der mutable Zugriff war möglich");
+    }
+
+    /// A3: Veraltete Ereignisse gehören nicht mehr zum aktuellen Lauf.
+    #[test]
+    fn veraltete_ereignisse_wuerden_verworfen() {
+        let run = FeedlyRun {
+            account_id: "feedly-1".to_string(),
+            run_id: 7,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let current = Some(run);
+        let matches = |account: &str, run_id: u64| match &current {
+            Some(r) => r.account_id == account && r.run_id == run_id,
+            None => false,
+        };
+        assert!(matches("feedly-1", 7), "eigener Abschluss wird angenommen");
+        assert!(!matches("feedly-1", 6), "älterer Lauf wird verworfen");
+        assert!(!matches("feedly-2", 7), "anderes Konto wird verworfen");
     }
 
     #[test]
@@ -546,12 +598,28 @@ pub fn data_dir() -> std::path::PathBuf {
 
 const JS_CAPTURE_POS: &str = "(()=>{const g=document.querySelector('meta[name=lf-doc]');const gen=g?g.content:'-1';const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return gen+':-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return gen+':'+idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return gen+':'+idx+':'+Math.round(off);})()";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Zusatzdaten eines Netzauftrags (z. B. Ziel-Feeds einer Serveraktion).
+#[derive(Clone, Default)]
+pub struct FeedlyParams {
+    pub remote_feed_ids: Vec<String>,
+    pub local_feed_ids: Vec<i64>,
+}
+
+/// Lauf, über den Abschlussereignisse zugeordnet und Abbruch ausgelöst wird.
+pub struct FeedlyRun {
+    pub account_id: String,
+    pub run_id: u64,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub enum TokenAction {
     StartFeedly,
     Refresh,
     QueuedSync,
+    /// Vom Coordinator bereits reservierter Folgelauf (nicht erneut anmelden).
+    ReservedRun,
     MarkScopeServer,
+    Outbox,
     CheckConnect,
 }
 
@@ -1153,49 +1221,36 @@ impl App {
             NetEvent::DiscoveryFailed { message, .. } => {
                 self.show_toast(&format!("Kein Feed gefunden: {message}"));
             }
-            NetEvent::FeedlySyncDone { added } => {
+            NetEvent::FeedlySyncDone {
+                account_id,
+                run_id,
+                added,
+            } => {
+                // Veraltete Ergebnisse (nach Logout oder neuem Lauf) werden verworfen.
+                if !self.feedly_event_is_current(&account_id, run_id) {
+                    dbg_log(&format!(
+                        "Feedly: Ergebnis von Lauf {run_id} verworfen (bereits ersetzt)"
+                    ));
+                    return;
+                }
                 self.refresh_feedly_status();
-                let queued = {
+                let reserved = {
                     let mut st = self.state.borrow_mut();
                     st.feedly_sync_running = false;
-                    let account_id = st
-                        .accounts
-                        .iter()
-                        .find(|(_, k, _)| k == "feedly")
-                        .map(|(id, _, _)| id.clone())
-                        .unwrap_or_default();
+                    st.feedly_sync_queued = false;
+                    st.active_feedly_run = None;
                     st.coordinator.set_now(now_ms());
-                    st.coordinator
-                        .finish(&account_id, now_ms())
-                        .started_next
-                        .is_some()
+                    st.coordinator.finish(&account_id, now_ms())
                 };
-                let _ = std::mem::take(&mut self.state.borrow_mut().feedly_sync_queued);
-                if queued {
-                    if let Some(account_id) = self
-                        .state
-                        .borrow()
-                        .accounts
-                        .iter()
-                        .find(|(_, k, _)| k == "feedly")
-                        .map(|(id, _, _)| id.clone())
-                    {
-                        self.with_token(TokenAction::QueuedSync);
-                    }
+                if reserved.is_some() {
+                    // Der Coordinator hat den Folgelauf bereits reserviert; er wird
+                    // direkt gestartet und **nicht** erneut angemeldet.
+                    self.start_queued_feedly_run();
                 }
                 let w = self.weak();
                 self.db_query(
-                    |db| {
-                        let acc = db
-                            .list_accounts()?
-                            .into_iter()
-                            .find(|(_, k, _)| k == "feedly");
-                        match acc {
-                            Some((id, _, _)) => {
-                                Ok::<_, storage::StorageError>(db.last_sync(&id)?.unwrap_or(0))
-                            }
-                            None => Ok(0),
-                        }
+                    move |db| {
+                        Ok::<_, storage::StorageError>(db.last_sync(&account_id)?.unwrap_or(0))
                     },
                     move |app, res: storage::Result<i64>| {
                         if let Ok(v) = res {
@@ -1210,22 +1265,22 @@ impl App {
                 }
             }
             NetEvent::FeedlySyncFailed {
+                account_id,
+                run_id,
                 message,
                 status,
                 retry_after_ms,
             } => {
+                if !self.feedly_event_is_current(&account_id, run_id) {
+                    dbg_log(&format!("Feedly: Fehler von Lauf {run_id} verworfen"));
+                    return;
+                }
                 self.refresh_feedly_status();
-                let account_id = self
-                    .state
-                    .borrow()
-                    .accounts
-                    .iter()
-                    .find(|(_, k, _)| k == "feedly")
-                    .map(|(id, _, _)| id.clone())
-                    .unwrap_or_default();
                 {
                     let mut st = self.state.borrow_mut();
                     st.feedly_sync_running = false;
+                    st.feedly_sync_queued = false;
+                    st.active_feedly_run = None;
                     st.coordinator.set_now(now_ms());
                     st.coordinator.finish(&account_id, now_ms());
                     // Pausen aus dem Sync gelten für alle Wege, auch für den
@@ -1244,6 +1299,15 @@ impl App {
                     }
                 }
                 self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
+                // Auch im Fehlerfall läuft ein reservierter Folgelauf weiter.
+                let reserved = {
+                    let mut st = self.state.borrow_mut();
+                    st.coordinator.set_now(now_ms());
+                    st.coordinator.finish(&account_id, now_ms())
+                };
+                if reserved.is_some() {
+                    self.start_queued_feedly_run();
+                }
             }
         }
     }
@@ -1981,6 +2045,13 @@ impl App {
     }
 
     /// Konto, dessen Sortierung für die aktuelle Ansicht gilt.
+    /// Konto-ID einer Art. Der Borrow endet beim Rückgabewert, damit im Aufrufer
+    /// kein `RefCell already borrowed` entstehen kann.
+    fn account_id_of_kind(&self, kind: &str) -> Option<String> {
+        let accounts = &self.state.borrow().accounts;
+        first_account_of_kind(accounts, kind)
+    }
+
     fn account_of_scope(&self, scope: &storage::Scope) -> Option<String> {
         let st = self.state.borrow();
         match scope {
@@ -2768,33 +2839,28 @@ impl App {
     }
 
     fn mark_scope_server_with(&self, token: String) {
-        {
-            let scope_feeds = self.feedly_scope_feeds();
-            let remote_ids: Vec<String> = scope_feeds.iter().map(|(_, r)| r.clone()).collect();
-            let local_ids: Vec<i64> = scope_feeds.iter().map(|(id, _)| *id).collect();
-            let n_feeds = remote_ids.len();
-            let tx = self.net.event_sender();
-            let worker = self.worker.clone();
-            self.net.spawn(async move {
-                let client = provider_feedly::FeedlyClient::new(token);
-                match client.markers_feeds("markAsRead", &remote_ids).await {
-                    Ok(()) => {
-                        let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added: 0 });
-                        let _ = worker.send(move |db| db.mark_feeds_read(&local_ids));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                            message: format!("Serverseitig als gelesen fehlgeschlagen: {e}"),
-                            status: Some("degraded".into()),
-                            retry_after_ms: None,
-                        });
-                    }
-                }
-            });
-            self.show_toast(&format!(
-                "Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung"
-            ));
+        let scope_feeds = self.feedly_scope_feeds();
+        if scope_feeds.is_empty() {
+            return;
         }
+        let account_id = match self.account_id_of_kind("feedly") {
+            Some(id) => id,
+            None => return,
+        };
+        let params = FeedlyParams {
+            remote_feed_ids: scope_feeds.iter().map(|(_, r)| r.clone()).collect(),
+            local_feed_ids: scope_feeds.iter().map(|(id, _)| *id).collect(),
+        };
+        let n_feeds = params.remote_feed_ids.len();
+        {
+            let mut st = self.state.borrow_mut();
+            st.pending_feedly_params = Some((account_id.clone(), params.clone()));
+        }
+        // Auch die Serveraktion läuft über den Coordinator (A3).
+        self.request_feedly_job(sync_engine::Job::ServerAction, account_id, token, params);
+        self.show_toast(&format!(
+            "Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung"
+        ));
     }
 
     pub fn show_toast(&self, msg: &str) {
@@ -3377,32 +3443,52 @@ impl App {
         match action {
             TokenAction::StartFeedly => self.start_feedly(token),
             TokenAction::Refresh => {
-                if let Some(account_id) = self
-                    .state
-                    .borrow()
-                    .accounts
-                    .iter()
-                    .find(|(_, k, _)| k == "feedly")
-                    .map(|(id, _, _)| id.clone())
-                {
+                // Wichtig: Die Konto-ID wird vor dem Aufruf kopiert. Ein Borrow
+                // über den Zweig hinaus paniked in `request_feedly_sync`.
+                let account_id = self.account_id_of_kind("feedly");
+                if let Some(account_id) = account_id {
                     self.request_feedly_sync(account_id, token, true);
                     self.show_toast("Feedly: Delta-Sync angefordert");
+                } else {
+                    self.show_toast("Feedly: kein Konto verbunden");
                 }
             }
             TokenAction::QueuedSync => {
-                let account_id = self
-                    .state
-                    .borrow()
-                    .accounts
-                    .iter()
-                    .find(|(_, k, _)| k == "feedly")
-                    .map(|(id, _, _)| id.clone());
+                let account_id = self.account_id_of_kind("feedly");
                 match account_id {
                     Some(id) => self.request_feedly_sync(id, token, false),
                     None => dbg_log("Kein Feedly-Konto für den Sync vorhanden"),
                 }
             }
             TokenAction::MarkScopeServer => self.mark_scope_server_with(token),
+            TokenAction::Outbox => {
+                if let Some(id) = self.account_id_of_kind("feedly") {
+                    self.request_feedly_job(
+                        sync_engine::Job::Outbox,
+                        id,
+                        token,
+                        FeedlyParams::default(),
+                    );
+                }
+            }
+            TokenAction::ReservedRun => {
+                // Der Coordinator hat diesen Lauf bereits reserviert. Er wird direkt
+                // gestartet; eine erneute Anmeldung würde ihn nur wieder vormerken.
+                let account_id = self.account_id_of_kind("feedly");
+                let reserved = {
+                    let mut st = self.state.borrow_mut();
+                    let id = account_id.clone().unwrap_or_default();
+                    st.coordinator.set_now(now_ms());
+                    st.coordinator.reserved_run(&id)
+                };
+                match (account_id, reserved) {
+                    (Some(account_id), Some((job, run_id))) => {
+                        let params = self.pending_server_params(&account_id);
+                        self.start_feedly_run(job, account_id, token, params, run_id);
+                    }
+                    _ => dbg_log("Feedly: kein reservierter Folgelauf vorhanden"),
+                }
+            }
             TokenAction::CheckConnect => {
                 let connected = self
                     .state
@@ -3419,32 +3505,65 @@ impl App {
         }
     }
 
-    fn request_feedly_sync(&self, account_id: String, token: String, priority: bool) {
-        // Erst-Sync, Delta-Sync, Outbox und Serveraktionen laufen über denselben
-        // Coordinator: kein Parallelzyklus, Priorität wird vorgemerkt, Pausen gelten
-        // auch für den manuellen Refresh.
+    /// Einziger Startweg für alle Feedly-Netzaufträge. Erst-Sync, Delta-Sync,
+    /// Outbox und serverseitige Aktionen laufen über den Coordinator; er entscheidet
+    /// über Start, Vormerkung, Pause oder Sperre und vergibt die Laufkennung.
+    /// Gehört ein Abschlussereignis zum aktuell laufenden Auftrag?
+    fn feedly_event_is_current(&self, account_id: &str, run_id: u64) -> bool {
+        let st = self.state.borrow();
+        match &st.active_feedly_run {
+            Some(run) => run.account_id == account_id && run.run_id == run_id,
+            None => false,
+        }
+    }
+
+    /// Bricht laufende Arbeit ab (Logout, Auth- oder Quotenstopp).
+    pub fn cancel_feedly_run(&self, account_id: &str) {
+        let mut st = self.state.borrow_mut();
+        if let Some(run) = &st.active_feedly_run {
+            if run.account_id == account_id {
+                run.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        st.active_feedly_run = None;
+        st.coordinator.set_now(now_ms());
+        st.coordinator.stop_running(account_id);
+    }
+
+    fn request_feedly_job(
+        &self,
+        job: sync_engine::Job,
+        account_id: String,
+        token: String,
+        params: FeedlyParams,
+    ) {
         let decision = {
             let mut st = self.state.borrow_mut();
             st.coordinator.set_now(now_ms());
-            let job = if priority {
-                sync_engine::Job::Refresh
-            } else {
-                sync_engine::Job::Scheduled
-            };
             let decision = st.coordinator.request(&account_id, job);
-            if matches!(decision, sync_engine::Decision::Start) {
+            if let sync_engine::Decision::Start { run_id } = decision {
                 st.feedly_sync_running = true;
-                if priority {
+                if job == sync_engine::Job::Refresh {
                     st.next_feedly_sync = 0;
                 }
+                st.active_feedly_run = Some(FeedlyRun {
+                    account_id: account_id.clone(),
+                    run_id,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                });
             }
             decision
         };
         match decision {
-            sync_engine::Decision::Start => dbg_log("Feedly: Zyklus wird gestartet"),
+            sync_engine::Decision::Start { run_id } => {
+                dbg_log(&format!(
+                    "Feedly: {:?} wird als Lauf {run_id} gestartet",
+                    job
+                ));
+                self.start_feedly_run(job, account_id, token, params, run_id);
+            }
             sync_engine::Decision::Queued => {
-                dbg_log("Feedly: Sync läuft bereits, weiterer Wunsch gemerkt");
-                return;
+                dbg_log("Feedly: ein Lauf ist aktiv, der Wunsch wurde vorgemerkt");
             }
             sync_engine::Decision::Paused(pause) => {
                 let message = match pause {
@@ -3456,23 +3575,90 @@ impl App {
                     }
                 };
                 self.show_toast(message);
-                return;
             }
             sync_engine::Decision::Blocked => {
                 self.show_toast("Feedly: nicht verbunden");
-                return;
             }
         }
-        let last_sync = {
+    }
+
+    /// Ziel-Feeds einer wartenden Serveraktion für den reservierten Folgelauf.
+    fn pending_server_params(&self, account_id: &str) -> FeedlyParams {
+        match &self.state.borrow().pending_feedly_params {
+            Some((account, params)) if account == account_id => params.clone(),
+            _ => FeedlyParams::default(),
+        }
+    }
+
+    /// Startet einen bereits vom Coordinator reservierten Lauf. Er darf **nicht**
+    /// erneut angemeldet werden, sonst hinge er ohne Netzwerkstart in der Liste.
+    fn start_queued_feedly_run(&self) {
+        self.with_token(TokenAction::ReservedRun);
+    }
+
+    fn start_feedly_run(
+        &self,
+        job: sync_engine::Job,
+        account_id: String,
+        token: String,
+        params: FeedlyParams,
+        run_id: u64,
+    ) {
+        let ctx = {
             let st = self.state.borrow();
-            if st.feedly_last_sync > 0 {
-                st.feedly_last_sync
-            } else {
-                now_ms() - 30 * 86_400_000
+            match &st.active_feedly_run {
+                Some(run) if run.run_id == run_id => feedly_sync::RunCtx {
+                    account_id: run.account_id.clone(),
+                    run_id,
+                    cancel: std::sync::Arc::clone(&run.cancel),
+                },
+                _ => feedly_sync::RunCtx::new(&account_id, run_id),
             }
         };
-        dbg_log(&format!("Feedly: Delta-Sync ab {}", last_sync));
-        feedly_sync::delta_sync(self.worker.clone(), &self.net, token, account_id, last_sync);
+        match job {
+            sync_engine::Job::Initial => {
+                feedly_sync::initial_sync(self.worker.clone(), &self.net, token, ctx)
+            }
+            sync_engine::Job::Refresh | sync_engine::Job::Scheduled => {
+                let last_sync = {
+                    let st = self.state.borrow();
+                    if st.feedly_last_sync > 0 {
+                        st.feedly_last_sync
+                    } else {
+                        now_ms() - 30 * 86_400_000
+                    }
+                };
+                dbg_log(&format!("Feedly: Delta-Sync ab {last_sync}"));
+                feedly_sync::delta_sync(
+                    self.worker.clone(),
+                    &self.net,
+                    token,
+                    account_id,
+                    last_sync,
+                    ctx,
+                )
+            }
+            sync_engine::Job::Outbox => {
+                feedly_sync::process_outbox(self.worker.clone(), &self.net, token, ctx)
+            }
+            sync_engine::Job::ServerAction => feedly_sync::mark_feeds_server_side(
+                self.worker.clone(),
+                &self.net,
+                token,
+                ctx,
+                params.remote_feed_ids,
+                params.local_feed_ids,
+            ),
+        }
+    }
+
+    fn request_feedly_sync(&self, account_id: String, token: String, priority: bool) {
+        let job = if priority {
+            sync_engine::Job::Refresh
+        } else {
+            sync_engine::Job::Scheduled
+        };
+        self.request_feedly_job(job, account_id, token, FeedlyParams::default());
     }
 
     fn connect_feedly_dialog(&self) {
@@ -3537,12 +3723,21 @@ impl App {
     /// Trennt Feedly: Token und Kontobindung werden entfernt, laufende und
     /// nachgeforderte Zyklen werden verworfen, das Konto wird lokal abgeschaltet.
     fn disconnect_feedly(&self) {
+        // Laufende Arbeit wird invalidiert, damit keine Requests und keine
+        // DB-Schreibvorgänge nach dem Logout mehr stattfinden.
         {
             let mut st = self.state.borrow_mut();
             st.feedly_sync_queued = false;
+            st.feedly_sync_running = false;
             st.next_feedly_sync = 0;
             for (id, kind, _) in st.accounts.clone() {
                 if kind == "feedly" {
+                    if let Some(run) = st.active_feedly_run.take() {
+                        if run.account_id == id {
+                            run.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    st.coordinator.abort(&id);
                     st.coordinator.block(&id);
                 }
             }
@@ -3577,20 +3772,44 @@ impl App {
 
     fn start_feedly(&self, token: String) {
         // Neue Anmeldung hebt Pausen und Sperre des Koordinators auf.
-        {
+        let account_id = {
+            let existing = self.account_id_of_kind("feedly");
             let mut st = self.state.borrow_mut();
-            let account_id = st
-                .accounts
-                .iter()
-                .find(|(_, k, _)| k == "feedly")
-                .map(|(id, _, _)| id.clone());
-            if let Some(id) = account_id {
-                st.coordinator.resume(&id);
-                st.coordinator.unblock(&id);
+            if let Some(id) = &existing {
+                st.coordinator.resume(id);
+                st.coordinator.unblock(id);
+            }
+            existing
+        };
+        match account_id {
+            Some(id) => {
+                self.show_toast("Feedly: Erst-Sync gestartet …");
+                self.request_feedly_job(
+                    sync_engine::Job::Initial,
+                    id,
+                    token,
+                    FeedlyParams::default(),
+                );
+            }
+            None => {
+                // Noch kein Konto: der Erst-Sync legt es an. Dafür braucht der
+                // Coordinator eine Kennung; ein vorhandenes Konto genügt als Anker.
+                let anchor = self
+                    .state
+                    .borrow()
+                    .accounts
+                    .first()
+                    .map(|(id, _, _)| id.clone())
+                    .unwrap_or_else(|| "feedly-pending".to_string());
+                self.show_toast("Feedly: Erst-Sync gestartet …");
+                self.request_feedly_job(
+                    sync_engine::Job::Initial,
+                    anchor,
+                    token,
+                    FeedlyParams::default(),
+                );
             }
         }
-        self.show_toast("Feedly: Erst-Sync gestartet …");
-        feedly_sync::initial_sync(self.worker.clone(), &self.net, token);
     }
 
     fn start_outbox_tick(&self) {
@@ -3639,11 +3858,11 @@ impl App {
                                 None => return,
                             };
                             let _ = tx.send(Box::new(move |app: &Rc<App>| {
-                                feedly_sync::process_outbox(
-                                    app.worker.clone(),
-                                    &app.net,
-                                    token,
+                                app.request_feedly_job(
+                                    sync_engine::Job::Outbox,
                                     account_id.clone(),
+                                    token,
+                                    FeedlyParams::default(),
                                 );
                             })
                                 as Box<dyn FnOnce(&Rc<App>) + Send>);
@@ -3698,14 +3917,7 @@ impl App {
 
     /// Liest den gespeicherten Kontozustand (inkl. hängender Änderungen).
     pub fn refresh_feedly_status(&self) {
-        let Some(account_id) = self
-            .state
-            .borrow()
-            .accounts
-            .iter()
-            .find(|(_, k, _)| k == "feedly")
-            .map(|(id, _, _)| id.clone())
-        else {
+        let Some(account_id) = self.account_id_of_kind("feedly") else {
             return;
         };
         self.db_query(

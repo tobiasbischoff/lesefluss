@@ -38,10 +38,16 @@ pub enum NetEvent {
         input: String,
         message: String,
     },
+    /// Ein Lauf meldet genau einen Abschluss. Konto und Laufkennung erlauben es,
+    /// veraltete Ergebnisse zu erkennen, wenn ein neuer Zyklus schon läuft.
     FeedlySyncDone {
+        account_id: String,
+        run_id: u64,
         added: usize,
     },
     FeedlySyncFailed {
+        account_id: String,
+        run_id: u64,
         message: String,
         /// Kontozustand laut Sync (`auth_required`, `rate_limited`, …), falls bekannt.
         status: Option<String>,

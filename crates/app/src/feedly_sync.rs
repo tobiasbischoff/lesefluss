@@ -2,6 +2,58 @@ use crate::dbworker::DbWorker;
 use crate::net::Net;
 use crate::window::dbg_log;
 use provider_feedly as pf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Kennzeichnet einen Lauf: Konto, Laufnummer und Abbruchmöglichkeit.
+#[derive(Clone)]
+pub struct RunCtx {
+    pub account_id: String,
+    pub run_id: u64,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl RunCtx {
+    pub fn new(account_id: &str, run_id: u64) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            run_id,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Nach Logout, Auth- oder Quotenstopp: keine weiteren Requests, keine
+    /// weiteren DB-Schreibvorgänge dieses Laufs.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+}
+
+/// Fehler eines Laufs mit strukturierter Steuerungsinformation.
+#[derive(Debug, Clone)]
+pub struct SyncFailure {
+    pub message: String,
+    pub status: Option<String>,
+    pub retry_after_ms: Option<i64>,
+}
+
+impl SyncFailure {
+    fn new(message: impl Into<String>, status: Option<&str>, retry_after_ms: Option<i64>) -> Self {
+        Self {
+            message: message.into(),
+            status: status.map(str::to_string),
+            retry_after_ms,
+        }
+    }
+}
+
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+pub type SyncResult<T> = Result<T, SyncFailure>;
 
 pub fn token_path() -> std::path::PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
@@ -338,7 +390,7 @@ pub async fn fetch_id_inventory(
     client: &pf::FeedlyClient,
     stream: &str,
     max_pages: usize,
-) -> Result<pf::Inventory, storage::StorageError> {
+) -> SyncResult<pf::Inventory> {
     let mut pager = pf::Pager::new();
     let mut continuation: Option<String> = None;
     let mut ids: Vec<String> = Vec::new();
@@ -372,7 +424,7 @@ pub async fn fetch_stream_inventory<F, Fut>(
     newer_than: Option<i64>,
     max_pages: usize,
     mut on_page: F,
-) -> Result<StreamSummary, storage::StorageError>
+) -> SyncResult<StreamSummary>
 where
     F: FnMut(Vec<pf::Entry>) -> Fut,
     Fut: std::future::Future<Output = Result<usize, String>>,
@@ -399,12 +451,16 @@ where
                 })
             }
             pf::PageAction::Aborted => {
-                return Err(storage::StorageError::Schema(format!(
-                    "Inhaltsabruf unvollständig: {}",
-                    pager
-                        .stopped_because
-                        .unwrap_or_else(|| "Abbruch ohne Angabe".to_string())
-                )))
+                return Err(SyncFailure::new(
+                    format!(
+                        "Inhaltsabruf unvollständig: {}",
+                        pager
+                            .stopped_because
+                            .unwrap_or_else(|| "Abbruch ohne Angabe".to_string())
+                    ),
+                    None,
+                    None,
+                ))
             }
         }
     }
@@ -426,7 +482,7 @@ pub async fn reconcile_saved(
     account_id: &str,
     saved: &pf::Inventory,
     pull_generation: i64,
-) -> Result<(), storage::StorageError> {
+) -> SyncResult<()> {
     let remote = match saved {
         pf::Inventory::Complete(ids) => ids.clone(),
         pf::Inventory::Incomplete(reason) => {
@@ -438,7 +494,7 @@ pub async fn reconcile_saved(
     };
     let local_saved: Vec<String> = db(worker, {
         let account_id = account_id.to_string();
-        move |db2| db2.saved_ids_for_account(&account_id)
+        move |db2| sr(db2.saved_ids_for_account(&account_id))
     })
     .await?;
     let remote_set: std::collections::HashSet<&str> = remote.iter().map(String::as_str).collect();
@@ -460,8 +516,8 @@ pub async fn reconcile_saved(
             let account_id = account_id.to_string();
             let id = id.clone();
             move |db2| {
-                db2.apply_remote_status(&account_id, &id, None, Some(false), generation)?;
-                Ok::<_, storage::StorageError>(())
+                sr(db2.apply_remote_status(&account_id, &id, None, Some(false), generation))?;
+                Ok::<_, SyncFailure>(())
             }
         })
         .await?;
@@ -471,8 +527,8 @@ pub async fn reconcile_saved(
             let account_id = account_id.to_string();
             let id = id.clone();
             move |db2| {
-                db2.apply_remote_status(&account_id, &id, None, Some(true), generation)?;
-                Ok::<_, storage::StorageError>(())
+                sr(db2.apply_remote_status(&account_id, &id, None, Some(true), generation))?;
+                Ok::<_, SyncFailure>(())
             }
         })
         .await?;
@@ -495,7 +551,7 @@ pub async fn reconcile_unread(
     account_id: &str,
     unread: &pf::Inventory,
     pull_generation: i64,
-) -> Result<usize, storage::StorageError> {
+) -> SyncResult<usize> {
     let remote = match unread {
         pf::Inventory::Complete(ids) => ids.clone(),
         pf::Inventory::Incomplete(reason) => {
@@ -508,7 +564,7 @@ pub async fn reconcile_unread(
     let remote_set: std::collections::HashSet<&str> = remote.iter().map(String::as_str).collect();
     let local: Vec<String> = db(worker, {
         let account_id = account_id.to_string();
-        move |db2| db2.unread_ids_for_account(&account_id)
+        move |db2| sr(db2.unread_ids_for_account(&account_id))
     })
     .await?;
     let missing: Vec<String> = local
@@ -522,9 +578,14 @@ pub async fn reconcile_unread(
             let account_id = account_id.to_string();
             move |db2| {
                 // Fehlt die ID im Unread-Inventar, ist der Artikel remote gelesen.
-                let res =
-                    db2.apply_remote_status(&account_id, &id, Some(true), None, pull_generation)?;
-                Ok::<_, storage::StorageError>(res.applied)
+                let res = sr(db2.apply_remote_status(
+                    &account_id,
+                    &id,
+                    Some(true),
+                    None,
+                    pull_generation,
+                ))?;
+                Ok::<_, SyncFailure>(res.applied)
             }
         })
         .await?;
@@ -548,10 +609,10 @@ pub async fn load_missing_contents(
     account_id: &str,
     pull_generation: i64,
     batch: usize,
-) -> Result<usize, storage::StorageError> {
+) -> SyncResult<usize> {
     let ids: Vec<String> = db(worker, {
         let account_id = account_id.to_string();
-        move |db2| db2.articles_needing_content(&account_id, batch as u32)
+        move |db2| sr(db2.articles_needing_content(&account_id, batch as u32))
     })
     .await?;
     if ids.is_empty() {
@@ -560,11 +621,11 @@ pub async fn load_missing_contents(
     let entries = client
         .entries_mget(&ids)
         .await
-        .map_err(|e| storage::StorageError::Schema(format!("Nachladen fehlgeschlagen: {e}")))?;
+        .map_err(|e| SyncFailure::new(format!("Nachladen fehlgeschlagen: {e}"), None, None))?;
     let received = entries.len();
     ingest_entries(worker, account_id, pull_generation, entries)
         .await
-        .map_err(storage::StorageError::Schema)?;
+        .map_err(string_err)?;
     dbg_log(&format!(
         "Nachgeladene Inhalte: {received} Artikel (von {} IDs)",
         ids.len()
@@ -580,31 +641,35 @@ pub fn confirmed(entry: &pf::Entry, field: &str, desired: bool) -> bool {
     }
 }
 
-pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
+pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     let tx = net.event_sender();
     set_status(&worker, "initial_sync", None);
-    let status_account = String::new();
     let sync_started_ms = storage::now_ms();
     net.spawn(async move {
-        let client = pf::FeedlyClient::new(token);
-        let res: storage::Result<usize> = async {
+        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        let res: SyncResult<usize> = async {
             let profile = client.profile().await.map_err(io_err)?;
             db(&worker, {
                 let p = profile.clone();
                 move |db2| {
-                    db2.upsert_account(
+                    sr(db2.upsert_account(
                         &p.id,
                         "feedly",
                         p.full_name
                             .as_deref()
                             .or(p.email.as_deref())
                             .unwrap_or("Feedly"),
-                    )
+                    ))
                 }
             })
             .await?;
+            if ctx.is_cancelled() {
+                return Err(SyncFailure::new("Lauf abgebrochen", None, None));
+            }
             let subs = client.subscriptions().await.map_err(io_err)?;
             let cats = client.categories().await.map_err(io_err)?;
+            // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und
+            // Ereignisse dieses Laufs.
             let account_id = profile.id.clone();
             // Profilbindung im Schlüsselbund: Token und Konto gehören zusammen.
             let _ = bind_account(&account_id);
@@ -613,12 +678,12 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
                 db(&worker, {
                     let account_id = account_id.clone();
                     let c = c.clone();
-                    move |db2| db2.upsert_group_remote(&account_id, &c.id, &name)
+                    move |db2| sr(db2.upsert_group_remote(&account_id, &c.id, &name))
                 })
                 .await?;
             }
             let group_ids: std::collections::HashMap<String, i64> =
-                db(&worker, |db2| db2.list_groups())
+                db(&worker, |db2| sr(db2.list_groups()))
                     .await?
                     .into_iter()
                     .filter_map(|g| g.remote_id.map(|r| (r, g.id)))
@@ -632,13 +697,13 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
                     let url = url.clone();
                     let title = title.clone();
                     move |db2| {
-                        db2.upsert_feed_remote(
+                        sr(db2.upsert_feed_remote(
                             &account_id,
                             &s.id,
                             &url,
                             &title,
                             s.website.as_deref(),
-                        )
+                        ))
                     }
                 })
                 .await?;
@@ -647,14 +712,14 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
                     .iter()
                     .filter_map(|c| group_ids.get(&c.id).copied())
                     .collect();
-                db(&worker, move |db2| db2.set_feed_groups(fid, &gids)).await?;
+                db(&worker, move |db2| sr(db2.set_feed_groups(fid, &gids))).await?;
             }
             let stream = pf::global_all_stream(&profile.id);
             let newer_than = storage::now_ms() - 30 * 86_400_000;
             // Generation vor dem ersten Inhaltsabruf erfassen.
             let pull_gen = db(&worker, {
                 let account_id = account_id.clone();
-                move |db2| db2.pull_generation(&account_id)
+                move |db2| sr(db2.pull_generation(&account_id))
             })
             .await?;
             let summary = fetch_stream_inventory(
@@ -691,7 +756,7 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
                 "Watermark auf {checkpoint} (Start {sync_started_ms})"
             ));
             db(&worker, move |db2| {
-                db2.set_last_sync(&account_id, checkpoint)
+                sr(db2.set_last_sync(&account_id, checkpoint))
             })
             .await?;
             Ok(added)
@@ -699,26 +764,79 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String) {
         .await;
         match res {
             Ok(added) => {
-                set_status(&worker, "ready", Some(&status_account));
-                let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added });
+                set_status(&worker, "ready", Some(&ctx.account_id));
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncDone {
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    added,
+                });
             }
             Err(e) => {
-                let (status, detail) = classify_storage(&e);
-                set_status(&worker, status, Some(&status_account));
+                let status = e.status.clone().unwrap_or_else(|| "degraded".to_string());
+                set_status(&worker, &status, Some(&ctx.account_id));
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                    message: detail.unwrap_or_else(|| e.to_string()),
-                    status: Some(status.to_string()),
-                    retry_after_ms: None,
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    message: e.message.clone(),
+                    status: e.status.clone(),
+                    retry_after_ms: e.retry_after_ms,
                 });
             }
         }
     });
 }
 
-pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: String) {
+/// Serverseitiges „alles gelesen“ für eine Auswahl von Feeds. Der lokale Zustand
+/// folgt erst nach der Serverbestätigung, damit die transaktionale Outbox stimmt.
+pub fn mark_feeds_server_side(
+    worker: DbWorker,
+    net: &Net,
+    token: String,
+    ctx: RunCtx,
+    remote_feed_ids: Vec<String>,
+    local_feed_ids: Vec<i64>,
+) {
     let tx = net.event_sender();
     net.spawn(async move {
-        let client = pf::FeedlyClient::new(token);
+        if ctx.is_cancelled() {
+            return;
+        }
+        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        match client.markers_feeds("markAsRead", &remote_feed_ids).await {
+            Ok(()) => {
+                db(&worker, move |db2| {
+                    db2.mark_feeds_read(&local_feed_ids);
+                })
+                .await;
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncDone {
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    added: 0,
+                });
+            }
+            Err(e) => {
+                let failure = io_err(e);
+                set_status(&worker, "degraded", Some(&ctx.account_id));
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    message: format!(
+                        "Serverseitig als gelesen fehlgeschlagen: {}",
+                        failure.message
+                    ),
+                    status: failure.status.clone(),
+                    retry_after_ms: failure.retry_after_ms,
+                });
+            }
+        }
+    });
+}
+
+pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
+    let account_id = ctx.account_id.clone();
+    let tx = net.event_sender();
+    net.spawn(async move {
+        let client = pf::FeedlyClient::with_base(token, pf::base_url());
         let now = storage::now_ms();
         // Claim und Requestrevision werden gemeinsam erfasst: ein zweiter
         // Prozessor kann dieselbe Zeile nicht parallel senden.
@@ -739,6 +857,11 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
                 .push((r.id, r.revision, r.entity_id.clone()));
         }
         for ((field, desired), entries) in groups {
+            // Nach Logout, Auth- oder Quotenstopp wird kein weiterer Batch gesendet.
+            if ctx.is_cancelled() {
+                dbg_log("Outbox: Lauf abgebrochen, weitere Batches entfallen");
+                break;
+            }
             let action = match (field.as_str(), desired) {
                 ("read", true) => "markAsRead",
                 ("read", false) => "keepUnread",
@@ -786,6 +909,8 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
                             })
                             .await;
                             let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                                account_id: ctx.account_id.clone(),
+                                run_id: ctx.run_id,
                                 message: format!(
                                     "Feedly hat {count} von {total} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt"
                                 ),
@@ -808,6 +933,8 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
                     })
                     .await;
                     let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        account_id: ctx.account_id.clone(),
+                        run_id: ctx.run_id,
                         message: format!(
                             "404 für {n} Änderungen: {message} — bleiben lokal erhalten und werden nicht erneut gesendet",
                             n = sent.len()
@@ -823,10 +950,14 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
                     let _ = db(&worker, move |db2| db2.outbox_fail(&sent, next, false)).await;
                     set_status(&worker, "rate_limited", Some(&account_id));
                     let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        account_id: ctx.account_id.clone(),
+                        run_id: ctx.run_id,
                         status: Some("rate_limited".into()),
                         retry_after_ms: Some(next),
                         message: format!("Drosselung durch Feedly — neuer Versuch ab {}", fmt_ms(next)),
                     });
+                    // Drosselung beendet den Versand dieses Laufs.
+                    break;
                 }
                 Err(pf::FeedlyError::Api { status, message, .. }) if status == 401 || status == 403 => {
                     // Zentraler Auth-Stopp: Konto wird sichtbar gesperrt und lange
@@ -839,19 +970,28 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, account_id: St
                         Some(&account_id),
                     );
                     let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        account_id: ctx.account_id.clone(),
+                        run_id: ctx.run_id,
                         status: Some("auth_required".into()),
                         retry_after_ms: Some(next),
                         message: format!("Auth/Rechte ({status}): {message} — bitte neu verbinden"),
                     });
+                    // Auth-Stopp: keine weiteren Batches.
+                    break;
                 }
                 Err(e) => {
                     let next = storage::now_ms() + 60_000;
                     let _ = db(&worker, move |db2| db2.outbox_fail(&sent, next, false)).await;
                     let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                        account_id: ctx.account_id.clone(),
+                        run_id: ctx.run_id,
                         message: e.to_string(),
                         status: None,
                         retry_after_ms: Some(next),
                     });
+                    if ctx.is_cancelled() {
+                        break;
+                    }
                 }
             }
         }
@@ -883,19 +1023,18 @@ pub fn delta_sync(
     token: String,
     account_id: String,
     last_sync_ms: i64,
+    ctx: RunCtx,
 ) {
     let tx = net.event_sender();
     set_status(&worker, "syncing", Some(&account_id));
-    let status_account = account_id.clone();
-    let _ = &status_account;
     let sync_started_ms = storage::now_ms();
     net.spawn(async move {
-        let client = pf::FeedlyClient::new(token);
-        let res: storage::Result<usize> = async {
+        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        let res: SyncResult<usize> = async {
             let overlap = last_sync_ms - 5 * 60_000;
             let pull_gen = db(&worker, {
                 let account_id = account_id.clone();
-                move |db2| db2.pull_generation(&account_id)
+                move |db2| sr(db2.pull_generation(&account_id))
             })
             .await?;
             let mut reads_pager = pf::Pager::new();
@@ -910,8 +1049,14 @@ pub fn delta_sync(
                         let account_id = account_id.clone();
                         let id = m.id.clone();
                         move |db2| {
-                            db2.apply_remote_status(&account_id, &id, Some(true), None, pull_gen)?;
-                            Ok::<_, storage::StorageError>(())
+                            sr(db2.apply_remote_status(
+                                &account_id,
+                                &id,
+                                Some(true),
+                                None,
+                                pull_gen,
+                            ))?;
+                            Ok::<_, SyncFailure>(())
                         }
                     })
                     .await?;
@@ -921,12 +1066,16 @@ pub fn delta_sync(
                     pf::PageAction::Continue => reads_continuation = next,
                     pf::PageAction::Done => break,
                     pf::PageAction::Aborted => {
-                        return Err(storage::StorageError::Schema(format!(
-                            "Read-Abgleich unvollständig: {}",
-                            reads_pager
-                                .stopped_because
-                                .unwrap_or_else(|| "Abbruch ohne Angabe".to_string())
-                        )))
+                        return Err(SyncFailure::new(
+                            format!(
+                                "Read-Abgleich unvollständig: {}",
+                                reads_pager
+                                    .stopped_because
+                                    .unwrap_or_else(|| "Abbruch ohne Angabe".to_string())
+                            ),
+                            None,
+                            None,
+                        ))
                     }
                 }
             }
@@ -965,7 +1114,7 @@ pub fn delta_sync(
                 "Watermark auf {checkpoint} (Start {sync_started_ms})"
             ));
             db(&worker, move |db2| {
-                db2.set_last_sync(&account_id, checkpoint)
+                sr(db2.set_last_sync(&account_id, checkpoint))
             })
             .await?;
             Ok(added)
@@ -973,16 +1122,22 @@ pub fn delta_sync(
         .await;
         match res {
             Ok(added) => {
-                set_status(&worker, "ready", Some(&status_account));
-                let _ = tx.send(crate::net::NetEvent::FeedlySyncDone { added });
+                set_status(&worker, "ready", Some(&ctx.account_id));
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncDone {
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    added,
+                });
             }
             Err(e) => {
-                let (status, detail) = classify_storage(&e);
-                set_status(&worker, status, Some(&status_account));
+                let status = e.status.clone().unwrap_or_else(|| "degraded".to_string());
+                set_status(&worker, &status, Some(&ctx.account_id));
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                    message: detail.unwrap_or_else(|| e.to_string()),
-                    status: Some(status.to_string()),
-                    retry_after_ms: None,
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    message: e.message.clone(),
+                    status: e.status.clone(),
+                    retry_after_ms: e.retry_after_ms,
                 });
             }
         }
@@ -1028,12 +1183,35 @@ pub fn classify(error: &pf::FeedlyError) -> (&'static str, Option<String>) {
     }
 }
 
-fn string_err(e: String) -> storage::StorageError {
-    storage::StorageError::Schema(e)
+fn string_err(e: String) -> SyncFailure {
+    SyncFailure::new(e, None, None)
 }
 
-fn io_err(e: pf::FeedlyError) -> storage::StorageError {
-    storage::StorageError::Schema(e.to_string())
+fn storage_err(e: storage::StorageError) -> SyncFailure {
+    SyncFailure::new(e.to_string(), None, None)
+}
+
+/// DB-Ergebnis in das Fehlerformat eines Laufs überführen.
+fn sr<T>(r: storage::Result<T>) -> SyncResult<T> {
+    r.map_err(storage_err)
+}
+
+/// Wandelt einen Feedly-Fehler in einen typisierten Lauf-Fehler. HTTP-Status und
+/// `Retry-After` bleiben bis zur Steuerung erhalten.
+pub fn io_err(e: pf::FeedlyError) -> SyncFailure {
+    let (status, retry_after_ms) = match &e {
+        pf::FeedlyError::Api { status: 401, .. } | pf::FeedlyError::Api { status: 403, .. } => {
+            (Some("auth_required"), None)
+        }
+        pf::FeedlyError::Api {
+            status: 429,
+            retry_after_ms,
+            ..
+        } => (Some("rate_limited"), *retry_after_ms),
+        pf::FeedlyError::Api { status: 404, .. } => (Some("degraded"), None),
+        _ => (None, None),
+    };
+    SyncFailure::new(e.to_string(), status, retry_after_ms)
 }
 
 #[cfg(test)]

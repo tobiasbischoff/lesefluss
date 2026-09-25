@@ -44,8 +44,8 @@ pub enum Pause {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Decision {
-    /// Jetzt starten.
-    Start,
+    /// Jetzt starten; `run_id` kennzeichnet den Lauf bis zum Abschluss.
+    Start { run_id: u64 },
     /// Läuft bereits; der Wunsch ist vorgemerkt.
     Queued,
     /// Pause aktiv; der Wunsch wird verworfen und erst nach erneutem Anfordern
@@ -58,9 +58,13 @@ pub enum Decision {
 #[derive(Debug, Default)]
 struct AccountState {
     running: Option<Job>,
+    /// Laufkennung des aktuellen Laufs; steigt mit jedem Start.
+    run_id: u64,
     queued: Option<Job>,
     pause: Option<Pause>,
     blocked: bool,
+    /// Lauf, dessen Arbeit nach `block()` verworfen werden muss.
+    cancel_current: bool,
 }
 
 #[derive(Debug, Default)]
@@ -69,11 +73,13 @@ pub struct SyncCoordinator {
     now_ms: i64,
 }
 
-/// Ergebnis eines abgeschlossenen Laufs.
+/// Ergebnis eines abgeschlossenen Laufs: der Coordinator reserviert den Folgelauf
+/// und liefert ihn **mit** seiner Laufkennung zurück. Der Aufrufer startet diesen
+/// Auftrag direkt, ohne ihn erneut anzufordern.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Outcome {
-    pub finished: Option<Job>,
-    pub started_next: Option<Job>,
+pub struct ReservedRun {
+    pub job: Job,
+    pub run_id: u64,
 }
 
 impl SyncCoordinator {
@@ -115,41 +121,88 @@ impl SyncCoordinator {
             };
             return Decision::Queued;
         }
+        state.run_id += 1;
         state.running = Some(job);
-        Decision::Start
+        state.cancel_current = false;
+        Decision::Start {
+            run_id: state.run_id,
+        }
     }
 
-    /// Meldet das Ende eines Laufs und liefert den nächsten Start sofort mit.
-    pub fn finish(&mut self, account: &str, now_ms: i64) -> Outcome {
+    /// Meldet das Ende eines Laufs und reserviert den Folgelauf, falls einer
+    /// wartete. Der Rückgabewert ist der **einzige** Startauftrag dafür; er darf
+    /// nicht erneut über `request` angemeldet werden.
+    pub fn finish(&mut self, account: &str, now_ms: i64) -> Option<ReservedRun> {
         self.now_ms = now_ms;
         let state = self.state(account);
         state.running = None;
+        state.cancel_current = false;
         if Self::pause_active(state, now_ms).is_some() {
             state.queued = None;
-            return Outcome {
-                finished: None,
-                started_next: None,
-            };
+            return None;
         }
         match state.queued.take() {
             Some(next) => {
+                state.run_id += 1;
                 state.running = Some(next);
-                Outcome {
-                    finished: None,
-                    started_next: Some(next),
-                }
+                Some(ReservedRun {
+                    job: next,
+                    run_id: state.run_id,
+                })
             }
-            None => Outcome {
-                finished: None,
-                started_next: None,
-            },
+            None => None,
         }
+    }
+
+    /// Meldet einen Abbruch (z. B. Logout) und verwirft vorgemerkte Arbeit.
+    /// Der laufende Auftrag wird zum Invalidieren markiert.
+    pub fn abort(&mut self, account: &str) -> Option<Job> {
+        let state = self.state(account);
+        let running = state.running;
+        state.running = None;
+        state.queued = None;
+        state.cancel_current = running.is_some();
+        running
+    }
+
+    /// Der aktuell laufende oder reservierte Auftrag samt Laufkennung, ohne einen
+    /// neuen Lauf zu starten. Wird vom Dispatcher nach `finish` benutzt.
+    pub fn reserved_run(&self, account: &str) -> Option<(Job, u64)> {
+        self.accounts
+            .get(account)
+            .and_then(|s| s.running.map(|job| (job, s.run_id)))
+    }
+
+    /// Laufkennung des aktuellen Laufs; `None`, wenn nichts läuft.
+    pub fn current_run(&self, account: &str) -> Option<u64> {
+        self.accounts
+            .get(account)
+            .filter(|s| s.running.is_some())
+            .map(|s| s.run_id)
+    }
+
+    /// Wurde der laufende Auftrag nach einem Abbruch invalidiert?
+    pub fn is_cancelled(&self, account: &str) -> bool {
+        self.accounts
+            .get(account)
+            .map(|s| s.cancel_current)
+            .unwrap_or(false)
     }
 
     pub fn pause(&mut self, account: &str, pause: Pause) {
         let state = self.state(account);
         state.pause = Some(pause);
         state.queued = None;
+    }
+
+    /// Sorgt dafür, dass ein Auth-/Quota-Stopp auch den laufenden Versand beendet.
+    pub fn stop_running(&mut self, account: &str) -> Option<Job> {
+        let state = self.state(account);
+        let running = state.running;
+        state.running = None;
+        state.queued = None;
+        state.cancel_current = running.is_some();
+        running
     }
 
     /// Hebt eine Pause auf (neue Anmeldung, Zeit abgelaufen).
@@ -195,32 +248,74 @@ impl SyncCoordinator {
 mod tests {
     use super::*;
 
+    fn start(c: &mut SyncCoordinator, account: &str, job: Job) -> Option<u64> {
+        match c.request(account, job) {
+            Decision::Start { run_id } => Some(run_id),
+            other => panicunerwartet(other),
+        }
+    }
+
+    fn panicunerwartet(d: Decision) -> ! {
+        panic!("unerwartete Entscheidung: {d:?}")
+    }
+
     #[test]
     fn laufende_zyklen_werden_nicht_verdoppelt() {
         let mut c = SyncCoordinator::new();
-        assert_eq!(c.request("feedly-1", Job::Initial), Decision::Start);
+        let first = start(&mut c, "feedly-1", Job::Initial).expect("Start");
         assert_eq!(c.request("feedly-1", Job::Scheduled), Decision::Queued);
         assert_eq!(c.running("feedly-1"), Some(Job::Initial));
+        assert_eq!(c.current_run("feedly-1"), Some(first));
     }
 
     #[test]
     fn der_wichtigere_wunsch_gewinnt() {
         let mut c = SyncCoordinator::new();
-        c.request("feedly-1", Job::Initial);
+        start(&mut c, "feedly-1", Job::Initial);
         c.request("feedly-1", Job::Scheduled);
         c.request("feedly-1", Job::ServerAction);
         assert_eq!(c.queued("feedly-1"), Some(Job::ServerAction));
-        let out = c.finish("feedly-1", 0);
-        assert_eq!(out.started_next, Some(Job::ServerAction));
+        let reserved = c.finish("feedly-1", 0).expect("Folgelauf reserviert");
+        assert_eq!(reserved.job, Job::ServerAction);
+        assert_eq!(c.running("feedly-1"), Some(Job::ServerAction));
     }
 
     #[test]
     fn niedrigere_prioritaet_ersetzt_den_wunsch_nicht() {
         let mut c = SyncCoordinator::new();
-        c.request("feedly-1", Job::Initial);
+        start(&mut c, "feedly-1", Job::Initial);
         c.request("feedly-1", Job::Refresh);
         c.request("feedly-1", Job::Scheduled);
         assert_eq!(c.queued("feedly-1"), Some(Job::Refresh));
+    }
+
+    /// A2: Start A, Refresh während A, Abschluss A → genau **ein** reservierter
+    /// Start B, Abschluss B, danach wieder ein freier Start. Der reservierte
+    /// Auftrag darf nicht erneut angefordert werden.
+    #[test]
+    fn reservierter_folgelauf_wird_genau_einmal_gestartet() {
+        let mut c = SyncCoordinator::new();
+        let a = start(&mut c, "k", Job::Initial).expect("A");
+        assert_eq!(c.request("k", Job::Refresh), Decision::Queued);
+        let b = c.finish("k", 10).expect("B reserviert");
+        assert_ne!(b.run_id, a, "jeder Lauf hat eine eigene Kennung");
+        // Der Aufrufer startet B direkt. Ein erneutes Anfordern würde B nur
+        // wieder vormerken und keinen Netzwerkstart auslösen.
+        assert_eq!(c.current_run("k"), Some(b.run_id));
+        assert!(c.finish("k", 20).is_none(), "kein dritter Lauf ohne Wunsch");
+        let c_run = start(&mut c, "k", Job::Refresh).expect("nachfolgender Lauf");
+        assert!(c_run > b.run_id);
+    }
+
+    #[test]
+    fn auch_im_fehlerfall_bleibt_kein_haengender_lauf() {
+        let mut c = SyncCoordinator::new();
+        start(&mut c, "k", Job::Initial);
+        c.request("k", Job::Outbox);
+        // Fehlerpfad: der Abschluss wird auch dort aufgerufen.
+        let reserved = c.finish("k", 0).expect("Folgelauf nach Fehler");
+        assert_eq!(reserved.job, Job::Outbox);
+        assert!(c.finish("k", 0).is_none());
     }
 
     #[test]
@@ -236,7 +331,10 @@ mod tests {
             Decision::Paused(Pause::Auth)
         );
         c.resume("feedly-1");
-        assert_eq!(c.request("feedly-1", Job::Refresh), Decision::Start);
+        assert!(matches!(
+            c.request("feedly-1", Job::Refresh),
+            Decision::Start { .. }
+        ));
     }
 
     #[test]
@@ -249,39 +347,71 @@ mod tests {
             Decision::Paused(Pause::Quota(2_000))
         );
         c.set_now(3_000);
-        assert_eq!(c.request("feedly-1", Job::Refresh), Decision::Start);
+        assert!(matches!(
+            c.request("feedly-1", Job::Refresh),
+            Decision::Start { .. }
+        ));
     }
 
     #[test]
     fn pause_verwirft_bereits_vorgemerkte_arbeit() {
         let mut c = SyncCoordinator::new();
-        c.request("feedly-1", Job::Initial);
+        start(&mut c, "feedly-1", Job::Initial);
         c.request("feedly-1", Job::Refresh);
         c.pause("feedly-1", Pause::Auth);
-        let out = c.finish("feedly-1", 0);
-        assert_eq!(
-            out.started_next, None,
-            "keine Folgearbeit während der Pause"
-        );
+        assert!(c.finish("feedly-1", 0).is_none());
         assert_eq!(c.queued("feedly-1"), None);
     }
 
     #[test]
     fn abmelden_sperrt_bis_zur_erneuten_verbindung() {
         let mut c = SyncCoordinator::new();
-        c.request("feedly-1", Job::Refresh);
+        start(&mut c, "feedly-1", Job::Refresh);
         c.block("feedly-1");
         assert!(c.is_blocked("feedly-1"));
         assert_eq!(c.request("feedly-1", Job::Refresh), Decision::Blocked);
         c.unblock("feedly-1");
-        assert_eq!(c.request("feedly-1", Job::Refresh), Decision::Start);
+        assert!(matches!(
+            c.request("feedly-1", Job::Refresh),
+            Decision::Start { .. }
+        ));
+    }
+
+    #[test]
+    fn abmelden_invalidiert_den_laufenden_auftrag() {
+        let mut c = SyncCoordinator::new();
+        start(&mut c, "feedly-1", Job::Outbox);
+        assert!(
+            c.abort("feedly-1").is_some(),
+            "der laufende Auftrag wird gemeldet"
+        );
+        assert!(
+            c.is_cancelled("feedly-1"),
+            "weitere Arbeit muss verworfen werden"
+        );
+        assert!(c.current_run("feedly-1").is_none());
+        assert!(c.finish("feedly-1", 0).is_none());
+    }
+
+    #[test]
+    fn auth_oder_quota_beendet_den_laufenden_versand() {
+        let mut c = SyncCoordinator::new();
+        start(&mut c, "feedly-1", Job::Outbox);
+        assert!(c.stop_running("feedly-1").is_some());
+        assert!(c.is_cancelled("feedly-1"));
+        c.pause("feedly-1", Pause::Auth);
+        assert_eq!(
+            c.request("feedly-1", Job::Refresh),
+            Decision::Paused(Pause::Auth)
+        );
     }
 
     #[test]
     fn konten_synchronisieren_unabhaengig() {
         let mut c = SyncCoordinator::new();
-        assert_eq!(c.request("konto-a", Job::Refresh), Decision::Start);
-        assert_eq!(c.request("konto-b", Job::Refresh), Decision::Start);
+        let a = start(&mut c, "konto-a", Job::Refresh).expect("A");
+        let b = start(&mut c, "konto-b", Job::Refresh).expect("B");
+        assert!(a > 0 && b > 0, "beide Läufe haben eine Kennung");
         assert_eq!(c.running("konto-a"), Some(Job::Refresh));
         assert_eq!(c.running("konto-b"), Some(Job::Refresh));
     }

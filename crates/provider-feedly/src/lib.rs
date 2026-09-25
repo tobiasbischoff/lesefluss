@@ -250,9 +250,18 @@ pub struct ReadsPage {
     pub continuation: Option<String>,
 }
 
+/// Produktive Basis-URL. `LF_FEEDLY_BASE` überschreibt sie, damit die echten
+/// Sync-Einstiege gegen einen Mockserver getestet werden können.
+pub fn base_url() -> String {
+    std::env::var("LF_FEEDLY_BASE")
+        .ok()
+        .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
+        .unwrap_or_else(|| "https://cloud.feedly.com/v3/".to_string())
+}
+
 impl FeedlyClient {
     pub fn new(token: String) -> Self {
-        Self::with_base(token, "https://cloud.feedly.com/v3/".to_string())
+        Self::with_base(token, base_url())
     }
 
     pub fn with_base(token: String, base: String) -> Self {

@@ -15,6 +15,10 @@ pub struct UiState {
     pub accounts: Vec<(String, String, String)>,
     /// Koordiniert alle Feedly-Zyklen pro Konto (Erst-Sync, Delta, Outbox, Aktionen).
     pub coordinator: sync_engine::SyncCoordinator,
+    /// Aktuell laufender Netzauftrag; ältere Ereignisse werden verworfen.
+    pub active_feedly_run: Option<crate::window::FeedlyRun>,
+    /// Ziel-Feeds einer wartenden Serveraktion.
+    pub pending_feedly_params: Option<(String, crate::window::FeedlyParams)>,
     pub next_feedly_sync: i64,
     pub feedly_last_sync: i64,
     pub counts: Counts,
@@ -45,6 +49,8 @@ impl Default for UiState {
             groups: Vec::new(),
             accounts: Vec::new(),
             coordinator: sync_engine::SyncCoordinator::new(),
+            active_feedly_run: None,
+            pending_feedly_params: None,
             next_feedly_sync: 0,
             feedly_last_sync: 0,
             counts: Counts::default(),
