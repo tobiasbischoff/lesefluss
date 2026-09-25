@@ -284,6 +284,11 @@ und [FeedlyAPICaller](https://github.com/Ranchero-Software/NetNewsWire/blob/b436
 
 - [ ] **P1 — Tastatur:** Ctrl+K-Palette, Shortcutübersicht, einzelne Belegungen,
   Splitter-Actions, Fokus-Rückgabe, Esc-Kette, Text-Undo und IME korrekt implementieren.
+- [x] **P1 — Tastatur (teilweise):** Buchstaben-Router mit Capture-Priorität, j/k,
+  vollständige Aktionen für Lesen/Merken/Undo/Redo/Suche/Filter, Esc-Kette und
+  Fokusrückgabe sind vorhanden und durch Router-Tests abgedeckt.
+  **Offen:** Ctrl+K-Befehlspalette, Shortcutübersicht, individuelle Belegungen,
+  Splitter-Actions.
 - [ ] **P2 — Zustand:** *teilweise erledigt 2026-09-25:* Sortierung ist je Konto
   (`sort_<konto>`) und fällt auf die globale Vorgabe zurück; Identität und Cursor sind
   total eindeutig (L3). **Offen:** Persistenz von Auswahl, Quelle, Filter, Suchbegriff,
@@ -299,9 +304,13 @@ und [FeedlyAPICaller](https://github.com/Ranchero-Software/NetNewsWire/blob/b436
   Reader-Sprache korrekt. Einige übersetzte Tooltips sind keine vollständige Lokalisierung.
 - [ ] **P5 — Accessibility:** alle Funktionen ohne Maus, AT-SPI-Namen/Rollen/Status,
   High Contrast, reduzierte Bewegung, Textskalierung bis 200 %, RTL/CJK und sichtbarer Fokus.
-- [ ] **P6 — Reaktionsfähigkeit:** verbleibende Datei-/Keyring-/Parser-/Cachearbeit aus GTK
-  entfernen, Eventverarbeitung begrenzen, End-to-End-Latenz einschließlich Queue und
-  WebKit messen. Fehlerseiten statt stiller Workerabbrüche/leerer Fenster.
+- [ ] **P6 — Reaktionsfähigkeit:** *teilweise erledigt 2026-09-25:* Datei-,
+  Keyring-, Parser- und Cachearbeit läuft in Workthreads (Keyring mit Zeitgrenze,
+  Feedly-Client im Net-Runtime, Medien im Netz-Worker); DB-Workerfehler werden als
+  Meldung angezeigt statt als leeres Fenster; DB-Messung bei 100 000 Artikeln neu
+  gemessen (`perf-report.md`). **Offen:** End-to-End-Latenz einschließlich Queue und
+  WebKit im laufenden Fenster, Begrenzung der Ereignisverarbeitung bei sehr großen
+  Importen, Q3-Gerätemessungen.
 
 ## 5. Tests, Distribution und nachvollziehbare Abnahme
 

@@ -54,6 +54,7 @@ Details und Rohwerte: `docs/perf-report.md`.
 | Keyring | Token im Secret Service | `secret-tool lookup` liefert Token, Datei entfernt | erfüllt |
 | Outbox nach Neustart | Änderungen gehen raus | Outbox-Zeilen bleiben persistent, `outbox_reset_inflight` beim Start | erfüllt (Test), live nach Neustart bestätigt |
 | Dauerhafte Fehler | sichtbar, kein Massenwechsel | 404 → `status='failed'` + `unsynced`, Meldung an die Oberfläche | erfüllt |
+| DB bei 100 000 Artikeln | Liste/Keyset < 50 ms, Suche < 150 ms | 25.09.2026: 12,2 / 12,7 ms p50, Suche 51,5 ms p50, Zähler 108 ms, Seed 2921 ms | erfüllt (ohne Fenster) |
 | 60-s-Scrollen mit Parallel-Import | kein Stalls > 50 ms | nicht durchgeführt (Zeit-/Werkzeugbudget) | **offen** |
 | Skalierung 125/150/200 %, Textskalierung | Layout bleibt benutzbar | nicht geprüft | **offen** |
 | High Contrast, reduzierte Bewegung | unterstützt und geprüft | nicht geprüft | **offen** |
