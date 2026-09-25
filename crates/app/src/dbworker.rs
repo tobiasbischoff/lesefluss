@@ -54,21 +54,18 @@ impl DbWorker {
         Self { tx, failure }
     }
 
-    /// Kleiner, blockierender Lesezugriff nur für die Layoutwiederherstellung
-    /// beim Start; die Oberfläche wartet dabei nicht auf Datenbankarbeit.
-    pub fn read_layout(&self) -> Option<String> {
-        let w = self.clone();
-        std::thread::spawn(move || {
-            w.send(|db| db.get_pref("layout").ok().flatten())
-                .recv()
-                .ok()
-                .and_then(|b| b.downcast::<storage::Result<Option<String>>>().ok())
-                .map(|r| r.ok().flatten())
-                .unwrap_or(None)
-        })
-        .join()
-        .ok()
-        .flatten()
+    /// Layoutwiederherstellung beim Start. Läuft vor dem Ereignis-Schleifen-
+    /// Anlauf und wartet daher bewusst auf den Worker; Fehler werden benannt
+    /// statt als „kein Layout“ verschluckt.
+    pub fn read_layout(&self) -> Result<Option<String>, String> {
+        let out = self
+            .send(|db| db.get_pref("layout"))
+            .recv()
+            .map_err(|_| "Datenbank-Worker antwortet nicht".to_string())?;
+        match out.downcast::<storage::Result<Option<String>>>() {
+            Ok(value) => value.map_err(|e| e.to_string()),
+            Err(_) => Err("unerwartetes Antwortformat des Datenbank-Workers".to_string()),
+        }
     }
 
     pub fn send<F, R>(&self, f: F) -> Receiver<JobOut>
@@ -80,5 +77,47 @@ impl DbWorker {
         let job: Job = Box::new(move |db| Box::new(f(db)));
         let _ = self.tx.send(Envelope { job, reply });
         rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B7: Der Layout-Leser nennt Fehler, statt sie als „kein Layout“ zu
+    /// verschlucken, und legt keinen blockierenden Hilfs-Thread an.
+    #[test]
+    fn layout_lesen_liefert_wert_oder_nennt_den_fehler() {
+        let dir = std::env::temp_dir().join(format!("lesefluss-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = DbWorker::start(dir.join("library.db"));
+        assert_eq!(worker.read_layout().unwrap(), None);
+        worker
+            .send(|db| db.set_pref("layout", "1280;800"))
+            .recv()
+            .unwrap()
+            .downcast::<storage::Result<()>>()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            worker.read_layout().unwrap(),
+            Some("1280;800".to_string()),
+            "der gespeicherte Wert kommt zurück"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B7: Ein nicht erreichbarer Worker endet als benannter Fehler.
+    #[test]
+    fn read_layout_ohne_worker_meldet_fehler() {
+        let path = std::env::temp_dir().join(format!("lesefluss-fehlt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        // Als Verzeichnis kann SQLite keine Datenbank öffnen: der Worker startet nicht.
+        std::fs::create_dir_all(path.join("library.db")).unwrap();
+        let worker = DbWorker::start(path.join("library.db"));
+        let err = worker.read_layout().unwrap_err();
+        assert_eq!(err, "Datenbank-Worker antwortet nicht");
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

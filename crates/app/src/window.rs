@@ -1956,7 +1956,13 @@ impl App {
     }
 
     fn apply_layout(&self) {
-        let raw = self.worker.read_layout();
+        let raw = match self.worker.read_layout() {
+            Ok(raw) => raw,
+            Err(message) => {
+                dbg_log(&format!("Layout nicht wiederhergestellt: {message}"));
+                None
+            }
+        };
         if let Some(raw) = raw {
             let parts: Vec<i64> = raw
                 .split(';')
