@@ -1,5 +1,6 @@
 [package]
-name = "lesefluss-app"
+name = "lesefluss"
+default-run = "lesefluss"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

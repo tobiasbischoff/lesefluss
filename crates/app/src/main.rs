@@ -40,12 +40,17 @@ impl LibraryLock {
             .write(true)
             .truncate(false)
             .open(&path)
-            .map_err(|e| format!("Sperrdatei {} nicht zu öffnen: {e}", path.display()))?;
+            .map_err(|e| {
+                crate::tr_format!(
+                    "Sperrdatei {} nicht zu öffnen: {e}",
+                    "Could not open lock file {}: {e}",
+                    path.display()
+                )
+            })?;
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if locked != 0 {
             return Err(
-                "Die Bibliothek ist bereits von einer anderen Lesefluss-Instanz geöffnet \
-                 (wiederhergestellt wird nur mit exklusivem Zugriff)."
+                crate::tr!("Die Bibliothek ist bereits von einer anderen Lesefluss-Instanz geöffnet (wiederhergestellt wird nur mit exklusivem Zugriff).", "The library is already open in another Lesefluss instance (restoring requires exclusive access).")
                     .to_string(),
             );
         }
@@ -82,17 +87,34 @@ fn consistent_backup(
     let safety = dir.join(format!("library.pre-restore-{stamp}.db"));
     match storage::Database::open(db_path) {
         Ok(db) => {
-            db.wal_checkpoint()
-                .map_err(|e| format!("Sicherung des alten Bestands fehlgeschlagen (WAL): {e}"))?;
-            db.backup_to(&safety)
-                .map_err(|e| format!("Sicherung des alten Bestands fehlgeschlagen: {e}"))?;
+            db.wal_checkpoint().map_err(|e| {
+                crate::tr_format!(
+                    "Sicherung des alten Bestands fehlgeschlagen (WAL): {e}",
+                    "Could not back up existing library (WAL): {e}"
+                )
+            })?;
+            db.backup_to(&safety).map_err(|e| {
+                crate::tr_format!(
+                    "Sicherung des alten Bestands fehlgeschlagen: {e}",
+                    "Could not back up existing library: {e}"
+                )
+            })?;
         }
         Err(_) => {
-            std::fs::copy(db_path, &safety)
-                .map_err(|e| format!("Sicherung des alten Bestands fehlgeschlagen: {e}"))?;
+            std::fs::copy(db_path, &safety).map_err(|e| {
+                crate::tr_format!(
+                    "Sicherung des alten Bestands fehlgeschlagen: {e}",
+                    "Could not back up existing library: {e}"
+                )
+            })?;
         }
     }
-    fsync_file(&safety).map_err(|e| format!("Sicherung nicht dauerhaft schreibbar: {e}"))?;
+    fsync_file(&safety).map_err(|e| {
+        crate::tr_format!(
+            "Sicherung nicht dauerhaft schreibbar: {e}",
+            "Could not persist backup: {e}"
+        )
+    })?;
     Ok(safety)
 }
 
@@ -112,8 +134,12 @@ fn finish_interrupted_activation(
     let db_path = dir.join("library.db");
     let _ = std::fs::remove_file(dir.join("library.db-wal"));
     let _ = std::fs::remove_file(dir.join("library.db-shm"));
-    std::fs::rename(new_db, &db_path)
-        .map_err(|e| format!("Wiederherstellung nicht aktiviert, alter Bestand erhalten: {e}"))?;
+    std::fs::rename(new_db, &db_path).map_err(|e| {
+        crate::tr_format!(
+            "Wiederherstellung nicht aktiviert, alter Bestand erhalten: {e}",
+            "Restore not activated, existing library kept: {e}"
+        )
+    })?;
     fsync_dir(dir);
     let _ = std::fs::remove_file(dir.join("restore.pending"));
     let _ = std::fs::remove_file(dir.join("library.restore-staged"));
@@ -132,7 +158,11 @@ pub fn apply_pending_restore(dir: &std::path::Path) -> Result<Option<String>, St
 
     if finish_interrupted_activation(dir, &new_db)? {
         return Ok(Some(
-            "Wiederherstellung wurde nach einem Abbruch abgeschlossen".to_string(),
+            crate::tr!(
+                "Wiederherstellung wurde nach einem Abbruch abgeschlossen",
+                "Restore completed after an interruption"
+            )
+            .to_string(),
         ));
     }
     if !pending.exists() {
@@ -140,8 +170,9 @@ pub fn apply_pending_restore(dir: &std::path::Path) -> Result<Option<String>, St
     }
     if let Err(e) = storage::Database::validate_candidate(&pending) {
         let _ = std::fs::remove_file(&pending);
-        return Err(format!(
-            "Wiederherstellung abgebrochen, die vorhandene Bibliothek bleibt unverändert: {e}"
+        return Err(crate::tr_format!(
+            "Wiederherstellung abgebrochen, die vorhandene Bibliothek bleibt unverändert: {e}",
+            "Restore cancelled, existing library unchanged: {e}"
         ));
     }
     if db_path.is_file() {
@@ -150,24 +181,34 @@ pub fn apply_pending_restore(dir: &std::path::Path) -> Result<Option<String>, St
     let _ = std::fs::remove_file(&staged);
     if let Err(e) = std::fs::copy(&pending, &staged) {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!("Kopie in die Staging-Datei fehlgeschlagen: {e}"));
+        return Err(crate::tr_format!(
+            "Kopie in die Staging-Datei fehlgeschlagen: {e}",
+            "Could not copy to staging file: {e}"
+        ));
     }
     if let Err(e) = storage::Database::prepare_restore_candidate(&staged) {
         let _ = std::fs::remove_file(&staged);
-        return Err(format!(
-            "Wiederherstellung abgebrochen, die vorhandene Bibliothek bleibt unverändert: {e}"
+        return Err(crate::tr_format!(
+            "Wiederherstellung abgebrochen, die vorhandene Bibliothek bleibt unverändert: {e}",
+            "Restore cancelled, existing library unchanged: {e}"
         ));
     }
     let _ = std::fs::remove_file(&new_db);
     if let Err(e) = std::fs::copy(&staged, &new_db) {
         let _ = std::fs::remove_file(&new_db);
         let _ = std::fs::remove_file(&staged);
-        return Err(format!("Aktivierungsdatei nicht schreibbar: {e}"));
+        return Err(crate::tr_format!(
+            "Aktivierungsdatei nicht schreibbar: {e}",
+            "Could not write activation file: {e}"
+        ));
     }
     if let Err(e) = fsync_file(&new_db) {
         let _ = std::fs::remove_file(&new_db);
         let _ = std::fs::remove_file(&staged);
-        return Err(format!("Aktivierungsdatei nicht dauerhaft schreibbar: {e}"));
+        return Err(crate::tr_format!(
+            "Aktivierungsdatei nicht dauerhaft schreibbar: {e}",
+            "Could not persist activation file: {e}"
+        ));
     }
     // Sidecars belong to the old file and were secured together with it. The lock
     // guarantees that no other process has the database open.
@@ -175,24 +216,30 @@ pub fn apply_pending_restore(dir: &std::path::Path) -> Result<Option<String>, St
     let _ = std::fs::remove_file(dir.join("library.db-shm"));
     if let Err(e) = std::fs::rename(&new_db, &db_path) {
         let _ = std::fs::remove_file(&new_db);
-        return Err(format!(
-            "Wiederherstellung nicht aktiviert, alter Bestand erhalten: {e}"
+        return Err(crate::tr_format!(
+            "Wiederherstellung nicht aktiviert, alter Bestand erhalten: {e}",
+            "Restore not activated, existing library kept: {e}"
         ));
     }
     fsync_dir(dir);
     let _ = std::fs::remove_file(&pending);
     let _ = std::fs::remove_file(&staged);
     Ok(Some(
-        "Backup wurde beim Start wiederhergestellt".to_string(),
+        crate::tr!(
+            "Backup wurde beim Start wiederhergestellt",
+            "Backup restored on launch"
+        )
+        .to_string(),
     ))
 }
 
 fn main() -> gtk::glib::ExitCode {
+    glib::set_application_name("Lesefluss");
     let t0 = std::time::Instant::now();
     let dir = window::data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let app = adw::Application::builder()
-        .application_id("io.github.PROJEKTINHABER.Lesefluss")
+        .application_id("io.github.tobiasbischoff.Lesefluss")
         .build();
     // Erst die Einzelinstanz behaupten: ein Zweitstart darf die Datenbank einer
     // laufenden Instanz weder lesen noch ersetzen.
@@ -217,6 +264,14 @@ fn main() -> gtk::glib::ExitCode {
         }
     };
     let worker = dbworker::DbWorker::start(db_path);
+    // Read the saved language before creating any widgets or starting network work.
+    let saved_language = worker
+        .send(|db| db.get_pref("language"))
+        .recv()
+        .ok()
+        .and_then(|v| v.downcast::<storage::Result<Option<String>>>().ok())
+        .and_then(|v| (*v).ok().flatten());
+    strings::initialize(saved_language.as_deref());
     let net = Rc::new(net::Net::start());
     net.spawn_scheduler(worker.clone());
 
@@ -232,7 +287,10 @@ fn main() -> gtk::glib::ExitCode {
                     instance.show_toast(&msg);
                 }
                 if let Some(err) = worker2.failure.lock().ok().and_then(|f| f.clone()) {
-                    instance.show_toast(&format!("Datenbank nicht geöffnet: {err}"));
+                    instance.show_toast(&crate::tr_format!(
+                        "Datenbank nicht geöffnet: {err}",
+                        "Could not open database: {err}"
+                    ));
                 }
                 glib::idle_add_local(move || {
                     window::dbg_log(&format!("startup-ready {} ms", t0.elapsed().as_millis()));
@@ -299,7 +357,7 @@ mod restore_tests {
         .unwrap();
 
         let notice = apply_pending_restore(&dir).unwrap().expect("Hinweis");
-        assert!(notice.contains("wiederhergestellt"));
+        assert!(notice.contains("restored"));
         assert!(!dir.join("restore.pending").exists());
         assert!(!dir.join("library.restore-staged").exists());
         let db = storage::Database::open(&live).unwrap();
@@ -322,7 +380,7 @@ mod restore_tests {
         std::fs::write(dir.join("restore.pending"), vec![7u8; 8192]).unwrap();
 
         let err = apply_pending_restore(&dir).unwrap_err();
-        assert!(err.contains("abgebrochen"), "{err}");
+        assert!(err.contains("cancelled"), "{err}");
         assert_eq!(
             std::fs::read(&live).unwrap(),
             before,
@@ -348,7 +406,7 @@ mod restore_tests {
             Err(e) => e,
             Ok(_) => panic!("zweite Instanz darf die Sperre nicht erhalten"),
         };
-        assert!(err.contains("bereits"), "{err}");
+        assert!(err.contains("already"), "{err}");
         drop(first);
         LibraryLock::acquire(&dir).expect("nach Freigabe wieder möglich");
     }
@@ -372,7 +430,7 @@ mod restore_tests {
         )
         .unwrap();
         let err = apply_pending_restore(&dir).unwrap_err();
-        assert!(err.contains("abgebrochen"), "{err}");
+        assert!(err.contains("cancelled"), "{err}");
         assert_eq!(
             std::fs::read(&live).unwrap(),
             before,
@@ -403,7 +461,7 @@ mod restore_tests {
         }
         std::fs::write(dir.join("restore.pending"), std::fs::read(&fake).unwrap()).unwrap();
         let err = apply_pending_restore(&dir).unwrap_err();
-        assert!(err.contains("Schem") || err.contains("Spalte"), "{err}");
+        assert!(err.contains("schema") || err.contains("Column"), "{err}");
         assert_eq!(
             std::fs::read(&live).unwrap(),
             before,
@@ -425,7 +483,7 @@ mod restore_tests {
         )
         .unwrap();
         let err = apply_pending_restore(&dir).unwrap_err();
-        assert!(err.contains("alter Bestand erhalten"), "{err}");
+        assert!(err.contains("existing library kept"), "{err}");
         assert!(
             dir.join("library.db/inhalt").exists(),
             "alter Bestand unangetastet"
@@ -479,7 +537,7 @@ mod restore_tests {
         std::fs::copy(&staged, dir.join("library.db.new")).unwrap();
 
         let notice = apply_pending_restore(&dir).unwrap().expect("Hinweis");
-        assert!(notice.contains("abgeschlossen"), "{notice}");
+        assert!(notice.contains("completed"), "{notice}");
         let db = storage::Database::open(&live).unwrap();
         assert!(
             db.raw()

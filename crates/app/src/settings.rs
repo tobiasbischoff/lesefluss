@@ -9,24 +9,91 @@ impl App {
         let win = adw::PreferencesWindow::builder()
             .modal(true)
             .transient_for(&self.window)
+            .title(crate::tr!("Einstellungen", "Settings"))
             .build();
         let p = self.prefs.borrow().clone();
 
+        let language_page = adw::PreferencesPage::builder()
+            .title(crate::tr!("Sprache", "Language"))
+            .icon_name("preferences-desktop-locale-symbolic")
+            .build();
+        let language_group = adw::PreferencesGroup::builder()
+            .title(crate::tr!("Oberflächensprache", "Interface language"))
+            .build();
+        let language = adw::ComboRow::builder()
+            .title(crate::tr!("Sprache", "Language"))
+            .subtitle(crate::tr!(
+                "Wird nach einem Neustart angewendet",
+                "Applies after restarting Lesefluss"
+            ))
+            .model(&gtk::StringList::new(&[
+                "English",
+                "Deutsch",
+                crate::tr!("Systemsprache", "System language"),
+            ]))
+            .selected(match p.language {
+                crate::strings::LanguageChoice::English => 0,
+                crate::strings::LanguageChoice::German => 1,
+                crate::strings::LanguageChoice::System => 2,
+            })
+            .build();
+        language_group.add(&language);
+        if std::env::var("LF_LANG").ok().is_some_and(|v| !v.is_empty()) {
+            language_group.set_description(Some(crate::tr!(
+                "LF_LANG überschreibt die Auswahl beim Start. Zum Verwenden dieser Einstellung LF_LANG entfernen.",
+                "LF_LANG overrides this choice at startup. Unset LF_LANG to use this setting."
+            )));
+        }
+        language_page.add(&language_group);
+        win.add(&language_page);
+        let w = self.weak();
+        language.connect_selected_item_notify(move |row| {
+            let Some(app) = w.upgrade() else { return };
+            let choice = match row.selected() {
+                1 => crate::strings::LanguageChoice::German,
+                2 => crate::strings::LanguageChoice::System,
+                _ => crate::strings::LanguageChoice::English,
+            };
+            app.db_query(
+                move |db| db.set_pref("language", choice.key()),
+                move |app, result| {
+                    app.show_toast(if result.is_ok() {
+                        app.prefs.borrow_mut().language = choice;
+                        crate::tr!(
+                            "Sprache gespeichert — bitte Lesefluss neu starten",
+                            "Language saved — please restart Lesefluss"
+                        )
+                    } else {
+                        crate::tr!(
+                            "Sprache konnte nicht gespeichert werden",
+                            "Could not save language"
+                        )
+                    });
+                },
+            );
+        });
+
         let page_read = adw::PreferencesPage::builder()
-            .title("Lesen")
+            .title(crate::tr!("Lesen", "Reading"))
             .icon_name("text-x-generic-symbolic")
             .build();
         let grp = adw::PreferencesGroup::builder()
-            .title("Leseverhalten")
+            .title(crate::tr!("Leseverhalten", "Reading behavior"))
             .build();
         let auto = adw::SwitchRow::builder()
-            .title("Automatisch als gelesen markieren")
-            .subtitle("Nach 0,8 s sichtbarem Artikel")
+            .title(crate::tr!(
+                "Automatisch als gelesen markieren",
+                "Automatically mark as read"
+            ))
+            .subtitle(crate::tr!(
+                "Nach 0,8 s sichtbarem Artikel",
+                "After the article has been visible for 0.8 seconds"
+            ))
             .active(p.auto_read)
             .build();
         grp.add(&auto);
         let font = adw::SpinRow::builder()
-            .title("Schriftgröße Reader")
+            .title(crate::tr!("Schriftgröße Reader", "Reader font size"))
             .adjustment(&gtk::Adjustment::new(
                 p.reader_font,
                 14.0,
@@ -38,7 +105,10 @@ impl App {
             .build();
         grp.add(&font);
         let measure = adw::SpinRow::builder()
-            .title("Zeilenbreite (Zeichen)")
+            .title(crate::tr!(
+                "Zeilenbreite (Zeichen)",
+                "Line width (characters)"
+            ))
             .adjustment(&gtk::Adjustment::new(
                 p.reader_measure as f64,
                 55.0,
@@ -50,7 +120,7 @@ impl App {
             .build();
         grp.add(&measure);
         let lh = adw::SpinRow::builder()
-            .title("Zeilenhöhe")
+            .title(crate::tr!("Zeilenhöhe", "Line height"))
             .adjustment(&gtk::Adjustment::new(
                 p.reader_line_height,
                 1.4,
@@ -65,16 +135,19 @@ impl App {
         win.add(&page_read);
 
         let page_view = adw::PreferencesPage::builder()
-            .title("Darstellung")
+            .title(crate::tr!("Darstellung", "Appearance"))
             .icon_name("preferences-desktop-appearance-symbolic")
             .build();
         let grp = adw::PreferencesGroup::builder()
-            .title("Erscheinungsbild")
+            .title(crate::tr!("Erscheinungsbild", "Appearance"))
             .build();
         let theme = adw::ComboRow::builder()
             .title("Theme")
             .model(&gtk::StringList::new(&[
-                "system", "dark", "light", "omarchy",
+                crate::tr!("System", "System"),
+                crate::tr!("Dunkel", "Dark"),
+                crate::tr!("Hell", "Light"),
+                "Omarchy",
             ]))
             .build();
         let idx = match p.theme.as_str() {
@@ -86,30 +159,48 @@ impl App {
         theme.set_selected(idx);
         grp.add(&theme);
         let compact = adw::SwitchRow::builder()
-            .title("Kompakte Liste")
+            .title(crate::tr!("Kompakte Liste", "Compact list"))
             .active(p.compact)
             .build();
         grp.add(&compact);
         let block_images = adw::SwitchRow::builder()
-            .title("Externe Bilder blockieren")
-            .subtitle("Keine Bilder nachladen; nur Platzhalter mit Bildbeschreibung")
+            .title(crate::tr!(
+                "Externe Bilder blockieren",
+                "Block external images"
+            ))
+            .subtitle(crate::tr!(
+                "Keine Bilder nachladen; nur Platzhalter mit Bildbeschreibung",
+                "Show placeholders with image descriptions instead of loading images"
+            ))
             .active(p.block_images)
             .build();
         grp.add(&block_images);
         let thumbs = adw::SwitchRow::builder()
-            .title("Bildvorschauen in der Liste")
+            .title(crate::tr!(
+                "Bildvorschauen in der Liste",
+                "Image previews in the list"
+            ))
             .active(p.thumbs)
             .build();
         grp.add(&thumbs);
         let letters = adw::SwitchRow::builder()
-            .title("Buchstabenkürzel (j/k/n/p/m/s/o)")
+            .title(crate::tr!(
+                "Buchstabenkürzel (j/k/n/p/m/s/o)",
+                "Letter shortcuts (j/k/n/p/m/s/o)"
+            ))
             .active(p.letter_shortcuts)
             .build();
         grp.add(&letters);
         let order = adw::ComboRow::builder()
-            .title("Reihenfolge")
-            .subtitle("Gilt für alle Ansichten und Konten")
-            .model(&gtk::StringList::new(&["Neueste zuerst", "Älteste zuerst"]))
+            .title(crate::tr!("Reihenfolge", "Sort order"))
+            .subtitle(crate::tr!(
+                "Gilt für alle Ansichten und Konten",
+                "Applies to all views and accounts"
+            ))
+            .model(&gtk::StringList::new(&[
+                crate::tr!("Neueste zuerst", "Newest first"),
+                crate::tr!("Älteste zuerst", "Oldest first"),
+            ]))
             .selected(if p.newest_first { 0 } else { 1 })
             .build();
         grp.add(&order);
@@ -117,12 +208,14 @@ impl App {
         win.add(&page_view);
 
         let page_sync = adw::PreferencesPage::builder()
-            .title("Aktualisierung")
+            .title(crate::tr!("Aktualisierung", "Refresh"))
             .icon_name("view-refresh-symbolic")
             .build();
-        let grp = adw::PreferencesGroup::builder().title("Abruf").build();
+        let grp = adw::PreferencesGroup::builder()
+            .title(crate::tr!("Abruf", "Fetching"))
+            .build();
         let refresh = adw::SpinRow::builder()
-            .title("Intervall (Minuten)")
+            .title(crate::tr!("Intervall (Minuten)", "Interval (minutes)"))
             .adjustment(&gtk::Adjustment::new(
                 p.refresh_min as f64,
                 5.0,
@@ -137,15 +230,21 @@ impl App {
         win.add(&page_sync);
 
         let page_store = adw::PreferencesPage::builder()
-            .title("Speicher & Datenschutz")
+            .title(crate::tr!("Speicher & Datenschutz", "Storage & privacy"))
             .icon_name("drive-harddisk-symbolic")
             .build();
         let grp = adw::PreferencesGroup::builder()
-            .title("Aufbewahrung")
+            .title(crate::tr!("Aufbewahrung", "Retention"))
             .build();
         let retention = adw::SpinRow::builder()
-            .title("Gelesene Inhalte behalten (Tage)")
-            .subtitle("Danach Bereinigung; Gespeicherte bleiben")
+            .title(crate::tr!(
+                "Gelesene Inhalte behalten (Tage)",
+                "Keep read articles (days)"
+            ))
+            .subtitle(crate::tr!(
+                "Danach Bereinigung; Gespeicherte bleiben",
+                "Older read articles are removed; saved articles are kept"
+            ))
             .adjustment(&gtk::Adjustment::new(
                 p.retention_days as f64,
                 7.0,
@@ -157,7 +256,7 @@ impl App {
             .build();
         grp.add(&retention);
         let media = adw::SpinRow::builder()
-            .title("Bildcache (MiB)")
+            .title(crate::tr!("Bildcache (MiB)", "Image cache (MiB)"))
             .adjustment(&gtk::Adjustment::new(
                 p.media_mb as f64,
                 64.0,
@@ -171,20 +270,29 @@ impl App {
 
         // Speicherübersicht: Datenbank, Bildcache und gepinnte Dateien getrennt.
         let db_row = adw::ActionRow::builder()
-            .title("Datenbank")
-            .subtitle("wird berechnet …")
+            .title(crate::tr!("Datenbank", "Database"))
+            .subtitle(crate::tr!("wird berechnet …", "Calculating…"))
             .build();
         let cache_row = adw::ActionRow::builder()
-            .title("Bildcache")
-            .subtitle("wird berechnet …")
+            .title(crate::tr!("Bildcache", "Image cache"))
+            .subtitle(crate::tr!("wird berechnet …", "Calculating…"))
             .build();
         let pinned_row = adw::ActionRow::builder()
-            .title("Gepinnte Bilder (gespeicherte Artikel)")
-            .subtitle("werden nie automatisch gelöscht")
+            .title(crate::tr!(
+                "Gepinnte Bilder (gespeicherte Artikel)",
+                "Pinned images (saved articles)"
+            ))
+            .subtitle(crate::tr!(
+                "werden nie automatisch gelöscht",
+                "Never deleted automatically"
+            ))
             .build();
         let grp_usage = adw::PreferencesGroup::builder()
-            .title("Belegung")
-            .description("Getrennt nach Datenbank, Cache und geschützten Dateien")
+            .title(crate::tr!("Belegung", "Storage usage"))
+            .description(crate::tr!(
+                "Getrennt nach Datenbank, Cache und geschützten Dateien",
+                "Database, cache and protected files shown separately"
+            ))
             .build();
         grp_usage.add(&db_row);
         grp_usage.add(&cache_row);
@@ -208,7 +316,14 @@ impl App {
                 },
                 move |_app, res| {
                     if let Ok((count, bytes)) = res {
-                        pinned_row.set_subtitle(&format!("{count} Dateien · {} KiB", bytes / 1024));
+                        pinned_row.set_subtitle(&crate::tr_plural!(
+                            count,
+                            "{count} Datei · {} KiB",
+                            "{count} Dateien · {} KiB",
+                            "{count} file · {} KiB",
+                            "{count} files · {} KiB",
+                            bytes / 1024
+                        ));
                     }
                 },
             );
@@ -236,20 +351,29 @@ impl App {
         win.add(&page_store);
 
         let page_acc = adw::PreferencesPage::builder()
-            .title("Konten")
+            .title(crate::tr!("Konten", "Accounts"))
             .icon_name("system-users-symbolic")
             .build();
-        let grp = adw::PreferencesGroup::builder().title("Konten").build();
+        let grp = adw::PreferencesGroup::builder()
+            .title(crate::tr!("Konten", "Accounts"))
+            .build();
         let local = adw::ActionRow::builder()
-            .title("Lokale Bibliothek")
-            .subtitle("Aktiv — Feeds, OPML, Suche, Offline")
+            .title(crate::tr!("Lokale Bibliothek", "Local library"))
+            .subtitle(crate::tr!(
+                "Aktiv — Feeds, OPML, Suche, Offline",
+                "Active — feeds, OPML, search, offline access"
+            ))
             .build();
         grp.add(&local);
         let feedly_state = {
             let st = self.state.borrow();
             let connected = st.accounts.iter().any(|(_, k, _)| k == "feedly");
             if !connected {
-                "Nicht verbunden (Menü → Feedly verbinden …)".to_string()
+                crate::tr!(
+                    "Nicht verbunden (Menü → Feedly verbinden …)",
+                    "Not connected (Menu → Connect to Feedly…)"
+                )
+                .to_string()
             } else {
                 let acc = st
                     .accounts
@@ -267,8 +391,9 @@ impl App {
                     }
                     None => {
                         let _ = acc;
-                        format!(
+                        crate::tr_format!(
                             "Verbunden · Delta-Sync alle {} min",
+                            "Connected · incremental sync every {} min",
                             self.prefs.borrow().refresh_min
                         )
                     }

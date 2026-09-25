@@ -61,23 +61,32 @@ impl ReaderPane {
             .build();
         let loading = adw::StatusPage::builder()
             .icon_name("content-loading-symbolic")
-            .title("Artikel wird geladen …")
+            .title(crate::tr!("Artikel wird geladen …", "Loading article…"))
             .vexpand(true)
             .build();
         let empty = adw::StatusPage::builder()
             .icon_name("applications-library-symbolic")
-            .title("Kein Artikel geöffnet")
-            .description("Wähle links einen Artikel aus.")
+            .title(crate::tr!("Kein Artikel geöffnet", "No article open"))
+            .description(crate::tr!(
+                "Wähle links einen Artikel aus.",
+                "Select an article on the left."
+            ))
             .vexpand(true)
             .build();
         let error = adw::StatusPage::builder()
             .icon_name("dialog-error-symbolic")
-            .title("Der Artikel konnte nicht dargestellt werden")
-            .description("Der Web-Prozess wurde beendet. Der Inhalt ist weiterhin lokal verfügbar.")
+            .title(crate::tr!(
+                "Der Artikel konnte nicht dargestellt werden",
+                "The article could not be displayed"
+            ))
+            .description(crate::tr!(
+                "Der Web-Prozess wurde beendet. Der Inhalt ist weiterhin lokal verfügbar.",
+                "The web process stopped. The content is still available offline."
+            ))
             .vexpand(true)
             .build();
         let retry = gtk::Button::builder()
-            .label("Erneut versuchen")
+            .label(crate::tr!("Erneut versuchen", "Try again"))
             .css_classes(vec!["pill".to_string(), "suggested-action".to_string()])
             .action_name("win.reader-retry")
             .build();
@@ -90,7 +99,7 @@ impl ReaderPane {
         stack.set_visible_child_name("empty");
 
         let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text("Im Artikel suchen")
+            .placeholder_text(crate::tr!("Im Artikel suchen", "Find in article"))
             .build();
         let search_bar = gtk::SearchBar::builder()
             .child(&search_entry)
@@ -99,36 +108,48 @@ impl ReaderPane {
 
         let btn_read = gtk::Button::builder()
             .icon_name("mail-unread-symbolic")
-            .tooltip_text("Gelesen/ungelesen umschalten (M)")
+            .tooltip_text(crate::tr!(
+                "Gelesen/ungelesen umschalten (M)",
+                "Toggle read/unread (M)"
+            ))
             .action_name("win.toggle-read")
             .build();
         let btn_saved = gtk::Button::builder()
             .icon_name("bookmark-new-symbolic")
-            .tooltip_text("Speichern/Entspeichern (S)")
+            .tooltip_text(crate::tr!("Speichern/Entspeichern (S)", "Save/unsave (S)"))
             .action_name("win.toggle-saved")
             .build();
         let btn_external = gtk::Button::builder()
             .icon_name("external-link-symbolic")
-            .tooltip_text("Im Browser öffnen (O)")
+            .tooltip_text(crate::tr!("Im Browser öffnen (O)", "Open in browser (O)"))
             .action_name("win.open-external")
             .build();
 
         let zoom_menu = gio::Menu::new();
-        zoom_menu.append(Some("Größer"), Some("win.zoom-in"));
-        zoom_menu.append(Some("Kleiner"), Some("win.zoom-out"));
-        zoom_menu.append(Some("Zurücksetzen"), Some("win.zoom-reset"));
+        zoom_menu.append(Some(crate::tr!("Größer", "Larger")), Some("win.zoom-in"));
+        zoom_menu.append(Some(crate::tr!("Kleiner", "Smaller")), Some("win.zoom-out"));
+        zoom_menu.append(
+            Some(crate::tr!("Zurücksetzen", "Reset")),
+            Some("win.zoom-reset"),
+        );
         let btn_zoom = gtk::MenuButton::builder()
             .icon_name("font-x-large-symbolic")
-            .tooltip_text("Typografie")
+            .tooltip_text(crate::tr!("Typografie", "Typography"))
             .menu_model(&zoom_menu)
             .build();
 
         let more_menu = gio::Menu::new();
-        more_menu.append(Some("Link kopieren"), Some("win.copy-link"));
-        more_menu.append(Some("Im Artikel suchen"), Some("win.find"));
+        more_menu.append(
+            Some(crate::tr!("Link kopieren", "Copy link")),
+            Some("win.copy-link"),
+        );
+        more_menu.append(
+            Some(crate::tr!("Im Artikel suchen", "Find in article")),
+            Some("win.find"),
+        );
         let btn_more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
-            .tooltip_text("Weitere Aktionen")
+            .tooltip_text(crate::tr!("Weitere Aktionen", "More actions"))
             .menu_model(&more_menu)
             .build();
 
@@ -167,7 +188,13 @@ impl ReaderPane {
                                 None::<&gio::Cancellable>,
                                 |res| {
                                     if let Err(e) = res {
-                                        eprintln!("Extern öffnen fehlgeschlagen: {e}");
+                                        eprintln!(
+                                            "{}",
+                                            crate::tr_format!(
+                                                "Extern öffnen fehlgeschlagen: {e}",
+                                                "Could not open in browser: {e}"
+                                            )
+                                        );
                                     }
                                 },
                             );

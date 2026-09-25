@@ -33,12 +33,12 @@
 
 ## Distribution
 
-- **App-ID ist ein Platzhalter** (`io.github.PROJEKTINHABER.Lesefluss`) und wird mit der
-  Namensklärung vor der ersten Veröffentlichung ersetzt; Desktop-Datei, AppStream und Icon
-  tragen dieselbe ID und müssen dann gemeinsam umbenannt werden.
-- **PKGBUILD** ist auf ein lokales Quellverzeichnis ausgelegt (`source=("git+file://$srcdir/../")`)
-  und vor einer echten Veröffentlichung auf ein echtes Repository umzuschreiben. `makepkg` wurde
-  auf dieser Maschine noch nicht vollständig durchlaufen.
+- **App-Name:** Lesefluss. Die App-ID ist `io.github.tobiasbischoff.Lesefluss`;
+  Desktop-Datei, AppStream und Icon verwenden dieselbe Kennung. Projektadresse:
+  `https://github.com/tobiasbischoff/lesefluss`.
+- **PKGBUILD** baut den lokalen Repository-Checkout (`source=()`).
+  Es gibt noch kein veröffentlichtes AUR-Paket; die Installation aus dem Checkout
+  ist in der README beschrieben.
 - **Flatpak** ist nicht enthalten; Portal-, Schlüsselbund- und Theme-Zugriffe wären dort separat
   zu prüfen und minimal zu halten.
 - **Kein Installer/Updater**, keine Signatur, kein AUR-Eintrag.

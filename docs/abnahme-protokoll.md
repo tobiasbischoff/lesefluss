@@ -27,11 +27,11 @@ nicht „vermutlich in Ordnung“.
 | Konflikte nach ACK | jüngere Absicht gewinnt | Test `stale_pull_cannot_overwrite_a_confirmed_local_intent` | dito | erfüllt |
 | Retention | Pending geschützt, Metadaten erhalten | Test `retention_keeps_metadata_and_protects_pending_outbox` | dito | erfüllt |
 | Volltextindex | keine Waisen nach rowid-Wiederverwendung | Test `fts_index_survives_rowid_reuse` | dito | erfüllt |
-| Restore | defekte Datei darf Bestand nicht ersetzen | Tests `broken_candidate_keeps_existing_library`, `valid_candidate_replaces_library_and_keeps_safety_copy` | `cargo test --bin lesefluss-app` | erfüllt |
+| Restore | defekte Datei darf Bestand nicht ersetzen | Tests `broken_candidate_keeps_existing_library`, `valid_candidate_replaces_library_and_keeps_safety_copy` | `cargo test --bin lesefluss` | erfüllt |
 | Netzwerkgrenzen | keine Ziele ins Heimnetz, Bodies begrenzt | Tests `private_and_loopback_targets_are_blocked`, `oversized_chunked_body_is_aborted_before_full_allocation` | `cargo test -p provider-local` | erfüllt |
 | Bilder | SVG ausgeschlossen, 40-MP-Grenze wirksam | `oversized_images_are_rejected_by_header_dimensions` | dito | erfüllt |
 | Pagination | Limit gilt als unvollständig | `pager_reports_safety_limit_as_incomplete`, `pager_detects_cursor_cycles` | `cargo test -p provider-feedly` | erfüllt |
-| Tastaturroute | eindeutiger Besitzer, keine Felder | `letter_keys_map_to_actions`, `other_keys_are_untouched`, `editing_classes_are_recognized` | `cargo test --bin lesefluss-app` | erfüllt |
+| Tastaturroute | eindeutiger Besitzer, keine Felder | `letter_keys_map_to_actions`, `other_keys_are_untouched`, `editing_classes_are_recognized` | `cargo test --bin lesefluss` | erfüllt |
 | OPML-Hierarchie | Stack korrekt, Grenzen hart | `group_after_feed_outline_stays_open`, `unbalanced_and_too_deep_documents_are_rejected` | dito | erfüllt |
 | Sortierung | beide Richtungen, lückenlos | `oldest_first_paginates_without_gaps_or_repeats`, `search_also_supports_oldest_first` | `cargo test -p storage` | erfüllt |
 | Abbestellen | gespeicherte Artikel bleiben | `unsubscribing_keeps_saved_articles_and_stops_fetching` | dito | erfüllt |
@@ -41,8 +41,8 @@ nicht „vermutlich in Ordnung“.
 | Fall | Soll | Ist | Beleg | Status |
 |---|---|---|---|---|
 | Startzeit | warm p95 < 700 ms | 192–232 ms | `LF_DEBUG=1` → `startup-ready` | erfüllt |
-| Lokale Auswahl | p95 < 50 ms | Seitenabruf 11 ms p95 (100k-Artikel-DB) | `lf-bench` | erfüllt (ohne Renderzeit) |
-| Suche 100k | p95 < 150 ms | 45,6 ms p95 | `lf-bench` | erfüllt |
+| Lokale Auswahl | p95 < 50 ms | Seitenabruf 11 ms p95 (100k-Artikel-DB) | `lesefluss-bench` | erfüllt (ohne Renderzeit) |
+| Suche 100k | p95 < 150 ms | 45,6 ms p95 | `lesefluss-bench` | erfüllt |
 | Idle-CPU | < 1 % Kern | 0,20 % über 10 s | `/proc/<pid>/stat` | erfüllt |
 | Speicher | < 350 MiB PSS | 123 MiB | `/proc/<pid>/smaps_rollup` | erfüllt |
 | Frame-Pacing | keine Stalls > 50 ms | max 33 ms unter Navigationslast | `LF_FRAMECHECK=stress` | erfüllt (ohne Endgerät-Scrollen) |

@@ -1,7 +1,7 @@
 # M1 — Status und Abnahme
 
-**Stand:** 23.09.2026. Build: `cargo run --bin lesefluss-app` (App-ID
-`io.github.PROJEKTINHABER.Lesefluss`).
+**Stand:** 23.09.2026. Build: `cargo run --bin lesefluss` (App-ID
+`io.github.tobiasbischoff.Lesefluss`).
 
 ## Umgesetzt
 

@@ -174,14 +174,20 @@ pub fn first_account_of_kind(accounts: &[(String, String, String)], kind: &str) 
 
 pub fn status_label(status: &str) -> &'static str {
     match status {
-        "initial_sync" => "Erstsynchronisation läuft",
-        "syncing" => "Synchronisation läuft",
-        "ready" => "Verbunden und aktuell",
-        "offline" => "Offline — lokale Daten nutzbar",
-        "rate_limited" => "Drosselung durch Feedly, späterer Versuch",
-        "auth_required" => "Erneute Anmeldung erforderlich",
-        "degraded" => "Eingeschränkt synchronisiert",
-        _ => "Getrennt",
+        "initial_sync" => crate::tr!("Erstsynchronisation läuft", "Initial sync in progress"),
+        "syncing" => crate::tr!("Synchronisation läuft", "Sync in progress"),
+        "ready" => crate::tr!("Verbunden und aktuell", "Connected and up to date"),
+        "offline" => crate::tr!(
+            "Offline — lokale Daten nutzbar",
+            "Offline — local data available"
+        ),
+        "rate_limited" => crate::tr!(
+            "Drosselung durch Feedly, späterer Versuch",
+            "Rate limited by Feedly, retrying later"
+        ),
+        "auth_required" => crate::tr!("Erneute Anmeldung erforderlich", "Sign in again"),
+        "degraded" => crate::tr!("Eingeschränkt synchronisiert", "Partially synced"),
+        _ => crate::tr!("Getrennt", "Disconnected"),
     }
 }
 
@@ -637,17 +643,32 @@ mod router_tests {
 
     #[test]
     fn account_states_are_translated() {
-        assert_eq!(status_label("ready"), "Verbunden und aktuell");
+        assert_eq!(
+            status_label("ready"),
+            crate::tr!("Verbunden und aktuell", "Connected and up to date")
+        );
         assert_eq!(
             status_label("auth_required"),
-            "Erneute Anmeldung erforderlich"
+            crate::tr!("Erneute Anmeldung erforderlich", "Sign in again")
         );
         assert_eq!(
             status_label("rate_limited"),
-            "Drosselung durch Feedly, späterer Versuch"
+            crate::tr!(
+                "Drosselung durch Feedly, späterer Versuch",
+                "Rate limited by Feedly, retrying later"
+            )
         );
-        assert_eq!(status_label("offline"), "Offline — lokale Daten nutzbar");
-        assert_eq!(status_label("unbekannt"), "Getrennt");
+        assert_eq!(
+            status_label("offline"),
+            crate::tr!(
+                "Offline — lokale Daten nutzbar",
+                "Offline — local data available"
+            )
+        );
+        assert_eq!(
+            status_label("unbekannt"),
+            crate::tr!("Getrennt", "Disconnected")
+        );
     }
 
     #[test]
@@ -952,7 +973,6 @@ pub struct App {
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
     /// Fertige Medienergebnisse: Artikel (Feed, ID), Dokumentgeneration, Ersetzungen.
     pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<PendingMedia>>>,
-    pub strings: crate::strings::Strings,
     pub focus_mode: Cell<bool>,
     pub bg_jobs_tx: JobSender,
     pub bg_jobs_rx: JobReceiver,
@@ -973,7 +993,6 @@ pub struct App {
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(application: &adw::Application, worker: DbWorker, net: Rc<Net>) -> Rc<Self> {
-        let st = crate::strings::Strings::detect();
         let reader = Rc::new(ReaderPane::new());
 
         let sidebar_list = gtk::ListBox::builder()
@@ -989,7 +1008,7 @@ impl App {
             .vexpand(true)
             .build();
         let last_sync_label = gtk::Label::builder()
-            .label("Noch nicht aktualisiert")
+            .label(crate::tr!("Noch nicht aktualisiert", "Not refreshed yet"))
             .xalign(0.0)
             .margin_start(16)
             .margin_end(16)
@@ -1002,34 +1021,63 @@ impl App {
         sidebar_footer.append(&last_sync_label);
 
         let primary_menu = gio::Menu::new();
-        primary_menu.append(Some("Feedly verbinden …"), Some("win.connect-feedly"));
-        primary_menu.append(Some("Feedly trennen"), Some("win.disconnect-feedly"));
-        primary_menu.append(Some("OPML importieren …"), Some("win.import-opml"));
-        primary_menu.append(Some("OPML exportieren …"), Some("win.export-opml"));
-        primary_menu.append(Some("Backup erstellen …"), Some("win.backup"));
-        primary_menu.append(Some("Nur-Lesen-Ansicht (F9)"), Some("win.focus-mode"));
-        primary_menu.append(Some("Aus Backup wiederherstellen …"), Some("win.restore"));
+        primary_menu.append(
+            Some(crate::tr!("Feedly verbinden …", "Connect to Feedly…")),
+            Some("win.connect-feedly"),
+        );
+        primary_menu.append(
+            Some(crate::tr!("Feedly trennen", "Disconnect Feedly")),
+            Some("win.disconnect-feedly"),
+        );
+        primary_menu.append(
+            Some(crate::tr!("OPML importieren …", "Import OPML…")),
+            Some("win.import-opml"),
+        );
+        primary_menu.append(
+            Some(crate::tr!("OPML exportieren …", "Export OPML…")),
+            Some("win.export-opml"),
+        );
+        primary_menu.append(
+            Some(crate::tr!("Backup erstellen …", "Create backup…")),
+            Some("win.backup"),
+        );
+        primary_menu.append(
+            Some(crate::tr!("Nur-Lesen-Ansicht (F9)", "Reading view (F9)")),
+            Some("win.focus-mode"),
+        );
+        primary_menu.append(
+            Some(crate::tr!(
+                "Aus Backup wiederherstellen …",
+                "Restore from backup…"
+            )),
+            Some("win.restore"),
+        );
         let settings_section = gio::Menu::new();
-        settings_section.append(Some("Einstellungen"), Some("win.settings"));
+        settings_section.append(
+            Some(crate::tr!("Einstellungen", "Settings")),
+            Some("win.settings"),
+        );
         primary_menu.append_section(None, &settings_section);
         let btn_hamburger = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
-            .tooltip_text(st.get("Menü", "Menu"))
+            .tooltip_text(crate::tr!("Menü", "Menu"))
             .menu_model(&primary_menu)
             .primary(true)
             .build();
         let btn_refresh = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text(st.get("Aktualisieren (Strg+R)", "Refresh (Ctrl+R)"))
+            .tooltip_text(crate::tr!("Aktualisieren (Strg+R)", "Refresh (Ctrl+R)"))
             .action_name("win.refresh")
             .build();
         let btn_add = gtk::Button::builder()
             .icon_name("list-add-symbolic")
-            .tooltip_text(st.get("Feed hinzufügen (Strg+N)", "Add feed (Ctrl+N)"))
+            .tooltip_text(crate::tr!("Feed hinzufügen (Strg+N)", "Add feed (Ctrl+N)"))
             .action_name("win.add-feed")
             .build();
-        let sidebar_title =
-            adw::WindowTitle::new("Lesefluss", &st.get("Lokale Bibliothek", "Local library"));
+        let sidebar_title = adw::WindowTitle::new(
+            "Lesefluss",
+            crate::tr!("Lokale Bibliothek", "Local library"),
+        );
         let sidebar_header = adw::HeaderBar::builder()
             .title_widget(&sidebar_title)
             .build();
@@ -1043,7 +1091,8 @@ impl App {
         sidebar_body.add_css_class("lf-sidebar");
         let sidebar_toolbar = adw::ToolbarView::builder().content(&sidebar_body).build();
         sidebar_toolbar.add_top_bar(&sidebar_header);
-        let sources_page = adw::NavigationPage::new(&sidebar_toolbar, "Quellen");
+        let sources_page =
+            adw::NavigationPage::new(&sidebar_toolbar, crate::tr!("Quellen", "Sources"));
 
         let list_store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let list_selection = gtk::SingleSelection::builder()
@@ -1065,15 +1114,15 @@ impl App {
             .build();
         let list_empty = adw::StatusPage::builder()
             .icon_name("mailbox-symbolic")
-            .title(st.get("Keine Artikel", "No articles"))
-            .description(st.get(
+            .title(crate::tr!("Keine Artikel", "No articles"))
+            .description(crate::tr!(
                 "In dieser Ansicht ist gerade nichts los.",
-                "There is nothing in this view right now.",
+                "There is nothing in this view right now."
             ))
             .vexpand(true)
             .build();
         let new_articles_label = gtk::Button::builder()
-            .label("Neue Artikel")
+            .label(crate::tr!("Neue Artikel", "New articles"))
             .has_frame(false)
             .css_classes(vec!["lf-new-articles".to_string()])
             .build();
@@ -1089,47 +1138,59 @@ impl App {
         list_stack.set_visible_child_name("list");
 
         let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text("Artikel durchsuchen (Strg+L)")
+            .placeholder_text(crate::tr!(
+                "Artikel durchsuchen (Strg+L)",
+                "Search articles (Ctrl+L)"
+            ))
             .build();
         let search_bar = gtk::SearchBar::builder()
             .child(&search_entry)
             .show_close_button(true)
             .build();
 
-        let list_title = adw::WindowTitle::new(&st.get("Ungelesen", "Unread"), "");
+        let list_title = adw::WindowTitle::new(crate::tr!("Ungelesen", "Unread"), "");
         let list_header = adw::HeaderBar::builder().title_widget(&list_title).build();
         let sort_button = gtk::Button::builder()
             .icon_name("view-sort-descending-symbolic")
-            .tooltip_text(st.get(
+            .tooltip_text(crate::tr!(
                 "Reihenfolge umkehren (Strg+Shift+P)",
-                "Reverse order (Ctrl+Shift+P)",
+                "Reverse order (Ctrl+Shift+P)"
             ))
             .action_name("win.toggle-sort-order")
             .build();
         list_header.pack_start(&sort_button);
         let list_menu = gio::Menu::new();
         list_menu.append(
-            Some("Bereich als gelesen markieren…"),
+            Some(crate::tr!(
+                "Bereich als gelesen markieren…",
+                "Mark section as read…"
+            )),
             Some("win.mark-scope-read"),
         );
         let list_more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .menu_model(&list_menu)
-            .tooltip_text("Listenaktionen")
+            .tooltip_text(crate::tr!("Listenaktionen", "List actions"))
             .build();
         list_header.pack_end(&list_more);
         let filter_saved = gtk::ToggleButton::builder()
             .icon_name("user-bookmarks-symbolic")
-            .tooltip_text("Gespeicherte Artikel anzeigen")
+            .tooltip_text(crate::tr!(
+                "Gespeicherte Artikel anzeigen",
+                "Show saved articles"
+            ))
             .build();
         let filter_unread = gtk::ToggleButton::builder()
             .icon_name("mail-unread-symbolic")
-            .tooltip_text("Ungelesene Artikel anzeigen")
+            .tooltip_text(crate::tr!(
+                "Ungelesene Artikel anzeigen",
+                "Show unread articles"
+            ))
             .active(true)
             .build();
         let filter_all = gtk::ToggleButton::builder()
             .icon_name("view-list-symbolic")
-            .tooltip_text("Alle Artikel anzeigen")
+            .tooltip_text(crate::tr!("Alle Artikel anzeigen", "Show all articles"))
             .build();
         let filter_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         filter_box.add_css_class("lf-filterbar");
@@ -1147,11 +1208,14 @@ impl App {
         list_toolbar.add_top_bar(&list_header);
         list_toolbar.add_top_bar(&search_bar);
         list_toolbar.add_bottom_bar(&filter_wrap);
-        let list_page = adw::NavigationPage::new(&list_toolbar, "Artikel");
+        let list_page = adw::NavigationPage::new(&list_toolbar, crate::tr!("Artikel", "Articles"));
 
         let btn_back = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
-            .tooltip_text("Zurück zur Artikelliste")
+            .tooltip_text(crate::tr!(
+                "Zurück zur Artikelliste",
+                "Back to article list"
+            ))
             .action_name("win.reader-back")
             .build();
         reader.header.pack_start(&btn_back);
@@ -1160,17 +1224,20 @@ impl App {
         fn label(btn: &gtk::Widget, text: &str) {
             btn.update_property(&[gtk::accessible::Property::Label(text)]);
         }
-        label(btn_hamburger.upcast_ref(), &st.get("Menü", "Menu"));
+        label(btn_hamburger.upcast_ref(), crate::tr!("Menü", "Menu"));
         label(
             btn_refresh.upcast_ref(),
-            &st.get("Aktualisieren", "Refresh"),
+            crate::tr!("Aktualisieren", "Refresh"),
         );
-        label(btn_add.upcast_ref(), &st.get("Feed hinzufügen", "Add feed"));
+        label(
+            btn_add.upcast_ref(),
+            crate::tr!("Feed hinzufügen", "Add feed"),
+        );
         label(
             btn_hamburger.upcast_ref(),
-            &st.get(
+            crate::tr!(
                 "Menü: OPML, Backup, Einstellungen",
-                "Menu: OPML, backup, settings",
+                "Menu: OPML, backup, settings"
             ),
         );
 
@@ -1178,14 +1245,20 @@ impl App {
             .min_sidebar_width(280.0)
             .max_sidebar_width(460.0)
             .sidebar(&list_page)
-            .content(&adw::NavigationPage::new(&reader.toolbar, "Lesen"))
+            .content(&adw::NavigationPage::new(
+                &reader.toolbar,
+                crate::tr!("Lesen", "Reading"),
+            ))
             .build();
 
         let outer = adw::NavigationSplitView::builder()
             .min_sidebar_width(208.0)
             .max_sidebar_width(320.0)
             .sidebar(&sources_page)
-            .content(&adw::NavigationPage::new(&inner, "Artikel"))
+            .content(&adw::NavigationPage::new(
+                &inner,
+                crate::tr!("Artikel", "Articles"),
+            ))
             .build();
 
         btn_back
@@ -1205,7 +1278,7 @@ impl App {
         window.add_css_class("lf-window");
         gtk::prelude::GtkWindowExt::set_icon_name(
             &window,
-            Some("io.github.PROJEKTINHABER.Lesefluss"),
+            Some("io.github.tobiasbischoff.Lesefluss"),
         );
 
         let css = gtk::CssProvider::new();
@@ -1254,7 +1327,6 @@ impl App {
             ),
             pending_db: RefCell::new(Vec::new()),
             pending_media: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            strings: crate::strings::Strings { lang: st.lang },
             focus_mode: Cell::new(false),
             bg_jobs_tx: bg_jobs_tx.clone(),
             bg_jobs_rx,
@@ -1412,7 +1484,13 @@ impl App {
                 self.touch_last_sync();
                 let label = title.unwrap_or_else(|| format!("Feed {feed_id}"));
                 if added > 0 {
-                    self.show_toast(&format!("{label}: {added} neue Artikel"));
+                    self.show_toast(&crate::tr_plural!(
+                        added,
+                        "{label}: {added} neuer Artikel",
+                        "{label}: {added} neue Artikel",
+                        "{label}: {added} new article",
+                        "{label}: {added} new articles"
+                    ));
                     let at_top = self.list_scroll.vadjustment().value() < 80.0;
                     self.reload_counts();
                     if at_top {
@@ -1424,11 +1502,17 @@ impl App {
             }
             NetEvent::FetchFailed { message } => {
                 self.touch_last_sync();
-                self.show_toast(&format!("Abruf fehlgeschlagen: {message}"));
+                self.show_toast(&crate::tr_format!(
+                    "Abruf fehlgeschlagen: {message}",
+                    "Refresh failed: {message}"
+                ));
             }
             NetEvent::DiscoveryDone { candidates } => self.show_discovery_dialog(candidates),
             NetEvent::DiscoveryFailed { message } => {
-                self.show_toast(&format!("Kein Feed gefunden: {message}"));
+                self.show_toast(&crate::tr_format!(
+                    "Kein Feed gefunden: {message}",
+                    "No feed found: {message}"
+                ));
             }
             NetEvent::FeedlySyncDone {
                 account_id,
@@ -1471,7 +1555,13 @@ impl App {
                 );
                 self.reload_meta_keep();
                 if added > 0 {
-                    self.show_toast(&format!("Feedly: {added} neue Artikel"));
+                    self.show_toast(&crate::tr_plural!(
+                        added,
+                        "Feedly: {added} neuer Artikel",
+                        "Feedly: {added} neue Artikel",
+                        "Feedly: {added} new article",
+                        "Feedly: {added} new articles"
+                    ));
                 }
             }
             NetEvent::FeedlySyncFailed {
@@ -1498,7 +1588,10 @@ impl App {
                     let mut st = self.state.borrow_mut();
                     finish_run(&mut st, &account_id, run_id, pause)
                 };
-                self.show_toast(&format!("Feedly-Sync fehlgeschlagen: {message}"));
+                self.show_toast(&crate::tr_format!(
+                    "Feedly-Sync fehlgeschlagen: {message}",
+                    "Feedly sync failed: {message}"
+                ));
                 match reserved {
                     Ok(Some(_)) => self.start_queued_feedly_run(),
                     Ok(None) => {}
@@ -1511,8 +1604,11 @@ impl App {
     fn touch_last_sync(&self) {
         let now = now_ms();
         self.state.borrow_mut().last_sync = Some(now);
-        self.last_sync_label
-            .set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(now)));
+        self.last_sync_label.set_label(&crate::tr_format!(
+            "Zuletzt aktualisiert: {}",
+            "Last refreshed: {}",
+            fmt_time(now)
+        ));
         self.worker.send(move |db| db.set_last_sync("local", now));
     }
 
@@ -1633,8 +1729,11 @@ impl App {
                     app.with_token(TokenAction::StartFeedly);
                 }
                 if let Some(ms) = last {
-                    app.last_sync_label
-                        .set_label(&format!("Zuletzt aktualisiert: {}", fmt_time(ms)));
+                    app.last_sync_label.set_label(&crate::tr_format!(
+                        "Zuletzt aktualisiert: {}",
+                        "Last refreshed: {}",
+                        fmt_time(ms)
+                    ));
                 }
                 app.run_retention();
                 app.refresh_sidebar();
@@ -1959,7 +2058,10 @@ impl App {
         let raw = match self.worker.read_layout() {
             Ok(raw) => raw,
             Err(message) => {
-                dbg_log(&format!("Layout nicht wiederhergestellt: {message}"));
+                dbg_log(&crate::tr_format!(
+                    "Layout nicht wiederhergestellt: {message}",
+                    "Could not restore layout: {message}"
+                ));
                 None
             }
         };
@@ -2011,8 +2113,13 @@ impl App {
             return;
         }
         self.new_articles_bar.set_visible(true);
-        self.new_articles_label
-            .set_label(&format!("{count} neue Artikel"));
+        self.new_articles_label.set_label(&crate::tr_plural!(
+            count,
+            "{count} neuer Artikel",
+            "{count} neue Artikel",
+            "{count} new article",
+            "{count} new articles"
+        ));
     }
 
     /// Aktuell sichtbarer oberster Artikel als logischer Schlüssel (Feed + ID).
@@ -2055,26 +2162,30 @@ impl App {
                 .iter()
                 .find(|(a, _, _)| a == id)
                 .map(|(_, k, n)| format!("{} · {}", k, n))
-                .unwrap_or_else(|| "Konto".into())
+                .unwrap_or_else(|| crate::tr!("Konto", "Account").into())
         };
         match &st.scope {
             Scope::Global => {
                 if st.accounts.iter().any(|(_, k, _)| k != "local") {
-                    "Alle Konten".into()
+                    crate::tr!("Alle Konten", "All accounts").into()
                 } else {
-                    "Lokale Bibliothek".into()
+                    crate::tr!("Lokale Bibliothek", "Local library").into()
                 }
             }
             Scope::Account(a) => acc_name(a),
             Scope::Feed(f) => match st.feeds.iter().find(|x| x.id == *f) {
-                Some(feed) if feed.account_id == "local" => "Lokale Bibliothek".into(),
+                Some(feed) if feed.account_id == "local" => {
+                    crate::tr!("Lokale Bibliothek", "Local library").into()
+                }
                 Some(feed) => acc_name(&feed.account_id),
-                None => "Lokale Bibliothek".into(),
+                None => crate::tr!("Lokale Bibliothek", "Local library").into(),
             },
             Scope::Group(g) => match st.groups.iter().find(|x| x.id == *g) {
-                Some(gr) if gr.account_id == "local" => "Lokale Bibliothek".into(),
+                Some(gr) if gr.account_id == "local" => {
+                    crate::tr!("Lokale Bibliothek", "Local library").into()
+                }
                 Some(gr) => acc_name(&gr.account_id),
-                None => "Lokale Bibliothek".into(),
+                None => crate::tr!("Lokale Bibliothek", "Local library").into(),
             },
         }
     }
@@ -2085,26 +2196,50 @@ impl App {
         let menu = gio::Menu::new();
         match source {
             Scope::Feed(_) => {
-                menu.append(Some("Umbenennen …"), Some("win.rename-feed"));
-                menu.append(Some("Gruppen …"), Some("win.edit-feed-groups"));
-                menu.append(Some("Als gelesen markieren"), Some("win.mark-source-read"));
-                menu.append(Some("Abbestellen …"), Some("win.unsubscribe-feed"));
+                menu.append(
+                    Some(crate::tr!("Umbenennen …", "Rename…")),
+                    Some("win.rename-feed"),
+                );
+                menu.append(
+                    Some(crate::tr!("Gruppen …", "Groups…")),
+                    Some("win.edit-feed-groups"),
+                );
+                menu.append(
+                    Some(crate::tr!("Als gelesen markieren", "Mark as read")),
+                    Some("win.mark-source-read"),
+                );
+                menu.append(
+                    Some(crate::tr!("Abbestellen …", "Unsubscribe…")),
+                    Some("win.unsubscribe-feed"),
+                );
             }
             Scope::Group(group_id) => {
-                menu.append(Some("Gruppe umbenennen …"), Some("win.rename-group"));
                 menu.append(
-                    Some("Alle als gelesen markieren"),
+                    Some(crate::tr!("Gruppe umbenennen …", "Rename group…")),
+                    Some("win.rename-group"),
+                );
+                menu.append(
+                    Some(crate::tr!("Alle als gelesen markieren", "Mark all as read")),
                     Some("win.mark-scope-read"),
                 );
                 let _ = group_id;
             }
             Scope::Account(_) => {
-                menu.append(Some("Aktualisieren"), Some("win.refresh"));
+                menu.append(
+                    Some(crate::tr!("Aktualisieren", "Refresh")),
+                    Some("win.refresh"),
+                );
             }
             Scope::Global => {
-                menu.append(Some("Aktualisieren"), Some("win.refresh"));
                 menu.append(
-                    Some("Alle als gelesen markieren …"),
+                    Some(crate::tr!("Aktualisieren", "Refresh")),
+                    Some("win.refresh"),
+                );
+                menu.append(
+                    Some(crate::tr!(
+                        "Alle als gelesen markieren …",
+                        "Mark all as read…"
+                    )),
                     Some("win.mark-scope-read"),
                 );
             }
@@ -2234,9 +2369,9 @@ impl App {
             }
         };
         self.show_toast(if newest {
-            "Reihenfolge: neueste zuerst"
+            crate::tr!("Reihenfolge: neueste zuerst", "Order: newest first")
         } else {
-            "Reihenfolge: älteste zuerst"
+            crate::tr!("Reihenfolge: älteste zuerst", "Order: oldest first")
         });
         self.load_page(false);
     }
@@ -2258,12 +2393,15 @@ impl App {
             .activates_default(true)
             .build();
         let dialog = adw::AlertDialog::builder()
-            .heading("Feed umbenennen")
-            .body("Der Name wird lokal gespeichert und nicht beim nächsten Abruf überschrieben.")
+            .heading(crate::tr!("Feed umbenennen", "Rename feed"))
+            .body(crate::tr!(
+                "Der Name wird lokal gespeichert und nicht beim nächsten Abruf überschrieben.",
+                "The name is saved locally and kept when the feed refreshes."
+            ))
             .extra_child(&entry)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("ok", "Speichern");
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response("ok", crate::tr!("Speichern", "Save"));
         dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("ok"));
         dialog.set_close_response("cancel");
@@ -2323,16 +2461,16 @@ impl App {
             list.append(check);
         }
         let new_name = gtk::Entry::builder()
-            .placeholder_text("Neue Gruppe")
+            .placeholder_text(crate::tr!("Neue Gruppe", "New group"))
             .build();
         list.append(&new_name);
         let dialog = adw::AlertDialog::builder()
-            .heading("Gruppen wählen")
-            .body("Ein Feed darf mehreren Gruppen angehören. Die lokale Bibliothek unterstützt verschachtelte Gruppen.")
+            .heading(crate::tr!("Gruppen wählen", "Choose groups"))
+            .body(crate::tr!("Ein Feed darf mehreren Gruppen angehören. Die lokale Bibliothek unterstützt verschachtelte Gruppen.", "A feed can belong to multiple groups. The local library supports nested groups."))
             .extra_child(&list)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("ok", "Übernehmen");
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response("ok", crate::tr!("Übernehmen", "Apply"));
         dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("ok"));
         dialog.set_close_response("cancel");
@@ -2391,15 +2529,14 @@ impl App {
             .iter()
             .find(|f| f.id == feed_id)
             .map(|f| f.title.clone())
-            .unwrap_or_else(|| "dieser Feed".into());
+            .unwrap_or_else(|| crate::tr!("dieser Feed", "this feed").into());
         let dialog = adw::AlertDialog::builder()
-            .heading("Feed abbestellen?")
-            .body(format!(
-                "{title} wird nicht mehr abgerufen. Gespeicherte und ausdrücklich aufbewahrte Artikel bleiben erhalten; ein späteres Wiederabonnieren übernimmt den bisherigen Status."
+            .heading(crate::tr!("Feed abbestellen?", "Unsubscribe from feed?"))
+            .body(crate::tr_format!("{title} wird nicht mehr abgerufen. Gespeicherte und ausdrücklich aufbewahrte Artikel bleiben erhalten; ein späteres Wiederabonnieren übernimmt den bisherigen Status.", "{title} will no longer be refreshed. Saved and explicitly retained articles are kept; resubscribing later restores their previous status."
             ))
             .build();
-        dialog.add_response("cancel", "Behalten");
-        dialog.add_response("ok", "Abbestellen");
+        dialog.add_response("cancel", crate::tr!("Behalten", "Keep"));
+        dialog.add_response("ok", crate::tr!("Abbestellen", "Unsubscribe"));
         dialog.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
         dialog.set_close_response("cancel");
         let w = self.weak();
@@ -2417,11 +2554,12 @@ impl App {
                 move |app, res| {
                     if let Ok(saved) = res {
                         let msg = if saved > 0 {
-                            format!(
-                                "Feed abbestellt — {saved} gespeicherte Artikel bleiben erhalten"
+                            crate::tr_format!(
+                                "Feed abbestellt — {saved} gespeicherte Artikel bleiben erhalten",
+                                "Unsubscribed — {saved} saved articles kept"
                             )
                         } else {
-                            "Feed abbestellt".to_string()
+                            crate::tr!("Feed abbestellt", "Unsubscribed").to_string()
                         };
                         app.show_toast(&msg);
                     }
@@ -2525,22 +2663,22 @@ impl App {
     fn scope_label_now(&self) -> String {
         let st = self.state.borrow();
         if let Some(q) = &st.search {
-            return format!("Suche: {q}");
+            return crate::tr_format!("Suche: {q}", "Search: {q}");
         }
         match &st.scope {
-            Scope::Global => "Ungelesen".into(),
+            Scope::Global => crate::tr!("Ungelesen", "Unread").into(),
             Scope::Account(a) => st
                 .accounts
                 .iter()
                 .find(|(id, _, _)| id == a)
                 .map(|(_, _, n)| n.clone())
-                .unwrap_or_else(|| "Konto".into()),
+                .unwrap_or_else(|| crate::tr!("Konto", "Account").into()),
             Scope::Group(g) => st
                 .groups
                 .iter()
                 .find(|x| &x.id == g)
                 .map(|x| x.name.clone())
-                .unwrap_or_else(|| "Gruppe".into()),
+                .unwrap_or_else(|| crate::tr!("Gruppe", "Group").into()),
             Scope::Feed(f) => st.feed_title(*f),
         }
     }
@@ -2773,7 +2911,10 @@ impl App {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("[lf] Statusänderung nicht gespeichert: {e}");
-                        let message = format!("Änderung konnte nicht gespeichert werden: {e}");
+                        let message = crate::tr_format!(
+                            "Änderung konnte nicht gespeichert werden: {e}",
+                            "Could not save change: {e}"
+                        );
                         let _ = result_tx.send(Box::new(move |app: &Rc<App>| {
                             let (feed_id, id, unread, saved) = revert;
                             if let Some(mut previous) = app.state.borrow().article(feed_id, &id) {
@@ -2838,7 +2979,7 @@ impl App {
 
     fn undo(&self) {
         let Some(batch) = self.history.borrow_mut().pop_undo() else {
-            self.show_toast("Nichts rückgängig zu machen");
+            self.show_toast(crate::tr!("Nichts rückgängig zu machen", "Nothing to undo"));
             return;
         };
         let mut redo: UndoBatch = Vec::new();
@@ -2859,12 +3000,12 @@ impl App {
         }
         self.history.borrow_mut().push_redo(redo);
         self.reload_counts();
-        self.show_toast("Aktion rückgängig gemacht");
+        self.show_toast(crate::tr!("Aktion rückgängig gemacht", "Action undone"));
     }
 
     fn redo(&self) {
         let Some(batch) = self.history.borrow_mut().pop_redo() else {
-            self.show_toast("Nichts wiederherzustellen");
+            self.show_toast(crate::tr!("Nichts wiederherzustellen", "Nothing to redo"));
             return;
         };
         let mut undo: UndoBatch = Vec::new();
@@ -2885,7 +3026,7 @@ impl App {
         }
         self.history.borrow_mut().push_undo(undo);
         self.reload_counts();
-        self.show_toast("Aktion wiederhergestellt");
+        self.show_toast(crate::tr!("Aktion wiederhergestellt", "Action redone"));
     }
 
     fn mark_scope_dialog(&self) {
@@ -2905,27 +3046,41 @@ impl App {
         };
         let label = self.scope_label_now();
         if ids.is_empty() {
-            self.show_toast(&format!("„{label}“ enthält keine ungelesenen Artikel"));
+            self.show_toast(&crate::tr_format!(
+                "„{label}“ enthält keine ungelesenen Artikel",
+                "“{label}” has no unread articles"
+            ));
             return;
         }
         let server_scope = self.feedly_scope_feeds();
-        let body = format!(
-            "„{label}“: {} zum Klickzeitpunkt bekannte Artikel werden als gelesen markiert. Rückgängig mit Strg+Z.{}",
+        let body = crate::tr_format!("„{label}“: {} zum Klickzeitpunkt bekannte Artikel werden als gelesen markiert. Rückgängig mit Strg+Z.{}", "“{label}”: {} currently known articles will be marked as read. Undo with Ctrl+Z.{}",
             ids.len(),
             if server_scope.is_empty() {
                 String::new()
             } else {
-                " Serverseitig können weitere Artikel außerhalb des geladenen Fensters existieren.".to_string()
+                crate::tr!(" Serverseitig können weitere Artikel außerhalb des geladenen Fensters existieren.", " There may be more articles on the server outside the loaded range.").to_string()
             }
         );
         let dialog = adw::AlertDialog::builder()
-            .heading("Bereich als gelesen markieren")
+            .heading(crate::tr!(
+                "Bereich als gelesen markieren",
+                "Mark section as read"
+            ))
             .body(body)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("mark", &format!("{} als gelesen markieren", ids.len()));
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response(
+            "mark",
+            &crate::tr_format!("{} als gelesen markieren", "Mark {} as read", ids.len()),
+        );
         if !server_scope.is_empty() {
-            dialog.add_response("server", "Alle serverseitig (komplette Feeds)");
+            dialog.add_response(
+                "server",
+                crate::tr!(
+                    "Alle serverseitig (komplette Feeds)",
+                    "All on server (entire feeds)"
+                ),
+            );
         }
         dialog.set_response_appearance("mark", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("cancel"));
@@ -2945,7 +3100,11 @@ impl App {
                 app.apply_status(*feed_id, id, Some(true), None, &mut batch);
             }
             app.history.borrow_mut().record_user(batch);
-            app.show_toast(&format!("{} Artikel als gelesen markiert", ids.len()));
+            app.show_toast(&crate::tr_format!(
+                "{} Artikel als gelesen markiert",
+                "{} articles marked as read",
+                ids.len()
+            ));
         });
     }
 
@@ -2992,8 +3151,7 @@ impl App {
         }
         // Auch die Serveraktion läuft über den Coordinator (A3).
         self.request_feedly_job(sync_engine::Job::ServerAction, account_id, token, params);
-        self.show_toast(&format!(
-            "Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung"
+        self.show_toast(&crate::tr_format!("Wird serverseitig für {n_feeds} Feeds als gelesen gemeldet — lokale Zähler folgen nach der Bestätigung", "Marking {n_feeds} feeds as read on the server — local counts will update after confirmation"
         ));
     }
 
@@ -3095,7 +3253,10 @@ impl App {
             })
             .collect();
         if positions.is_empty() {
-            self.show_toast("Keine weiteren ungelesenen Artikel in dieser Ansicht");
+            self.show_toast(crate::tr!(
+                "Keine weiteren ungelesenen Artikel in dieser Ansicht",
+                "No more unread articles in this view"
+            ));
             return;
         }
         let cur = self
@@ -3175,9 +3336,9 @@ impl App {
             "mail-unread-symbolic"
         });
         self.reader.btn_read.set_tooltip_text(Some(if row.unread {
-            "Als gelesen markieren (M)"
+            crate::tr!("Als gelesen markieren (M)", "Mark as read (M)")
         } else {
-            "Als ungelesen markieren (M)"
+            crate::tr!("Als ungelesen markieren (M)", "Mark as unread (M)")
         }));
         self.reader.btn_saved.set_icon_name(if row.saved {
             "user-bookmarks-symbolic"
@@ -3185,9 +3346,9 @@ impl App {
             "bookmark-new-symbolic"
         });
         self.reader.btn_saved.set_tooltip_text(Some(if row.saved {
-            "Entspeichern (S)"
+            crate::tr!("Entspeichern (S)", "Unsave (S)")
         } else {
-            "Speichern (S)"
+            crate::tr!("Speichern (S)", "Save (S)")
         }));
     }
 
@@ -3212,8 +3373,16 @@ impl App {
             .filter(|r| matches!(r, ListRow::Item(_)))
             .count() as i64;
         drop(st);
-        self.reader
-            .show_empty(&label, &format!("{unread} ungelesen · {total} Artikel"));
+        self.reader.show_empty(
+            &label,
+            &crate::tr_plural!(
+                total,
+                "{unread} ungelesen · {total} Artikel",
+                "{unread} ungelesen · {total} Artikel",
+                "{unread} unread · {total} article",
+                "{unread} unread · {total} articles"
+            ),
+        );
         self.reader.title.set_title(&label);
         self.reader.title.set_subtitle("");
     }
@@ -3250,7 +3419,10 @@ impl App {
                     .map(|(bytes, mime)| (url, provider_local::media::data_uri(&bytes, mime)))
             })
             .collect();
-        let placeholder = provider_local::media::placeholder_data_uri("Bild");
+        let placeholder = provider_local::media::placeholder_data_uri(
+            crate::tr!("Bild", "Image"),
+            crate::tr!("Bild nicht verfügbar", "Image unavailable"),
+        );
         let mut prepared = reader::sanitize::rewrite_images(&html, &placeholder);
         for (url, data) in &cached {
             prepared = reader::sanitize::replace_marker(&prepared, url, data);
@@ -3283,7 +3455,13 @@ impl App {
                     Some((bytes, mime)) => {
                         jobs.push((url, provider_local::media::data_uri(&bytes, mime)));
                     }
-                    None => jobs.push((url, provider_local::media::placeholder_data_uri(&alt))),
+                    None => jobs.push((
+                        url,
+                        provider_local::media::placeholder_data_uri(
+                            &alt,
+                            crate::tr!("Bild nicht verfügbar", "Image unavailable"),
+                        ),
+                    )),
                 }
             }
             if let Ok(mut q) = queue.lock() {
@@ -3461,7 +3639,10 @@ impl App {
             return;
         };
         if !external_uri_allowed(&url) {
-            self.show_toast("Link nicht geöffnet: nur http(s) ist erlaubt");
+            self.show_toast(crate::tr!(
+                "Link nicht geöffnet: nur http(s) ist erlaubt",
+                "Link not opened: only HTTP(S) is allowed"
+            ));
             return;
         }
         let w = self.weak();
@@ -3471,7 +3652,10 @@ impl App {
             move |res| {
                 if res.is_err() {
                     if let Some(app) = w.upgrade() {
-                        app.show_toast("Extern öffnen fehlgeschlagen");
+                        app.show_toast(crate::tr!(
+                            "Extern öffnen fehlgeschlagen",
+                            "Could not open in browser"
+                        ));
                     }
                 }
             },
@@ -3483,7 +3667,7 @@ impl App {
             return;
         };
         self.window.clipboard().set_text(&url);
-        self.show_toast("Link kopiert");
+        self.show_toast(crate::tr!("Link kopiert", "Link copied"));
     }
 
     // ── Konto ──
@@ -3500,13 +3684,19 @@ impl App {
             self.net.fetch_feed(self.worker.clone(), feed_id, url, true);
         }
         if local_count > 0 {
-            self.show_toast(&format!("Aktualisiere {local_count} Feeds…"));
+            self.show_toast(&crate::tr_format!(
+                "Aktualisiere {local_count} Feeds…",
+                "Refreshing {local_count} feeds…"
+            ));
         }
         if plan.feedly_account.is_some() {
             self.with_token(TokenAction::Refresh);
         }
         if local_count == 0 && plan.feedly_account.is_none() {
-            self.show_toast("Keine Feeds im aktuellen Bereich (Strg+N)");
+            self.show_toast(crate::tr!(
+                "Keine Feeds im aktuellen Bereich (Strg+N)",
+                "No feeds in this section (Ctrl+N)"
+            ));
         }
     }
 
@@ -3544,7 +3734,7 @@ impl App {
                             let bound = credential.account_id.as_deref();
                             if !feedly_sync::token_matches_account(bound, account) {
                                 app.show_toast(
-                                    "Feedly: gespeichertes Token gehört zu einem anderen Konto — bitte neu verbinden",
+                                    crate::tr!("Feedly: gespeichertes Token gehört zu einem anderen Konto — bitte neu verbinden", "Feedly: saved token belongs to another account — please reconnect"),
                                 );
                                 return;
                             }
@@ -3552,7 +3742,7 @@ impl App {
                         None => {
                             if !feedly_sync::unbound_allowed(has_account) {
                                 app.show_toast(
-                                    "Feedly: Token ist keinem Konto zugeordnet — bitte neu verbinden",
+                                    crate::tr!("Feedly: Token ist keinem Konto zugeordnet — bitte neu verbinden", "Feedly: token is not linked to an account — please reconnect"),
                                 );
                                 return;
                             }
@@ -3570,7 +3760,10 @@ impl App {
         match action {
             TokenAction::CheckConnect | TokenAction::StartFeedly => self.show_feedly_token_dialog(),
             _ => {
-                self.show_toast("Feedly: keine Verbindung — bitte „Feedly verbinden“ wählen");
+                self.show_toast(crate::tr!(
+                    "Feedly: keine Verbindung — bitte „Feedly verbinden“ wählen",
+                    "Feedly: not connected — choose “Connect to Feedly”"
+                ));
             }
         }
     }
@@ -3584,16 +3777,25 @@ impl App {
                 let account_id = self.account_id_of_kind("feedly");
                 if let Some(account_id) = account_id {
                     self.request_feedly_sync(account_id, token, true);
-                    self.show_toast("Feedly: Delta-Sync angefordert");
+                    self.show_toast(crate::tr!(
+                        "Feedly: Delta-Sync angefordert",
+                        "Feedly: incremental sync requested"
+                    ));
                 } else {
-                    self.show_toast("Feedly: kein Konto verbunden");
+                    self.show_toast(crate::tr!(
+                        "Feedly: kein Konto verbunden",
+                        "Feedly: no account connected"
+                    ));
                 }
             }
             TokenAction::QueuedSync => {
                 let account_id = self.account_id_of_kind("feedly");
                 match account_id {
                     Some(id) => self.request_feedly_sync(id, token, false),
-                    None => dbg_log("Kein Feedly-Konto für den Sync vorhanden"),
+                    None => dbg_log(crate::tr!(
+                        "Kein Feedly-Konto für den Sync vorhanden",
+                        "No Feedly account available to sync"
+                    )),
                 }
             }
             TokenAction::MarkScopeServer => self.mark_scope_server_with(token),
@@ -3623,7 +3825,10 @@ impl App {
                         let params = self.pending_server_params(&account_id);
                         self.start_feedly_run(job, account_id, token, params, run_id);
                     }
-                    _ => dbg_log("Feedly: kein reservierter Folgelauf vorhanden"),
+                    _ => dbg_log(crate::tr!(
+                        "Feedly: kein reservierter Folgelauf vorhanden",
+                        "Feedly: no follow-up sync scheduled"
+                    )),
                 }
             }
             TokenAction::CheckConnect => {
@@ -3689,21 +3894,33 @@ impl App {
                 self.start_feedly_run(job, account_id, token, params, run_id);
             }
             sync_engine::Decision::Queued => {
-                dbg_log("Feedly: ein Lauf ist aktiv, der Wunsch wurde vorgemerkt");
+                dbg_log(crate::tr!(
+                    "Feedly: ein Lauf ist aktiv, der Wunsch wurde vorgemerkt",
+                    "Feedly: sync in progress, request queued"
+                ));
             }
             sync_engine::Decision::Paused(pause) => {
                 let message = match pause {
                     sync_engine::Pause::Auth => {
-                        "Feedly: Anmeldung erforderlich — bitte neu verbinden"
+                        crate::tr!(
+                            "Feedly: Anmeldung erforderlich — bitte neu verbinden",
+                            "Feedly: sign-in required — please reconnect"
+                        )
                     }
                     sync_engine::Pause::Quota(_) => {
-                        "Feedly: Drosselung — der Versand wartet auf das Zeitfenster"
+                        crate::tr!(
+                            "Feedly: Drosselung — der Versand wartet auf das Zeitfenster",
+                            "Feedly: rate limited — uploads will resume later"
+                        )
                     }
                 };
                 self.show_toast(message);
             }
             sync_engine::Decision::Blocked => {
-                self.show_toast("Feedly: nicht verbunden");
+                self.show_toast(crate::tr!(
+                    "Feedly: nicht verbunden",
+                    "Feedly: not connected"
+                ));
             }
         }
     }
@@ -3826,20 +4043,23 @@ impl App {
             .iter()
             .any(|(_, k, _)| k == "feedly");
         let entry = gtk::Entry::builder()
-            .placeholder_text("Feedly Developer Token einfügen")
+            .placeholder_text(crate::tr!(
+                "Feedly Developer Token einfügen",
+                "Paste Feedly developer token"
+            ))
             .visibility(false)
             .build();
         let dialog = adw::AlertDialog::builder()
             .heading(if known_account {
-                "Feedly neu verbinden"
+                crate::tr!("Feedly neu verbinden", "Reconnect to Feedly")
             } else {
-                "Feedly verbinden"
+                crate::tr!("Feedly verbinden", "Connect to Feedly")
             })
-            .body("Privater Testzugang: Token unter feedly.com/v3/auth/dev bzw. via PKCE-Flow erzeugen und hier einfügen. Gespeicherung im Schlüsselbund; nur ohne Schlüsselbund in einer Datei mit Modus 600.")
+            .body(crate::tr!("Privater Testzugang: Token unter feedly.com/v3/auth/dev bzw. via PKCE-Flow erzeugen und hier einfügen. Gespeicherung im Schlüsselbund; nur ohne Schlüsselbund in einer Datei mit Modus 600.", "Private test access: create a token at feedly.com/v3/auth/dev or using the PKCE flow, then paste it here. Stored in the keyring; if unavailable, in a file accessible only to your user."))
             .extra_child(&entry)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("ok", "Verbinden");
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response("ok", crate::tr!("Verbinden", "Connect"));
         dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("ok"));
         dialog.set_close_response("cancel");
@@ -3851,7 +4071,10 @@ impl App {
             }
             let token = entry.text().trim().to_string();
             if token.is_empty() {
-                app.show_toast("Bitte ein Token einfügen");
+                app.show_toast(crate::tr!(
+                    "Bitte ein Token einfügen",
+                    "Please paste a token"
+                ));
                 return;
             }
             // secret-tool und Dateizugriff gehören in einen Worker, nie in den
@@ -3865,7 +4088,10 @@ impl App {
                         if saved {
                             app.start_feedly(token);
                         } else {
-                            app.show_toast("Token konnte nicht gespeichert werden");
+                            app.show_toast(crate::tr!(
+                                "Token konnte nicht gespeichert werden",
+                                "Could not save token"
+                            ));
                         }
                     }) as Box<dyn FnOnce(&Rc<App>) + Send>);
                 })
@@ -3916,7 +4142,10 @@ impl App {
             .spawn(move || {
                 feedly_sync::forget_token();
                 let _ = tx.send(Box::new(move |app: &Rc<App>| {
-                    app.show_toast("Feedly: getrennt, lokale Daten bleiben erhalten");
+                    app.show_toast(crate::tr!(
+                        "Feedly: getrennt, lokale Daten bleiben erhalten",
+                        "Feedly: disconnected, local data kept"
+                    ));
                     app.bootstrap();
                 }) as Box<dyn FnOnce(&Rc<App>) + Send>);
             })
@@ -3936,7 +4165,10 @@ impl App {
         };
         match account_id {
             Some(id) => {
-                self.show_toast("Feedly: Erst-Sync gestartet …");
+                self.show_toast(crate::tr!(
+                    "Feedly: Erst-Sync gestartet …",
+                    "Feedly: initial sync started…"
+                ));
                 self.request_feedly_job(
                     sync_engine::Job::Initial,
                     id,
@@ -3954,7 +4186,10 @@ impl App {
                     .first()
                     .map(|(id, _, _)| id.clone())
                     .unwrap_or_else(|| "feedly-pending".to_string());
-                self.show_toast("Feedly: Erst-Sync gestartet …");
+                self.show_toast(crate::tr!(
+                    "Feedly: Erst-Sync gestartet …",
+                    "Feedly: initial sync started…"
+                ));
                 self.request_feedly_job(
                     sync_engine::Job::Initial,
                     anchor,
@@ -4077,13 +4312,19 @@ impl App {
                 if let Some((s, d)) = entry.as_mut() {
                     if stuck > 0 && *s == "ready" {
                         *s = "degraded".to_string();
-                        *d = Some(format!("{stuck} Änderung(en) nicht bestätigt"));
+                        *d = Some(crate::tr_plural!(
+                            stuck,
+                            "{stuck} Änderung nicht bestätigt",
+                            "{stuck} Änderungen nicht bestätigt",
+                            "{stuck} change not confirmed",
+                            "{stuck} changes not confirmed"
+                        ));
                     }
                 }
                 let label = entry
                     .as_ref()
                     .map(|(s, _)| status_label(s))
-                    .unwrap_or("Verbunden");
+                    .unwrap_or(crate::tr!("Verbunden", "Connected"));
                 let text = format!("Feedly: {label}");
                 app.last_sync_label.set_label(&text);
                 app.state.borrow_mut().feedly_status = entry;
@@ -4122,7 +4363,8 @@ impl App {
 
     fn backup_dialog(&self) {
         let dlg = gtk::FileDialog::builder()
-            .title("Backup speichern unter")
+            .title(crate::tr!("Backup speichern unter", "Save backup as"))
+            .accept_label(crate::tr!("Speichern", "Save"))
             .build();
         dlg.set_initial_name(Some("lesefluss-backup.db"));
         let w = self.weak();
@@ -4145,18 +4387,19 @@ impl App {
             .unwrap_or(false);
             if let Some(app) = w.upgrade() {
                 let message = if res {
-                    app.strings.get("Backup erstellt", "Backup created")
+                    crate::tr!("Backup erstellt", "Backup created")
                 } else {
-                    app.strings.get("Backup fehlgeschlagen", "Backup failed")
+                    crate::tr!("Backup fehlgeschlagen", "Backup failed")
                 };
-                app.show_toast(&message);
+                app.show_toast(message);
             }
         });
     }
 
     fn restore_dialog(&self) {
         let dlg = gtk::FileDialog::builder()
-            .title("Backup-Datei wählen")
+            .title(crate::tr!("Backup-Datei wählen", "Choose backup file"))
+            .accept_label(crate::tr!("Öffnen", "Open"))
             .build();
         let w = self.weak();
         glib::MainContext::default().spawn_local(async move {
@@ -4171,17 +4414,25 @@ impl App {
                 .and_then(|_| std::fs::rename(&tmp, &pending))
             {
                 Ok(_) => match storage::Database::validate_candidate(&pending) {
-                    Ok(_) => {
-                        "Backup geprüft — es wird beim nächsten Start wiederhergestellt".to_string()
-                    }
+                    Ok(_) => crate::tr!(
+                        "Backup geprüft — es wird beim nächsten Start wiederhergestellt",
+                        "Backup verified — it will be restored on next launch"
+                    )
+                    .to_string(),
                     Err(e) => {
                         let _ = std::fs::remove_file(&pending);
-                        format!("Diese Datei ist keine lesbare Lesefluss-Bibliothek: {e}")
+                        crate::tr_format!(
+                            "Diese Datei ist keine lesbare Lesefluss-Bibliothek: {e}",
+                            "This file is not a readable Lesefluss library: {e}"
+                        )
                     }
                 },
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
-                    format!("Wiederherstellung fehlgeschlagen: {e}")
+                    crate::tr_format!(
+                        "Wiederherstellung fehlgeschlagen: {e}",
+                        "Restore failed: {e}"
+                    )
                 }
             };
             if let Some(app) = w.upgrade() {
@@ -4193,16 +4444,19 @@ impl App {
 
     fn add_feed_dialog(&self) {
         let entry = gtk::Entry::builder()
-            .placeholder_text("Feed- oder Website-URL")
+            .placeholder_text(crate::tr!("Feed- oder Website-URL", "Feed or website URL"))
             .activates_default(true)
             .build();
         let dialog = adw::AlertDialog::builder()
-            .heading("Feed hinzufügen")
-            .body("URL eingeben; Lesefluss sucht den Feed und zeigt eine Vorschau.")
+            .heading(crate::tr!("Feed hinzufügen", "Add feed"))
+            .body(crate::tr!(
+                "URL eingeben; Lesefluss sucht den Feed und zeigt eine Vorschau.",
+                "Enter a URL; Lesefluss will find the feed and show a preview."
+            ))
             .extra_child(&entry)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("add", "Suchen");
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response("add", crate::tr!("Suchen", "Search"));
         dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("add"));
         dialog.set_close_response("cancel");
@@ -4216,7 +4470,7 @@ impl App {
             if url.is_empty() {
                 return;
             }
-            app.show_toast("Suche Feed…");
+            app.show_toast(crate::tr!("Suche Feed…", "Finding feed…"));
             app.net.discover(url);
         });
     }
@@ -4244,12 +4498,15 @@ impl App {
             list.select_row(Some(&r));
         }
         let dialog = adw::AlertDialog::builder()
-            .heading("Feed gefunden")
-            .body("Bitte Feed auswählen und abonnieren.")
+            .heading(crate::tr!("Feed gefunden", "Feed found"))
+            .body(crate::tr!(
+                "Bitte Feed auswählen und abonnieren.",
+                "Select a feed to subscribe to."
+            ))
             .extra_child(&list)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("sub", "Abonnieren");
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response("sub", crate::tr!("Abonnieren", "Subscribe"));
         dialog.set_response_appearance("sub", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("sub"));
         dialog.set_close_response("cancel");
@@ -4363,6 +4620,8 @@ impl App {
             |db| {
                 let mut out: Vec<(String, String)> = Vec::new();
                 for key in [
+                    "language",
+                    "block_images",
                     "auto_read",
                     "compact",
                     "thumbs",

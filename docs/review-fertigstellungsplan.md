@@ -532,7 +532,8 @@ Das ist kein Anlass für einen Komplettneubau, erschwert aber genau die nötigen
 
 ### Releaseunterlagen richtigstellen
 
-- [ ] App-ID/Name und echte Paketquelle finalisieren, Desktop/AppStream/Icon konsistent;
+- [ ] Veröffentlichte Paketquelle finalisieren; Projektadresse `github.com/tobiasbischoff/lesefluss`,
+  Name Lesefluss und App-ID `io.github.tobiasbischoff.Lesefluss` sind festgelegt;
   gültiges PKGBUILD mit deterministischem Quellordner, Lizenzinstallation, Metadatenprüfungen.
 - [ ] LICENSE-MIT, LICENSE-APACHE, README mit Build/Test/Installation, Bedienung,
   Kontoverbindung, Datenorten und sicherer Wiederherstellung ergänzen.

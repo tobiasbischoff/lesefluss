@@ -38,7 +38,13 @@ impl DbWorker {
                 let db = match Database::open(&path) {
                     Ok(db) => db,
                     Err(e) => {
-                        eprintln!("Datenbank konnte nicht geöffnet werden: {e}");
+                        eprintln!(
+                            "{}",
+                            crate::tr_format!(
+                                "Datenbank konnte nicht geöffnet werden: {e}",
+                                "Could not open database: {e}"
+                            )
+                        );
                         if let Ok(mut slot) = failure_thread.lock() {
                             *slot = Some(e.to_string());
                         }
@@ -58,13 +64,20 @@ impl DbWorker {
     /// Anlauf und wartet daher bewusst auf den Worker; Fehler werden benannt
     /// statt als „kein Layout“ verschluckt.
     pub fn read_layout(&self) -> Result<Option<String>, String> {
-        let out = self
-            .send(|db| db.get_pref("layout"))
-            .recv()
-            .map_err(|_| "Datenbank-Worker antwortet nicht".to_string())?;
+        let out = self.send(|db| db.get_pref("layout")).recv().map_err(|_| {
+            crate::tr!(
+                "Datenbank-Worker antwortet nicht",
+                "Database worker is not responding"
+            )
+            .to_string()
+        })?;
         match out.downcast::<storage::Result<Option<String>>>() {
             Ok(value) => value.map_err(|e| e.to_string()),
-            Err(_) => Err("unerwartetes Antwortformat des Datenbank-Workers".to_string()),
+            Err(_) => Err(crate::tr!(
+                "unerwartetes Antwortformat des Datenbank-Workers",
+                "Unexpected response format from database worker"
+            )
+            .to_string()),
         }
     }
 
@@ -117,7 +130,7 @@ mod tests {
         std::fs::create_dir_all(path.join("library.db")).unwrap();
         let worker = DbWorker::start(path.join("library.db"));
         let err = worker.read_layout().unwrap_err();
-        assert_eq!(err, "Datenbank-Worker antwortet nicht");
+        assert_eq!(err, "Database worker is not responding");
         let _ = std::fs::remove_dir_all(&path);
     }
 }

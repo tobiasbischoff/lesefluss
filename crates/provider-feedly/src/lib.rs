@@ -14,7 +14,7 @@ pub enum FeedlyError {
     },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Antwort zu groß: {got} Bytes (Limit {limit})")]
+    #[error("Response too large: {got} bytes (limit {limit})")]
     TooLarge { got: usize, limit: usize },
     #[error(transparent)]
     Pager(#[from] PagerError),
@@ -158,7 +158,7 @@ pub struct Pager {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PagerError {
-    #[error("Pagination unvollständig: {0}")]
+    #[error("Pagination incomplete: {0}")]
     Incomplete(String),
 }
 
@@ -191,11 +191,11 @@ impl Pager {
             return PageAction::Done;
         };
         if !self.seen.insert(cursor.to_string()) {
-            self.stopped_because = Some(format!("Cursor-Zyklus bei {cursor}"));
+            self.stopped_because = Some(format!("Cursor cycle at {cursor}"));
             return PageAction::Aborted;
         }
         if self.pages >= max_pages {
-            self.stopped_because = Some(format!("Sicherheitslimit {max_pages} Seiten erreicht"));
+            self.stopped_because = Some(format!("Safety limit of {max_pages} pages reached"));
             return PageAction::Aborted;
         }
         PageAction::Continue
@@ -211,9 +211,7 @@ impl Pager {
             return Err(PagerError::Incomplete(reason).into());
         }
         if !self.complete {
-            return Err(
-                PagerError::Incomplete("keine Seite vollständig verarbeitet".into()).into(),
-            );
+            return Err(PagerError::Incomplete("no page fully processed".into()).into());
         }
         Ok(())
     }
@@ -620,7 +618,7 @@ mod tests {
         assert_eq!(p.after_page(Some("b"), 10, 50), PageAction::Continue);
         assert_eq!(p.after_page(Some("a"), 10, 50), PageAction::Aborted);
         let err = p.into_result().unwrap_err();
-        assert!(err.to_string().contains("Zyklus"), "{err}");
+        assert!(err.to_string().contains("cycle"), "{err}");
     }
 
     #[test]
@@ -630,7 +628,7 @@ mod tests {
         assert_eq!(p.after_page(Some("c1"), 10, 3), PageAction::Continue);
         assert_eq!(p.after_page(Some("c2"), 10, 3), PageAction::Aborted);
         let err = p.into_result().unwrap_err();
-        assert!(err.to_string().contains("Sicherheitslimit"), "{err}");
+        assert!(err.to_string().contains("Safety limit"), "{err}");
     }
 
     #[test]
@@ -638,7 +636,7 @@ mod tests {
         let p = Pager::new();
         assert!(!p.started());
         let err = p.into_result().unwrap_err();
-        assert!(err.to_string().contains("unvollständig"), "{err}");
+        assert!(err.to_string().contains("incomplete"), "{err}");
     }
 
     #[test]

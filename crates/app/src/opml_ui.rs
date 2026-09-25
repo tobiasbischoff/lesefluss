@@ -7,7 +7,8 @@ use gtk::gio;
 impl App {
     pub fn import_opml_dialog(&self) {
         let dlg = gtk::FileDialog::builder()
-            .title("OPML-Datei wählen")
+            .title(crate::tr!("OPML-Datei wählen", "Choose OPML file"))
+            .accept_label(crate::tr!("Öffnen", "Open"))
             .build();
         let w = self.weak();
         glib::MainContext::default().spawn_local(async move {
@@ -19,20 +20,29 @@ impl App {
                 Ok(b) if b.len() <= crate::opml::MAX_OPML_BYTES => b,
                 Ok(_) => {
                     if let Some(app) = w.upgrade() {
-                        app.show_toast("OPML-Datei zu groß (Limit 20 MiB)");
+                        app.show_toast(crate::tr!(
+                            "OPML-Datei zu groß (Limit 20 MiB)",
+                            "OPML file too large (20 MiB limit)"
+                        ));
                     }
                     return;
                 }
                 Err(e) => {
                     if let Some(app) = w.upgrade() {
-                        app.show_toast(&format!("Lesefehler: {e}"));
+                        app.show_toast(&crate::tr_format!(
+                            "Lesefehler: {e}",
+                            "Could not read file: {e}"
+                        ));
                     }
                     return;
                 }
             };
             let Ok(xml) = String::from_utf8(bytes) else {
                 if let Some(app) = w.upgrade() {
-                    app.show_toast("OPML-Datei ist kein UTF-8");
+                    app.show_toast(crate::tr!(
+                        "OPML-Datei ist kein UTF-8",
+                        "OPML file is not UTF-8"
+                    ));
                 }
                 return;
             };
@@ -44,7 +54,7 @@ impl App {
                 }
                 Err(e) => {
                     if let Some(app) = w.upgrade() {
-                        app.show_toast(&format!("OPML-Fehler: {e}"));
+                        app.show_toast(&crate::tr_format!("OPML-Fehler: {e}", "OPML error: {e}"));
                     }
                 }
             }
@@ -70,14 +80,19 @@ impl App {
             .take(40)
             .map(|f| format!("• {} — {}\n", f.title, f.xml_url))
             .collect();
-        let body = format!(
+        let body = crate::tr_format!(
             "{} neue Feeds, {} bestehende (bleiben erhalten, Gruppen werden zusammengeführt).{}",
+            "New feeds: {}; existing feeds: {} (kept, groups will be merged).{}",
             new.len(),
             existing,
             if draft.errors.is_empty() {
                 String::new()
             } else {
-                format!(" {} ungültige Einträge übersprungen.", draft.errors.len())
+                crate::tr_format!(
+                    " {} ungültige Einträge übersprungen.",
+                    " {} invalid entries skipped.",
+                    draft.errors.len()
+                )
             }
         );
         let label = gtk::Label::builder()
@@ -93,12 +108,15 @@ impl App {
             .min_content_height(80)
             .build();
         let dialog = adw::AlertDialog::builder()
-            .heading("OPML-Import")
+            .heading(crate::tr!("OPML-Import", "Import OPML"))
             .body(body)
             .extra_child(&scroll)
             .build();
-        dialog.add_response("cancel", "Abbrechen");
-        dialog.add_response("import", &format!("{} Feeds importieren", new.len()));
+        dialog.add_response("cancel", crate::tr!("Abbrechen", "Cancel"));
+        dialog.add_response(
+            "import",
+            &crate::tr_format!("Feeds importieren: {}", "Import feeds: {}", new.len()),
+        );
         dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("import"));
         dialog.set_close_response("cancel");
@@ -134,15 +152,22 @@ impl App {
             move |app, res: storage::Result<(usize, usize)>| {
                 let Ok((new_feeds, merged)) = res else {
                     if let Some(app) = w.upgrade() {
-                        app.show_toast("Import abgebrochen — es wurde nichts verändert");
+                        app.show_toast(crate::tr!(
+                            "Import abgebrochen — es wurde nichts verändert",
+                            "Import cancelled — no changes made"
+                        ));
                     }
                     return;
                 };
                 app.reload_meta_keep();
-                app.show_toast(&format!(
+                app.show_toast(&crate::tr_format!(
                     "{new_feeds} Feeds importiert, {merged} zusammengeführt{}",
+                    "Feeds imported: {new_feeds}; merged: {merged}{}",
                     if errors > 0 {
-                        format!(", {errors} Hinweise im Bericht")
+                        crate::tr_format!(
+                            ", {errors} Hinweise im Bericht",
+                            ", {errors} notices in the report"
+                        )
                     } else {
                         String::new()
                     }
@@ -174,9 +199,16 @@ impl App {
                 .collect()
         };
         let dlg = gtk::FileDialog::builder()
-            .title("OPML-Export speichern unter")
+            .title(crate::tr!(
+                "OPML-Export speichern unter",
+                "Save OPML export as"
+            ))
+            .accept_label(crate::tr!("Speichern", "Save"))
             .build();
-        dlg.set_initial_name(Some("lesefluss-abonnements.opml"));
+        dlg.set_initial_name(Some(crate::tr!(
+            "lesefluss-abonnements.opml",
+            "lesefluss-subscriptions.opml"
+        )));
         let w = self.weak();
         glib::MainContext::default().spawn_local(async move {
             let Ok(file) = dlg.save_future(None::<&gtk::Window>).await else {
@@ -189,9 +221,9 @@ impl App {
                 && std::fs::rename(&tmp, &path).is_ok();
             if let Some(app) = w.upgrade() {
                 app.show_toast(if ok {
-                    "OPML exportiert"
+                    crate::tr!("OPML exportiert", "OPML exported")
                 } else {
-                    "Export fehlgeschlagen"
+                    crate::tr!("Export fehlgeschlagen", "Export failed")
                 });
             }
         });

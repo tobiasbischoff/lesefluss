@@ -1,6 +1,6 @@
 # Native RSS-App für Omarchy: Produkt- und Implementationsspezifikation
 
-**Arbeitsname:** Lesefluss — vor Veröffentlichung auf Namenskollisionen prüfen.  
+**App-Name:** Lesefluss (festgelegt am 25. September 2026).
 **Stand:** 23. September 2026.  
 **Zielplattform:** Omarchy Linux auf Arch-Basis, Hyprland, native Wayland-Sitzung.  
 **Adressat:** Der Agent, der die Anwendung anschließend implementiert.  
@@ -659,7 +659,7 @@ WebKit-Absturz darf die native Anwendung nicht beenden. Fehleransicht mit erneut
 
 Unter echter Hyprland-Sitzung mit erzwungenem GTK-Wayland-Backend testen. Native Oberfläche und WebView müssen ohne XWayland funktionieren. Compositor-Clientinformationen zur Bestätigung verwenden; ein gesetztes Environment-Flag allein ist kein Beleg.
 
-Stabile Reverse-DNS-App-ID festlegen, beispielsweise für Entwicklung `io.github.PROJEKTINHABER.Lesefluss`; vor Release durch echte Projektkennung ersetzen. App-ID, Desktop-Datei, GApplication und Iconname abstimmen. Single-Instance-Verhalten über GApplication; weiterer Start aktiviert das vorhandene Fenster. Aktivierungstokens respektieren, keinen Fokus stehlen.
+App-Name: Lesefluss. Die App-ID lautet `io.github.tobiasbischoff.Lesefluss`; die Projektadresse ist `https://github.com/tobiasbischoff/lesefluss`. App-ID, Desktop-Datei, GApplication und Iconname abstimmen. Single-Instance-Verhalten über GApplication; weiterer Start aktiviert das vorhandene Fenster. Aktivierungstokens respektieren, keinen Fokus stehlen.
 
 Fenster muss gekachelt, schwebend, maximiert und schmal funktionieren. Keine selbst gesetzte Bildschirmposition voraussetzen. Fensterrahmen, Rundung und Schatten nicht mehrfach mit dem Compositor zeichnen. Linux-Fensteraktionen und Drag-Bereich erhalten; Headerbar bleibt funktional, wenn Hyprland keine zusätzlichen Dekorationen zeigt.
 

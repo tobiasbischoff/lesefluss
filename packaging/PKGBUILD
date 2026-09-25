@@ -1,10 +1,10 @@
 # Maintainer: Lesefluss contributors
 pkgname=lesefluss-git
 pkgver=0.1.0
-pkgrel=2
-pkgdesc="Nativer GTK-4-RSS-Reader für Wayland mit lokaler Bibliothek und Feedly-Sync"
+pkgrel=3
+pkgdesc="A native RSS reader for Wayland with a local library and optional Feedly sync"
 arch=('x86_64')
-url="https://example.org/lesefluss"
+url="https://github.com/tobiasbischoff/lesefluss"
 license=('MIT' 'Apache-2.0')
 depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'sqlite' 'libsecret' 'xdg-desktop-portal')
 makedepends=('cargo' 'rust')
@@ -14,7 +14,7 @@ source=()
 sha256sums=()
 
 # Aus dem Repository-Verzeichnis bauen:
-#   cd .. && makepkg -f packaging/PKGBUILD
+#   cd packaging && makepkg -si
 _srcdir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 build() {
@@ -25,7 +25,7 @@ build() {
   export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
   export LTOFLAGS=""
   export CFLAGS="${CFLAGS//-flto=auto/}"
-  cargo build --release --locked --bin lesefluss-app
+  cargo build --release --locked --bin lesefluss
 }
 
 check() {
@@ -35,13 +35,13 @@ check() {
 
 package() {
   cd "$_srcdir"
-  install -Dm755 target/release/lesefluss-app "$pkgdir/usr/bin/lesefluss"
-  install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.desktop \
-    "$pkgdir/usr/share/applications/io.github.PROJEKTINHABER.Lesefluss.desktop"
-  install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.svg \
-    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.PROJEKTINHABER.Lesefluss.svg"
-  install -Dm644 data/io.github.PROJEKTINHABER.Lesefluss.appdata.xml \
-    "$pkgdir/usr/share/metainfo/io.github.PROJEKTINHABER.Lesefluss.appdata.xml"
+  install -Dm755 target/release/lesefluss "$pkgdir/usr/bin/lesefluss"
+  install -Dm644 data/io.github.tobiasbischoff.Lesefluss.desktop \
+    "$pkgdir/usr/share/applications/io.github.tobiasbischoff.Lesefluss.desktop"
+  install -Dm644 data/io.github.tobiasbischoff.Lesefluss.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.tobiasbischoff.Lesefluss.svg"
+  install -Dm644 data/io.github.tobiasbischoff.Lesefluss.appdata.xml \
+    "$pkgdir/usr/share/metainfo/io.github.tobiasbischoff.Lesefluss.appdata.xml"
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
   install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"

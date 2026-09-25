@@ -19,7 +19,10 @@ pub struct RunCtx {
 /// weiterer Request.
 fn cancelled() -> SyncFailure {
     SyncFailure::new(
-        "Lauf abgebrochen (Logout, Auth- oder Quotenstopp)",
+        crate::tr!(
+            "Lauf abgebrochen (Logout, Auth- oder Quotenstopp)",
+            "Sync cancelled (signed out, authentication failure or rate limit)"
+        ),
         None,
         None,
     )
@@ -177,7 +180,10 @@ pub fn bind_account_with(program: &std::path::Path, account_id: &str) -> bool {
         program,
         &[
             "store",
-            "--label=Lesefluss: Feedly-Konto",
+            crate::tr!(
+                "--label=Lesefluss: Feedly-Konto",
+                "--label=Lesefluss: Feedly account"
+            ),
             "lesefluss",
             "feedly-account",
         ],
@@ -421,7 +427,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = path
         .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "kein Verzeichnis"))?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"))?;
     let unique = format!(
         ".{}.{}.tmp",
         path.file_name()
@@ -496,7 +502,10 @@ where
 fn entry_to_new_article(e: &pf::Entry) -> storage::NewArticle {
     storage::NewArticle {
         id: e.id.clone(),
-        title: e.title.clone().unwrap_or_else(|| "(ohne Titel)".into()),
+        title: e
+            .title
+            .clone()
+            .unwrap_or_else(|| crate::tr!("(ohne Titel)", "(untitled)").into()),
         author: e.author.clone(),
         url: e.url(),
         published_ms: e.published.or(e.crawled).unwrap_or_else(storage::now_ms),
@@ -627,9 +636,9 @@ pub async fn fetch_id_inventory(
             pf::PageAction::Done => return Ok(pf::Inventory::Complete(ids)),
             pf::PageAction::Aborted => {
                 return Ok(pf::Inventory::Incomplete(
-                    pager
-                        .stopped_because
-                        .unwrap_or_else(|| "Abbruch ohne Angabe".to_string()),
+                    pager.stopped_because.unwrap_or_else(|| {
+                        crate::tr!("Abbruch ohne Angabe", "Cancelled without a reason").to_string()
+                    }),
                 ))
             }
         }
@@ -675,11 +684,14 @@ where
             }
             pf::PageAction::Aborted => {
                 return Err(SyncFailure::new(
-                    format!(
+                    crate::tr_format!(
                         "Inhaltsabruf unvollständig: {}",
-                        pager
-                            .stopped_because
-                            .unwrap_or_else(|| "Abbruch ohne Angabe".to_string())
+                        "Content fetch incomplete: {}",
+                        pager.stopped_because.unwrap_or_else(|| crate::tr!(
+                            "Abbruch ohne Angabe",
+                            "Cancelled without a reason"
+                        )
+                        .to_string())
                     ),
                     None,
                     None,
@@ -885,9 +897,13 @@ pub fn require_complete(phases: &[PhaseResult]) -> SyncResult<()> {
     for phase in phases {
         if !phase.complete {
             return Err(SyncFailure::new(
-                format!(
+                crate::tr_format!(
                     "Statusabgleich unvollständig: {}",
-                    phase.reason.clone().unwrap_or_else(|| "unbekannt".into())
+                    "Status sync incomplete: {}",
+                    phase
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| crate::tr!("unbekannt", "unknown").into())
                 ),
                 Some("degraded"),
                 None,
@@ -962,10 +978,16 @@ pub async fn load_contents(
         if ctx.is_cancelled() {
             return Err(cancelled());
         }
-        let entries = client
-            .entries_mget(chunk)
-            .await
-            .map_err(|e| SyncFailure::new(format!("Nachladen fehlgeschlagen: {e}"), None, None))?;
+        let entries = client.entries_mget(chunk).await.map_err(|e| {
+            SyncFailure::new(
+                crate::tr_format!(
+                    "Nachladen fehlgeschlagen: {e}",
+                    "Could not fetch remaining content: {e}"
+                ),
+                None,
+                None,
+            )
+        })?;
         let received = entries.len();
         ingest_entries(worker, account_id, pull_generation, entries)
             .await
@@ -995,10 +1017,16 @@ pub async fn load_missing_contents(
     if ids.is_empty() {
         return Ok(0);
     }
-    let entries = client
-        .entries_mget(&ids)
-        .await
-        .map_err(|e| SyncFailure::new(format!("Nachladen fehlgeschlagen: {e}"), None, None))?;
+    let entries = client.entries_mget(&ids).await.map_err(|e| {
+        SyncFailure::new(
+            crate::tr_format!(
+                "Nachladen fehlgeschlagen: {e}",
+                "Could not fetch remaining content: {e}"
+            ),
+            None,
+            None,
+        )
+    })?;
     let received = entries.len();
     ingest_entries(worker, account_id, pull_generation, entries)
         .await
@@ -1020,7 +1048,10 @@ pub async fn sync_subscriptions(
     let subs = client.subscriptions().await.map_err(io_err)?;
     let cats = client.categories().await.map_err(io_err)?;
     for c in &cats {
-        let name = c.label.clone().unwrap_or_else(|| "Gruppe".into());
+        let name = c
+            .label
+            .clone()
+            .unwrap_or_else(|| crate::tr!("Gruppe", "Group").into());
         db(worker, {
             let account_id = account_id.to_string();
             let c = c.clone();
@@ -1101,7 +1132,11 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             })
             .await?;
             if ctx.is_cancelled() {
-                return Err(SyncFailure::new("Lauf abgebrochen", None, None));
+                return Err(SyncFailure::new(
+                    crate::tr!("Lauf abgebrochen", "Sync cancelled"),
+                    None,
+                    None,
+                ));
             }
             // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und Ereignisse
             // und wird jetzt verbindlich im Credential festgehalten.
@@ -1233,8 +1268,9 @@ pub fn mark_feeds_server_side(
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
                     account_id: ctx.account_id.clone(),
                     run_id: ctx.run_id,
-                    message: format!(
+                    message: crate::tr_format!(
                         "Serverseitig als gelesen fehlgeschlagen: {}",
+                        "Could not mark as read on server: {}",
                         failure.message
                     ),
                     status: failure.status.clone(),
@@ -1427,7 +1463,10 @@ async fn send_group(
             })
             .await;
             return Err(SyncFailure::new(
-                format!("404 für {total} Änderungen: {message} — bleiben lokal erhalten"),
+                crate::tr_format!(
+                    "404 für {total} Änderungen: {message} — bleiben lokal erhalten",
+                    "404 for {total} changes: {message} — kept locally"
+                ),
                 Some("degraded"),
                 None,
             ));
@@ -1447,8 +1486,9 @@ async fn send_group(
             })
             .await;
             return Err(SyncFailure::new(
-                format!(
+                crate::tr_format!(
                     "Drosselung durch Feedly — neuer Versuch ab {}",
+                    "Rate limited by Feedly — retrying {}",
                     fmt_ms(next)
                 ),
                 Some("rate_limited"),
@@ -1468,7 +1508,10 @@ async fn send_group(
             })
             .await;
             return Err(SyncFailure::new(
-                format!("Auth/Rechte ({status}): {message} — bitte neu verbinden"),
+                crate::tr_format!(
+                    "Auth/Rechte ({status}): {message} — bitte neu verbinden",
+                    "Authentication/permissions ({status}): {message} — please reconnect"
+                ),
                 Some("auth_required"),
                 Some(next),
             ));
@@ -1509,8 +1552,9 @@ async fn send_group(
                 return Err(failure);
             }
             return Err(SyncFailure::new(
-                format!(
+                crate::tr_format!(
                     "Bestätigung nach dem Upload fehlgeschlagen: {}",
+                    "Confirmation after upload failed: {}",
                     failure.message
                 ),
                 Some("degraded"),
@@ -1565,14 +1609,14 @@ async fn send_group(
     // und werden sichtbar gemeldet, weitere Gruppen laufen trotzdem.
     let _ = ctx;
     Err(SyncFailure::new(
-        format!("Feedly hat {count} von {} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt", group.rows.len()),
+        crate::tr_format!("Feedly hat {count} von {} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt", "Feedly has not confirmed {count} of {} changes yet — retry queued", group.rows.len()),
         Some("degraded"),
         None,
     ))
 }
 fn fmt_ms(ms: i64) -> String {
     let minutes = (ms - storage::now_ms()).max(0) / 60_000 + 1;
-    format!("in ca. {minutes} min")
+    crate::tr_format!("in ca. {minutes} min", "in about {minutes} min")
 }
 
 fn set_status(worker: &DbWorker, status: &str, account_id: Option<&str>) {
@@ -1645,11 +1689,14 @@ pub fn delta_sync(
                     pf::PageAction::Done => break,
                     pf::PageAction::Aborted => {
                         return Err(SyncFailure::new(
-                            format!(
+                            crate::tr_format!(
                                 "Read-Abgleich unvollständig: {}",
-                                reads_pager
-                                    .stopped_because
-                                    .unwrap_or_else(|| "Abbruch ohne Angabe".to_string())
+                                "Read status sync incomplete: {}",
+                                reads_pager.stopped_because.unwrap_or_else(|| crate::tr!(
+                                    "Abbruch ohne Angabe",
+                                    "Cancelled without a reason"
+                                )
+                                .to_string())
                             ),
                             None,
                             None,
@@ -1899,7 +1946,7 @@ mod r1_regression {
             .await
             .unwrap()
         {
-            pf::Inventory::Incomplete(r) => assert!(r.contains("Zyklus"), "{r}"),
+            pf::Inventory::Incomplete(r) => assert!(r.contains("cycle"), "{r}"),
             pf::Inventory::Complete(_) => panic!("Zyklus darf nicht als vollständig gelten"),
         }
     }
@@ -2096,7 +2143,7 @@ mod r1_regression {
             .await
             .unwrap()
         {
-            pf::Inventory::Incomplete(r) => assert!(r.contains("Sicherheitslimit"), "{r}"),
+            pf::Inventory::Incomplete(r) => assert!(r.contains("Safety limit"), "{r}"),
             pf::Inventory::Complete(_) => panic!("Limit darf nicht als vollständig gelten"),
         }
         assert_eq!(hits.load(Ordering::SeqCst), 3);
@@ -2820,7 +2867,7 @@ mod delta_e2e_tests {
         }
         let message = failed.expect("der Lauf meldet einen Fehler");
         assert!(
-            message.contains("unvollständig") || message.contains("Abgleich"),
+            message.contains("incomplete") || message.contains("sync"),
             "{message}"
         );
         let watermark = db_blocking(&worker, |db| db.last_sync("feedly-1").unwrap());
@@ -2873,7 +2920,7 @@ mod delta_e2e_tests {
             }
         }
         let message = failed.expect("der Erst-Sync meldet einen Fehler");
-        assert!(message.contains("unvollständig"), "{message}");
+        assert!(message.contains("incomplete"), "{message}");
         let watermark = db_blocking(&worker, |db| db.last_sync("feedly-7").unwrap());
         assert!(
             watermark.is_none(),
@@ -3417,7 +3464,7 @@ mod cancel_tests {
             }
         }
         assert!(
-            failed.unwrap_or_default().contains("abgebrochen"),
+            failed.unwrap_or_default().contains("cancelled"),
             "der Lauf meldet den Abbruch"
         );
         assert_eq!(

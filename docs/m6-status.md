@@ -23,7 +23,7 @@
   es werden nur app-eigene CSS-Klassen überschrieben.
 - **Distribution:** `packaging/PKGBUILD` (cargo --release --locked), Desktop-Entry,
   skalierbares Icon, AppStream-Metainfo unter `data/`; Fenster-Iconname gesetzt.
-  App-ID bleibt bis zur Namensklärung `io.github.PROJEKTINHABER.Lesefluss`.
+  App-ID seit der Namensfestlegung: `io.github.tobiasbischoff.Lesefluss`.
 
 ## Abnahme offen (manuell, frische Omarchy-Umgebung)
 

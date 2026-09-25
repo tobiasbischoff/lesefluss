@@ -1,5 +1,6 @@
 #[derive(Clone, Debug)]
 pub struct Prefs {
+    pub language: crate::strings::LanguageChoice,
     pub auto_read: bool,
     pub compact: bool,
     pub thumbs: bool,
@@ -19,6 +20,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
+            language: crate::strings::LanguageChoice::default(),
             auto_read: true,
             compact: false,
             thumbs: true,
@@ -38,7 +40,13 @@ impl Default for Prefs {
 
 impl Prefs {
     pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Self {
-        let mut p = Self::default();
+        let mut p = Self {
+            language: get("language")
+                .as_deref()
+                .and_then(crate::strings::LanguageChoice::parse)
+                .unwrap_or_default(),
+            ..Self::default()
+        };
         let num = |key: &str, min: f64, max: f64, fallback: f64| -> f64 {
             get(key)
                 .and_then(|v| v.trim().parse::<f64>().ok())
@@ -104,5 +112,28 @@ impl Prefs {
             }
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strings::LanguageChoice;
+
+    #[test]
+    fn language_preference_round_trips_through_database() {
+        let db = storage::Database::open_in_memory().unwrap();
+        let load = || Prefs::load(&|key| db.get_pref(key).unwrap());
+        assert_eq!(load().language, LanguageChoice::English);
+        for choice in [
+            LanguageChoice::German,
+            LanguageChoice::System,
+            LanguageChoice::English,
+        ] {
+            db.set_pref("language", choice.key()).unwrap();
+            assert_eq!(load().language, choice);
+        }
+        db.set_pref("language", "invalid").unwrap();
+        assert_eq!(load().language, LanguageChoice::English);
     }
 }

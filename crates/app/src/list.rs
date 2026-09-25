@@ -182,7 +182,7 @@ fn article_row(a: &ArticleRow, thumbs: bool) -> (gtk::Box, RowHandles) {
     let saved_icon = gtk::Image::builder()
         .icon_name("user-bookmarks-symbolic")
         .pixel_size(12)
-        .tooltip_text("Gespeichert")
+        .tooltip_text(crate::tr!("Gespeichert", "Saved"))
         .css_classes(vec!["lf-status-icon".to_string()])
         .build();
     saved_icon.set_visible(a.saved);

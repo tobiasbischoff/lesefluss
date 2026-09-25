@@ -8,7 +8,7 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("schema-fehler: {0}")]
+    #[error("schema error: {0}")]
     Schema(String),
 }
 
@@ -552,7 +552,7 @@ impl Database {
         let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
         if current > max_known {
             return Err(StorageError::Schema(format!(
-                "Datenbank hat neuere Schema-Version {current} als diese App ({max_known}) — nur lesen, nicht schreiben"
+                "Database schema version {current} is newer than this app ({max_known}) — read-only access required"
             )));
         }
         for (version, sql) in MIGRATIONS {
@@ -1837,21 +1837,19 @@ impl Database {
         let file = std::fs::File::open(path)?;
         let meta = file.metadata()?;
         if meta.len() < 512 {
-            return Err(StorageError::Schema(
-                "Datei ist keine SQLite-Datenbank".into(),
-            ));
+            return Err(StorageError::Schema("File is not a SQLite database".into()));
         }
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|e| StorageError::Schema(format!("Keine SQLite-Datenbank: {e}")))?;
+        .map_err(|e| StorageError::Schema(format!("Not a SQLite database: {e}")))?;
         let integrity: String = conn
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
-            .map_err(|e| StorageError::Schema(format!("Integritätsprüfung fehlgeschlagen: {e}")))?;
+            .map_err(|e| StorageError::Schema(format!("Integrity check failed: {e}")))?;
         if integrity != "ok" {
             return Err(StorageError::Schema(format!(
-                "Integritätsprüfung: {integrity}"
+                "Integrity check: {integrity}"
             )));
         }
         for table in ["accounts", "feeds", "articles", "schema_version"] {
@@ -1864,7 +1862,7 @@ impl Database {
                 .map_err(|e| StorageError::Schema(e.to_string()))?;
             if found == 0 {
                 return Err(StorageError::Schema(format!(
-                    "Erwartete Tabelle {table} fehlt — keine Lesefluss-Bibliothek"
+                    "Expected table {table} missing — not a Lesefluss library"
                 )));
             }
         }
@@ -1878,12 +1876,12 @@ impl Database {
         let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
         if version > max_known {
             return Err(StorageError::Schema(format!(
-                "Schema-Version {version} ist neuer als diese App ({max_known})"
+                "Schema version {version} is newer than this app ({max_known})"
             )));
         }
         if version < 1 {
             return Err(StorageError::Schema(
-                "Die Datei enthält keine Lesefluss-Migration — keine Lesefluss-Bibliothek".into(),
+                "File contains no Lesefluss migration — not a Lesefluss library".into(),
             ));
         }
         let expected = expected_schema(version)?;
@@ -1892,14 +1890,14 @@ impl Database {
             match actual.get(table) {
                 None => {
                     return Err(StorageError::Schema(format!(
-                        "Tabelle {table} fehlt — die Datei ist keine Lesefluss-Bibliothek"
+                        "Table {table} missing — file is not a Lesefluss library"
                     )))
                 }
                 Some(found) => {
                     for column in columns {
                         if !found.contains(column) {
                             return Err(StorageError::Schema(format!(
-                                "Spalte {table}.{column} fehlt — unvollständiges Schema"
+                                "Column {table}.{column} missing — incomplete schema"
                             )));
                         }
                     }
@@ -1919,7 +1917,7 @@ impl Database {
             .collect();
         if !violations.is_empty() {
             return Err(StorageError::Schema(format!(
-                "Fremdschlüssel verletzt: {}",
+                "Foreign key violation: {}",
                 violations.join(", ")
             )));
         }
@@ -1940,7 +1938,7 @@ impl Database {
         )?;
         if version < max_known && migrated <= version {
             return Err(StorageError::Schema(format!(
-                "Migration blieb bei Version {migrated} statt {version} zu erhöhen"
+                "Migration remained at version {migrated} instead of advancing beyond {version}"
             )));
         }
         let expected = expected_schema(migrated)?;
@@ -1950,12 +1948,12 @@ impl Database {
                 Some(found) if columns.iter().all(|c| found.contains(c)) => {}
                 Some(_) => {
                     return Err(StorageError::Schema(format!(
-                        "Migration unvollständig: Spalten in {table} fehlen"
+                        "Migration incomplete: columns missing in {table}"
                     )))
                 }
                 None => {
                     return Err(StorageError::Schema(format!(
-                        "Migration unvollständig: Tabelle {table} fehlt"
+                        "Migration incomplete: table {table} missing"
                     )))
                 }
             }
@@ -1963,10 +1961,10 @@ impl Database {
         let integrity: String = db
             .conn
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
-            .map_err(|e| StorageError::Schema(format!("Integritätsprüfung fehlgeschlagen: {e}")))?;
+            .map_err(|e| StorageError::Schema(format!("Integrity check failed: {e}")))?;
         if integrity != "ok" {
             return Err(StorageError::Schema(format!(
-                "Integritätsprüfung nach Migration: {integrity}"
+                "Integrity check after migration: {integrity}"
             )));
         }
         db.conn
@@ -3653,7 +3651,7 @@ mod tests {
             .unwrap();
         }
         let err = Database::validate_candidate(&candidate).unwrap_err();
-        assert!(err.to_string().contains("neuer"), "{err}");
+        assert!(err.to_string().contains("newer"), "{err}");
     }
 
     #[test]
@@ -4084,7 +4082,7 @@ mod tests {
             .unwrap();
         db.raw().execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         let err = Database::validate_candidate(&path).unwrap_err();
-        assert!(err.to_string().contains("Fremdschlüssel"), "{err}");
+        assert!(err.to_string().contains("Foreign key"), "{err}");
     }
 
     #[test]

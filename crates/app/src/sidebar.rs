@@ -14,18 +14,22 @@ pub fn rebuild(
     }
     filters_out.clear();
 
-    add_section(list, filters_out, "Bibliothek");
+    add_section(list, filters_out, crate::tr!("Bibliothek", "Library"));
     add_smart_row(
         list,
         filters_out,
         "mail-unread-symbolic",
-        "Ungelesen",
+        crate::tr!("Ungelesen", "Unread"),
         state.counts.unread,
         true,
         Source::Global,
     );
 
-    add_section(list, filters_out, "Lokale Bibliothek");
+    add_section(
+        list,
+        filters_out,
+        crate::tr!("Lokale Bibliothek", "Local library"),
+    );
     add_account_block(list, state, filters_out, "local", on_toggle_group);
 
     for (id, kind, name) in &state.accounts {
@@ -118,9 +122,9 @@ fn add_account_block(
             .icon_name(arrow)
             .css_classes(vec!["flat".to_string(), "lf-status-icon".to_string()])
             .tooltip_text(if is_collapsed {
-                "Gruppe ausklappen"
+                crate::tr!("Gruppe ausklappen", "Expand group")
             } else {
-                "Gruppe einklappen"
+                crate::tr!("Gruppe einklappen", "Collapse group")
             })
             .build();
         let cb = Rc::clone(on_toggle_group);

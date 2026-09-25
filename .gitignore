@@ -1,3 +1,4 @@
 /target
 *.token
 feedly-token
+feedly-credential

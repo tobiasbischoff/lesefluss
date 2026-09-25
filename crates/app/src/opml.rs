@@ -33,8 +33,9 @@ fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
 
 pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
     if xml.len() > MAX_OPML_BYTES {
-        return Err(format!(
+        return Err(crate::tr_format!(
             "Datei zu groß ({} Bytes, Limit {MAX_OPML_BYTES})",
+            "File too large ({} bytes, limit {MAX_OPML_BYTES})",
             xml.len()
         ));
     }
@@ -51,7 +52,10 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
             Ok(Event::Start(e)) if e.local_name().as_ref() == "outline" => {
                 outlines += 1;
                 if outlines > MAX_OUTLINES {
-                    return Err(format!("Mehr als {MAX_OUTLINES} Outlines"));
+                    return Err(crate::tr_format!(
+                        "Mehr als {MAX_OUTLINES} Outlines",
+                        "More than {MAX_OUTLINES} outlines"
+                    ));
                 }
                 let text = attr(&e, "text")
                     .or_else(|| attr(&e, "title"))
@@ -63,12 +67,16 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
                     }
                     _ => {
                         if group_stack.len() >= MAX_DEPTH {
-                            return Err(format!(
-                                "Verschachtelung tiefer als {MAX_DEPTH} bei Outline {outlines}"
+                            return Err(crate::tr_format!(
+                                "Verschachtelung tiefer als {MAX_DEPTH} bei Outline {outlines}",
+                                "Nesting exceeds {MAX_DEPTH} at outline {outlines}"
                             ));
                         }
                         if text.is_empty() {
-                            draft.errors.push(format!("Outline {outlines} ohne Namen"));
+                            draft.errors.push(crate::tr_format!(
+                                "Outline {outlines} ohne Namen",
+                                "Outline {outlines} has no name"
+                            ));
                         }
                         group_stack.push(text);
                         open_groups.push(true);
@@ -78,7 +86,10 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
             Ok(Event::Empty(e)) if e.local_name().as_ref() == "outline" => {
                 outlines += 1;
                 if outlines > MAX_OUTLINES {
-                    return Err(format!("Mehr als {MAX_OUTLINES} Outlines"));
+                    return Err(crate::tr_format!(
+                        "Mehr als {MAX_OUTLINES} Outlines",
+                        "More than {MAX_OUTLINES} outlines"
+                    ));
                 }
                 let text = attr(&e, "text")
                     .or_else(|| attr(&e, "title"))
@@ -95,22 +106,27 @@ pub fn parse_opml(xml: &str) -> Result<OpmlDraft, String> {
                 }
                 Some(false) => {}
                 None => {
-                    return Err("Unbalancedes Outline: schließendes Element ohne Öffnung".into())
+                    return Err(crate::tr!(
+                        "Unbalancedes Outline: schließendes Element ohne Öffnung",
+                        "Unbalanced outline: closing element without opening element"
+                    )
+                    .into())
                 }
             },
-            Err(err) => return Err(format!("XML-Fehler: {err}")),
+            Err(err) => return Err(crate::tr_format!("XML-Fehler: {err}", "XML error: {err}")),
             _ => {}
         }
         buf.clear();
     }
     if !open_groups.is_empty() {
-        return Err(format!(
+        return Err(crate::tr_format!(
             "Datei endet mit {} offenen Outline-Elementen",
+            "File ends with {} unclosed outline elements",
             open_groups.len()
         ));
     }
     if draft.feeds.is_empty() && draft.errors.is_empty() {
-        return Err("Keine Feed-Outlines gefunden".into());
+        return Err(crate::tr!("Keine Feed-Outlines gefunden", "No feed outlines found").into());
     }
     Ok(draft)
 }
@@ -138,7 +154,7 @@ fn make_feed(
 }
 
 pub fn build_opml(feeds: &[OpmlFeed]) -> String {
-    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n<head>\n<title>Lesefluss Abonnements</title>\n</head>\n<body>\n");
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n<head>\n<title>Lesefluss</title>\n</head>\n<body>\n");
     let mut open_groups: Vec<String> = Vec::new();
     for f in feeds {
         let mut depth = 0usize;
@@ -270,12 +286,12 @@ mod tests {
             + &"</outline>".repeat(40);
         let xml = format!("<opml version=\"2.0\"><body>{deep}</body></opml>");
         let err = parse_opml(&xml).unwrap_err();
-        assert!(err.contains("Verschachtelung"), "{err}");
+        assert!(err.contains("Nesting"), "{err}");
 
         let broken = "<opml version=\"2.0\"><body><outline text=\"G\">";
         let err = parse_opml(broken).unwrap_err();
         assert!(
-            err.contains("offenen") || err.contains("Unbalanced"),
+            err.contains("unclosed") || err.contains("Unbalanced"),
             "{err}"
         );
     }
@@ -295,7 +311,7 @@ mod tests {
         let xml = r#"<opml version="2.0"><body><outline><outline type="rss" text="F" xmlUrl="https://a.example/f.xml"/></outline></body></opml>"#;
         let draft = parse_opml(xml).expect("parse");
         assert!(
-            draft.errors.iter().any(|e| e.contains("ohne Namen")),
+            draft.errors.iter().any(|e| e.contains("has no name")),
             "{:?}",
             draft.errors
         );

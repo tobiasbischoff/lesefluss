@@ -52,7 +52,7 @@ pub fn render_document(doc: &ReaderDocument, tokens: &Tokens, style: &ReaderStyl
     }
     format!(
         r#"<!doctype html>
-<html lang="de">
+<html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

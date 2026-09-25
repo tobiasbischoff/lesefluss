@@ -12,11 +12,11 @@ Wayland/Hyprland, 2560×1600 @ 60 Hz, Skalierung 1.667, Lesefluss `0.1.0` (Relea
 | Startzeit bis zum ersten Idle-Turn nach dem Map | `LF_DEBUG=1`, Log `startup-ready <ms>` | 3 Läufe warm, 1 Lauf mit evakuierten DB-Seiten (`posix_fadvise(DONTNEED)`) |
 | Idle-CPU | Differenz `utime+stime` aus `/proc/<pid>/stat` über 10 s | 1 Lauf, 12 s nach dem Start |
 | Speicher | `Pss` aus `/proc/<pid>/smaps_rollup` | dito |
-| Datenbank | `lf-bench --seed 100000` (Release) | 100 000 synthetische Artikel, 10 Feeds, je 50 Messungen |
+| Datenbank | `lesefluss-bench --seed 100000` (Release) | 100 000 synthetische Artikel, 10 Feeds, je 50 Messungen |
 | Frame-Pacing | Tick-Callback am `gtk::FrameClock`, `LF_FRAMECHECK=1` | 3600 Frames (~60 s) |
 | Interaktionslast | `LF_FRAMECHECK=stress` → `win.next-article` alle 350 ms (DB-Abfrage + Reader-Render pro Schritt) | 3600 Frames |
 
-`lf-bench` schreibt ausschließlich in eine Wegwerf-Datenbank (`--db /tmp/lf-bench.db`).
+`lesefluss-bench` schreibt ausschließlich in eine Wegwerf-Datenbank (`--db /tmp/lesefluss-bench.db`).
 
 ## Ergebnisse
 
@@ -45,7 +45,7 @@ ohne `sudo` nicht erzwungen werden — das ist die verbleibende Abweichung zur M
 | Seed 100 000 Artikel (200er-Batches) | 2921 ms | — | — |
 
 Messung vom 25.09.2026 nach den Korrekturen an Cursor, Zählern und Revisionen
-(`target/release/lf-bench --seed 100000`, gleiche Maschine, Release). Die Gruppenzählung
+(`target/release/lesefluss-bench --seed 100000`, gleiche Maschine, Release). Die Gruppenzählung
 arbeitet jetzt über `(feed_id, id)` und ist deshalb etwas teurer; sie läuft im
 Aufbewahrungs-/Zählpfad und nicht zwischen zwei Klicks.
 

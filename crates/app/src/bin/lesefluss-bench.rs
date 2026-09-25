@@ -22,7 +22,7 @@ fn main() {
         .position(|a| a == "--db")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "/tmp/lf-bench.db".to_string());
+        .unwrap_or_else(|| "/tmp/lesefluss-bench.db".to_string());
 
     let _ = std::fs::remove_file(&path);
     let db = Database::open(std::path::Path::new(&path)).expect("db open");

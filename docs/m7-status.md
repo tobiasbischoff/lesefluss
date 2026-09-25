@@ -31,7 +31,7 @@
 
 ## Messwerkzeuge (bleiben im Repo)
 
-- `crates/app/src/bin/lf-bench.rs` — synthetische Datenbank (100 000 Artikel) und Latenzmessung
+- `crates/app/src/bin/lesefluss-bench.rs` — synthetische Datenbank (100 000 Artikel) und Latenzmessung
   für Liste, Keyset, Suche, Zähler, Statuswechsel; schreibt nur in die über `--db` angegebene Datei.
 - `LF_DEBUG=1` — Startzeit-Log (`startup-ready <ms>`) und Statusmeldungen.
 - `LF_FRAMECHECK=1` — 3600 Frame-Ticks am `gtk::FrameClock` mit p50/p95/p99/max und
@@ -78,8 +78,9 @@
 
 1. `makepkg -si` einmal vollständig durchlaufen (Quellpfad des PKGBUILDs auf ein echtes Repository
    umstellen).
-2. App-ID/Namen finalisieren — Platzhalter `io.github.PROJEKTINHABER.Lesefluss`; Desktop-Datei,
-   AppStream, Icon und `application_id` gemeinsam umbenennen.
+2. Name festgelegt: Lesefluss; Desktop-Datei, AppStream, Icon und `application_id`
+   verwenden `io.github.tobiasbischoff.Lesefluss`. Projektadresse:
+   `https://github.com/tobiasbischoff/lesefluss`.
 3. `LICENSE-MIT` und `LICENSE-APACHE` ins Wurzelverzeichnis.
 4. `cargo audit`/`cargo deny` auf einer Maschine mit Netzzugang.
 5. Manuelle Abnahmen: Orca/AT-SPI, Skalierung 125 %/150 %, Zweitmonitor-Mix, `sysprof`-Scrollmessung,

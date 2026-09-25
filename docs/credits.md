@@ -5,14 +5,14 @@
 ## Lizenz
 
 Das Repository ist noch ohne veröffentlichte Lizenzdatei; die geplante Doppel-Lizenzierung
-`MIT OR Apache-2.0` ist in `data/io.github.PROJEKTINHABER.Lesefluss.appdata.xml` als
+`MIT OR Apache-2.0` ist in `data/io.github.tobiasbischoff.Lesefluss.appdata.xml` als
 `project_license` eingetragen. Vor der ersten Veröffentlichung müssen `LICENSE-MIT` und
 `LICENSE-APACHE` im Wurzelverzeichnis liegen; beide Texte sind Standard und ohne Änderungen zu
 übernehmen.
 
 ## Icon
 
-`data/io.github.PROJEKTINHABER.Lesefluss.svg` ist ein eigens für dieses Projekt gezeichnetes Vektor-
+`data/io.github.tobiasbischoff.Lesefluss.svg` ist ein eigens für dieses Projekt gezeichnetes Vektor-
 Icon (RSS-Signal über dunkler Verlaufsfläche), keine Kopie oder Bearbeitung fremder Icons. Es ist
 als skalierbares Anwendungssymbol unter `hicolor/scalable/apps` installiert.
 

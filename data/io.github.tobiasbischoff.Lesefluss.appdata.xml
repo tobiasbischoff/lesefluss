@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tobiasbischoff.Lesefluss</id>
+  <name>Lesefluss</name>
+  <summary>A calm, native RSS reader for Wayland (local + Feedly)</summary>
+  <summary xml:lang="de">Ruhiger, nativer RSS-Reader für Wayland (lokal + Feedly)</summary>
+  <url type="homepage">https://github.com/tobiasbischoff/lesefluss</url>
+  <url type="bugtracker">https://github.com/tobiasbischoff/lesefluss/issues</url>
+  <developer_name>Lesefluss contributors</developer_name>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>Lesefluss is a native GTK 4 RSS reader with three panes, a virtual article list, a WebKit reader, full-text search, OPML import and export, a local library and optional offline-capable Feedly sync for read and saved states.</p>
+    <p xml:lang="de">Lesefluss ist ein nativer GTK-4-RSS-Reader mit drei Spalten, virtueller Artikelliste, WebKit-Reader, Volltextsuche, OPML-Import/-Export, lokaler Bibliothek und optionalem Feedly-Sync (Read/Saved, offline-fähig).</p>
+  </description>
+  <launchable type="desktop-id">io.github.tobiasbischoff.Lesefluss.desktop</launchable>
+  <provides>
+    <binary>lesefluss</binary>
+  </provides>
+  <languages>
+    <lang>en</lang>
+    <lang>de</lang>
+  </languages>
+  <content_rating type="oars-1.1"/>
+</component>

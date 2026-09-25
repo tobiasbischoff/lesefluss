@@ -2,7 +2,7 @@ use adw::prelude::*;
 use gtk::glib;
 use webkit6::prelude::*;
 
-const APP_ID: &str = "io.github.PROJEKTINHABER.Lesefluss.Probe";
+const APP_ID: &str = "io.github.tobiasbischoff.Lesefluss.Probe";
 
 fn long_document() -> String {
     let mut body = String::new();

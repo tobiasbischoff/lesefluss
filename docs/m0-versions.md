@@ -37,7 +37,7 @@ libadwaita ≥ 1.4, WebKitGTK ≥ 6.0-API. System hat 4.22/1.9/2.52 — Puffer v
 
 - `cargo run --bin lesefluss-probe` startet `AdwApplicationWindow` unter Hyprland.
 - GDK-Display-Typ: `GdkWaylandDisplay` → natives Wayland, kein XWayland.
-- Hyprland-Client class `io.github.PROJEKTINHABER.Lesefluss.Probe` gemappt.
+- Hyprland-Client class `io.github.tobiasbischoff.Lesefluss.Probe` gemappt.
 - WebKit6-`WebView` mit ephemeraler `NetworkSession`, langes HTML-Dokument (200 Absätze),
   CSP `default-src 'none'` im Dokument, nativer Scrollbesitzer = WebKit.
 - Native `GtkListBox`-Sidebar (248 px) + `GtkPaned`, F6-Fokuswechsel-Controller eingebaut.

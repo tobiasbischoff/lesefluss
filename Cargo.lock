@@ -1239,7 +1239,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lesefluss-app"
+name = "lesefluss"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",

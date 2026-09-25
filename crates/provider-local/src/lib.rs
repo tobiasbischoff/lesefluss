@@ -11,11 +11,11 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     #[error("parse: {0}")]
     Parse(String),
-    #[error("zu groß: {0} Bytes")]
+    #[error("too large: {0} bytes")]
     TooLarge(usize),
-    #[error("Ziel abgelehnt: {0}")]
+    #[error("destination rejected: {0}")]
     Blocked(String),
-    #[error("kein Feed gefunden")]
+    #[error("no feed found")]
     NoFeed,
 }
 
@@ -132,16 +132,16 @@ impl HttpClient {
                 .get("location")
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| {
-                    ProviderError::Blocked(format!("Weiterleitung ohne Ziel ({status})"))
+                    ProviderError::Blocked(format!("Redirect without destination ({status})"))
                 })?
                 .to_string();
             let next = current.join(&location).map_err(|_| {
-                ProviderError::Blocked(format!("Ungültiges Weiterleitungsziel: {location}"))
+                ProviderError::Blocked(format!("Invalid redirect destination: {location}"))
             })?;
             current = self.guard(next.as_str())?;
         }
         Err(ProviderError::Blocked(format!(
-            "Zu viele Weiterleitungen (>{MAX_REDIRECTS})"
+            "Too many redirects (>{MAX_REDIRECTS})"
         )))
     }
 
@@ -268,7 +268,7 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
             title: e
                 .title
                 .map(|t| t.content)
-                .unwrap_or_else(|| "(ohne Titel)".into()),
+                .unwrap_or_else(|| "(untitled)".into()),
             author: e.authors.first().map(|a| a.name.clone()),
             url: link,
             published_ms: published,

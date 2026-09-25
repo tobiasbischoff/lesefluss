@@ -73,11 +73,11 @@ pub fn host_resolves_public(host: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
-    #[error("unzulässiges Schema {0}")]
+    #[error("unsupported URL scheme {0}")]
     Scheme(String),
-    #[error("Zielhost nicht erreichbar: {0}")]
+    #[error("destination host unavailable: {0}")]
     HostBlocked(String),
-    #[error("Auflösung fehlgeschlagen: {0}")]
+    #[error("DNS lookup failed: {0}")]
     Resolve(String),
 }
 
@@ -159,7 +159,7 @@ impl reqwest::dns::Resolve for PolicyResolver {
                 .collect();
             if allowed.is_empty() {
                 return Err(Box::new(PolicyError::HostBlocked(
-                    "DNS lieferte nur nicht freigegebene Adressen".to_string(),
+                    "DNS returned only disallowed addresses".to_string(),
                 )) as BoxError);
             }
             Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)

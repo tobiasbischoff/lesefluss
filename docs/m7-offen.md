@@ -306,9 +306,13 @@ und [FeedlyAPICaller](https://github.com/Ranchero-Software/NetNewsWire/blob/b436
   getrennt nach Datenbank/WAL, Bildcache und gepinnten Dateien. **Offen:** Offline-Vorladen
   gewünschter Artikel, Löschen einzelner Cache-Einträge, Auswirkung von Änderungen auf
   laufende Bildjobs.
-- [ ] **P4 — Lokalisierung:** alle produktiven Texte inklusive Settings, Sidebar,
-  Fehler-/Import-/Kontodialoge auf DE/EN umstellen; Plurale, Datumsdarstellung und
-  Reader-Sprache korrekt. Einige übersetzte Tooltips sind keine vollständige Lokalisierung.
+- [x] **P4 — Lokalisierung (2026-09-25):** Englische Oberfläche als Standard;
+  persistente Auswahl English/Deutsch/Systemsprache unter Settings → Language
+  (Neustart erforderlich). Settings, Sidebar, Reader, Import-/Backup-/Kontodialoge
+  und Sync-Meldungen sind übersetzt; Datumsnamen folgen der App-Sprache.
+  Artikel bleiben in ihrer Originalsprache; dem Reader wird keine falsche deutsche
+  Inhaltssprache mehr vorgegeben. Technische Datenbank-/Netzwerkdiagnosen sind Englisch.
+  Locale-Priorität, Fallback, Speicherung und beide Sprachzweige sind getestet.
 - [ ] **P5 — Accessibility:** alle Funktionen ohne Maus, AT-SPI-Namen/Rollen/Status,
   High Contrast, reduzierte Bewegung, Textskalierung bis 200 %, RTL/CJK und sichtbarer Fokus.
 - [ ] **P6 — Reaktionsfähigkeit:** *teilweise erledigt 2026-09-25:* Datei-,

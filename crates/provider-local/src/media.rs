@@ -275,14 +275,17 @@ fn filetime_touch(p: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn placeholder_data_uri(alt: &str) -> String {
-    let alt: String = alt.chars().take(60).collect();
+pub fn placeholder_data_uri(alt: &str, unavailable_label: &str) -> String {
+    let alt = format!(
+        "{unavailable_label} — {}",
+        alt.chars().take(60).collect::<String>()
+    );
     let esc = alt
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     let svg = format!(
-        "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='96'><rect width='100%' height='100%' fill='#26272b'/><text x='50%' y='50%' fill='#9a9da6' font-family='sans-serif' font-size='13' text-anchor='middle' dominant-baseline='middle'>Bild nicht verfügbar — {esc}</text></svg>"
+        "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='96'><rect width='100%' height='100%' fill='#26272b'/><text x='50%' y='50%' fill='#9a9da6' font-family='sans-serif' font-size='13' text-anchor='middle' dominant-baseline='middle'>{esc}</text></svg>"
     );
     let enc = url::form_urlencoded::byte_serialize(svg.as_bytes()).collect::<String>();
     format!("data:image/svg+xml;utf8,{enc}")

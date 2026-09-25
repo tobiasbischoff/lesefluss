@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Lesefluss
+GenericName=RSS Reader
+GenericName[de]=RSS-Reader
+Comment=A calm, native RSS reader for Wayland (local + Feedly)
+Comment[de]=Ruhiger, nativer RSS-Reader für Wayland (lokal + Feedly)
+Exec=lesefluss
+Icon=io.github.tobiasbischoff.Lesefluss
+Terminal=false
+Categories=Network;News;GTK;
+Keywords=RSS;Feed;Reader;Feedly;OPML;
+StartupNotify=true
