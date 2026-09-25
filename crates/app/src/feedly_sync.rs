@@ -1120,220 +1120,331 @@ pub fn mark_feeds_server_side(
     });
 }
 
-/// Nach Feld und Sollzustand gruppierte Outbox-Zeilen: (Zeilen-ID, Revision, Artikel).
-type OutboxGroups = std::collections::HashMap<(String, bool), Vec<(i64, i64, String)>>;
-
 pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
-    let account_id = ctx.account_id.clone();
     let tx = net.event_sender();
     net.spawn(async move {
-        let client = pf::FeedlyClient::with_base(token, ctx.base());
-        let now = storage::now_ms();
-        // Claim und Requestrevision werden gemeinsam erfasst: ein zweiter
-        // Prozessor kann dieselbe Zeile nicht parallel senden.
-        let rows = db(&worker, {
-            let account_id = account_id.clone();
-            move |db2| db2.outbox_claim(&account_id, now, 100)
-        })
-        .await;
-        let Ok(rows) = rows else { return };
-        if rows.is_empty() {
-            return;
-        }
-        let mut groups: OutboxGroups = std::collections::HashMap::new();
-        for r in &rows {
-            groups
-                .entry((r.field.clone(), r.desired))
-                .or_default()
-                .push((r.id, r.revision, r.entity_id.clone()));
-        }
-        for ((field, desired), entries) in groups {
-            // Nach Logout, Auth- oder Quotenstopp wird kein weiterer Batch gesendet.
-            if ctx.is_cancelled() {
-                dbg_log("Outbox: Lauf abgebrochen, weitere Batches entfallen");
-                break;
+        let result = run_outbox(&worker, &tx, token, &ctx).await;
+        // Genau ein Abschluss pro Lauf: der Coordinator wird nie hängen gelassen.
+        match result {
+            Ok(()) => {
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncDone {
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    added: 0,
+                });
             }
-            let action = match (field.as_str(), desired) {
-                ("read", true) => "markAsRead",
-                ("read", false) => "keepUnread",
-                ("saved", true) => "markAsSaved",
-                _ => "markAsUnsaved",
-            };
-            let entry_ids: Vec<String> = entries.iter().map(|(_, _, e)| e.clone()).collect();
-            let sent: Vec<(i64, i64)> = entries.iter().map(|(id, rev, _)| (*id, *rev)).collect();
-            let entries_for_notice: Vec<(String, String)> = entries
-                .iter()
-                .map(|(_, _, entity)| (account_id.clone(), entity.clone()))
-                .collect();
-            match client.markers_entries(action, &entry_ids).await {
-                Ok(()) => {
-                    let total = sent.len();
-                    let _ = db(&worker, move |db2| db2.outbox_ack(&sent)).await;
-                    // Bestätigung durch einen **danach** begonnenen Statusabruf.
-                    // Die Nachbestätigung ist an die gesendete Revision gebunden:
-                    // eine inzwischen neuere Benutzerabsicht wird nicht überschrieben.
-                    match client.entries_mget(&entry_ids).await {
-                        Ok(remote) => {
-                            let by_id: std::collections::HashMap<&str, &pf::Entry> =
-                                remote.iter().map(|e| (e.id.as_str(), e)).collect();
-                            // Fehlende Antworten gelten ausdrücklich als unbestätigt.
-                            let unconfirmed: Vec<String> = entries
-                                .iter()
-                                .filter(|(_, _, entity)| {
-                                    match by_id.get(entity.as_str()) {
-                                        Some(e) => !confirmed(e, &field, desired),
-                                        None => true,
-                                    }
-                                })
-                                .map(|(_, _, entity)| entity.clone())
-                                .collect();
-                            if !unconfirmed.is_empty() {
-                                let count = unconfirmed.len();
-                                let account_for_db = account_id.clone();
-                                let field_for_db = field.clone();
-                                let sent_for_db: Vec<(i64, i64, String)> = entries
-                                    .iter()
-                                    .map(|(id, rev, entity)| (*id, *rev, entity.clone()))
-                                    .collect();
-                                let requeued = db(&worker, move |db2| {
-                                    let mut requeued = 0usize;
-                                    for (_, revision, entity) in &sent_for_db {
-                                        if db2.outbox_requeue_if_unchanged(
-                                            &account_for_db,
-                                            entity,
-                                            &field_for_db,
-                                            desired,
-                                            *revision,
-                                        )? {
-                                            requeued += 1;
-                                        }
-                                    }
-                                    let notices: Vec<(String, String)> = unconfirmed
-                                        .iter()
-                                        .map(|e| (account_for_db.clone(), e.clone()))
-                                        .collect();
-                                    db2.mark_unsynced(&notices)?;
-                                    Ok::<_, storage::StorageError>(requeued)
-                                })
-                                .await;
-                                dbg_log(&format!(
-                                    "Nachbestätigung: {} von {} erneut vorgemerkt",
-                                    id_count_guard(requeued).unwrap_or(0),
-                                    count
-                                ));
-                                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                                    account_id: ctx.account_id.clone(),
-                                    run_id: ctx.run_id,
-                                    message: format!(
-                                        "Feedly hat {count} von {total} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt"
-                                    ),
-                                    status: Some("degraded".into()),
-                                    retry_after_ms: None,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            // Eine fehlgeschlagene Bestätigungsabfrage ist selbst eine
-                            // offene Frage und wird sichtbar, nicht still übergangen.
-                            let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                                account_id: ctx.account_id.clone(),
-                                run_id: ctx.run_id,
-                                message: format!("Bestätigung nach dem Upload fehlgeschlagen: {e}"),
-                                status: Some("degraded".into()),
-                                retry_after_ms: None,
-                            });
-                        }
-                    }
-                }
-                Err(pf::FeedlyError::Api { status: 404, message, .. }) => {
-                    let _ = db(&worker, {
-                        let sent = sent.clone();
-                        move |db2| {
-                            let affected = db2.outbox_fail_permanent(&sent)?;
-                            if affected > 0 {
-                                db2.mark_unsynced(&entries_for_notice)?;
-                            }
-                            Ok::<_, storage::StorageError>(affected)
-                        }
-                    })
-                    .await;
-                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                        account_id: ctx.account_id.clone(),
-                        run_id: ctx.run_id,
-                        message: format!(
-                            "404 für {n} Änderungen: {message} — bleiben lokal erhalten und werden nicht erneut gesendet",
-                            n = sent.len()
-                        ),
-                        status: Some("degraded".into()),
-                        retry_after_ms: None,
-                    });
-                }
-                Err(pf::FeedlyError::Api { status: 429, retry_after_ms, .. }) => {
-                    // quota: der Server nennt den Zeitpunkt, sonst greift eine
-                    // vorsichtige Standardwartezeit.
-                    let next = retry_after_ms.unwrap_or_else(|| storage::now_ms() + 5 * 60_000);
-                    let _ = db(&worker, move |db2| db2.outbox_fail(&sent, next, false)).await;
-                    set_status(&worker, "rate_limited", Some(&account_id));
-                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                        account_id: ctx.account_id.clone(),
-                        run_id: ctx.run_id,
-                        status: Some("rate_limited".into()),
-                        retry_after_ms: Some(next),
-                        message: format!("Drosselung durch Feedly — neuer Versuch ab {}", fmt_ms(next)),
-                    });
-                    // Drosselung beendet den Versand dieses Laufs.
-                    break;
-                }
-                Err(pf::FeedlyError::Api { status, message, .. }) if status == 401 || status == 403 => {
-                    // Zentraler Auth-Stopp: Konto wird sichtbar gesperrt und lange
-                    // zurückgestellt, statt endlos mit fester Wartezeit zu versuchen.
-                    let next = storage::now_ms() + 30 * 60_000;
-                    let _ = db(&worker, move |db2| db2.outbox_fail(&sent, next, false)).await;
-                    set_status(
-                        &worker,
-                        "auth_required",
-                        Some(&account_id),
-                    );
-                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                        account_id: ctx.account_id.clone(),
-                        run_id: ctx.run_id,
-                        status: Some("auth_required".into()),
-                        retry_after_ms: Some(next),
-                        message: format!("Auth/Rechte ({status}): {message} — bitte neu verbinden"),
-                    });
-                    // Auth-Stopp: keine weiteren Batches.
-                    break;
-                }
-                Err(e) => {
-                    let next = storage::now_ms() + 60_000;
-                    let _ = db(&worker, move |db2| db2.outbox_fail(&sent, next, false)).await;
-                    let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
-                        account_id: ctx.account_id.clone(),
-                        run_id: ctx.run_id,
-                        message: e.to_string(),
-                        status: None,
-                        retry_after_ms: Some(next),
-                    });
-                    if ctx.is_cancelled() {
-                        break;
-                    }
-                }
+            Err(failure) => {
+                let status = failure.status.clone().unwrap_or_else(|| "degraded".into());
+                set_status(&worker, &status, Some(&ctx.account_id));
+                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                    account_id: ctx.account_id.clone(),
+                    run_id: ctx.run_id,
+                    message: failure.message,
+                    status: failure.status,
+                    retry_after_ms: failure.retry_after_ms,
+                });
             }
         }
     });
 }
 
-/// Der Rückgabewert der Nachbestätigung ist nur für Diagnosezwecke bestimmt.
-fn id_count_guard(count: Result<usize, storage::StorageError>) -> Option<usize> {
-    match count {
-        Ok(n) => Some(n),
-        Err(e) => {
-            eprintln!("[lf] Nachbestätigung nicht verarbeitet: {e}");
-            None
+/// Nach Feld und Sollzustand gruppierte Outbox-Zeilen: (Zeilen-ID, Revision, Artikel).
+type OutboxGroups = std::collections::HashMap<(String, bool), Vec<(i64, i64, String)>>;
+
+struct ClaimedGroup {
+    field: String,
+    desired: bool,
+    rows: Vec<(i64, i64, String)>,
+}
+
+/// Der eigentliche Outbox-Lauf. Jeder beendete Weg gibt nicht versandte Claims
+/// revisionssicher zurück, damit nichts als `inflight` hängen bleibt.
+async fn run_outbox(
+    worker: &DbWorker,
+    tx: &std::sync::mpsc::Sender<crate::net::NetEvent>,
+    token: String,
+    ctx: &RunCtx,
+) -> SyncResult<()> {
+    let account_id = ctx.account_id.clone();
+    let client = pf::FeedlyClient::with_base(token, ctx.base());
+    let now = storage::now_ms();
+    let rows = db(worker, {
+        let account_id = account_id.clone();
+        move |db2| sr(db2.outbox_claim(&account_id, now, 100))
+    })
+    .await?;
+    if rows.is_empty() {
+        dbg_log("Outbox: nichts zu senden");
+        return Ok(());
+    }
+    let mut groups: OutboxGroups = std::collections::HashMap::new();
+    for r in &rows {
+        groups
+            .entry((r.field.clone(), r.desired))
+            .or_default()
+            .push((r.id, r.revision, r.entity_id.clone()));
+    }
+    let mut pending_claims: Vec<(i64, i64)> = rows.iter().map(|r| (r.id, r.revision)).collect();
+    let mut first_error: Option<SyncFailure> = None;
+
+    for ((field, desired), rows) in groups {
+        if ctx.is_cancelled() {
+            release_claims(worker, &account_id, &pending_claims).await;
+            return Err(SyncFailure::new(
+                "Outbox: Lauf abgebrochen, nicht versandte Änderungen bleiben offen",
+                None,
+                None,
+            ));
         }
+        let group = ClaimedGroup {
+            field,
+            desired,
+            rows,
+        };
+        // Diese Gruppe ist jetzt in Arbeit; bei Abbruch bleibt sie im Claim.
+        for (id, rev, _) in &group.rows {
+            if let Some(slot) = pending_claims.iter_mut().find(|(i, _)| i == id) {
+                slot.1 = *rev;
+            }
+        }
+        match send_group(worker, &client, ctx, &account_id, &group).await {
+            Ok(()) => {
+                pending_claims.retain(|(id, _)| !group.rows.iter().any(|(i, _, _)| i == id));
+            }
+            Err(failure) => {
+                let stop = matches!(
+                    failure.status.as_deref(),
+                    Some("auth_required") | Some("rate_limited")
+                );
+                release_claims(worker, &account_id, &pending_claims).await;
+                if stop {
+                    return Err(failure);
+                }
+                if first_error.is_none() {
+                    first_error = Some(failure);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(failure) => {
+            let _ = tx;
+            Err(failure)
+        }
+        None => Ok(()),
     }
 }
 
+/// Gibt nicht versandte Claims wieder frei (revisionsgebunden).
+async fn release_claims(worker: &DbWorker, account_id: &str, claims: &[(i64, i64)]) {
+    if claims.is_empty() {
+        return;
+    }
+    let next_try = storage::now_ms();
+    let sent = claims.to_vec();
+    let released = db(worker, move |db2| {
+        sr(db2.outbox_fail(&sent, next_try, false))?;
+        Ok::<_, SyncFailure>(())
+    })
+    .await;
+    if let Err(e) = released {
+        dbg_log(&format!(
+            "Outbox: Claims konnten nicht freigegeben werden: {e}"
+        ));
+    }
+    let _ = account_id;
+    dbg_log(&format!(
+        "Outbox: {} nicht versandte Änderungen wieder freigegeben",
+        claims.len()
+    ));
+}
+
+/// Sendet und bestätigt eine Gruppe; Fehler sind typisiert (Status, Retry-Zeit).
+async fn send_group(
+    worker: &DbWorker,
+    client: &pf::FeedlyClient,
+    ctx: &RunCtx,
+    account_id: &str,
+    group: &ClaimedGroup,
+) -> SyncResult<()> {
+    let field = group.field.as_str();
+    let desired = group.desired;
+    let action = match (field, desired) {
+        ("read", true) => "markAsRead",
+        ("read", false) => "keepUnread",
+        ("saved", true) => "markAsSaved",
+        _ => "markAsUnsaved",
+    };
+    let entry_ids: Vec<String> = group.rows.iter().map(|(_, _, e)| e.clone()).collect();
+    let sent: Vec<(i64, i64)> = group.rows.iter().map(|(id, rev, _)| (*id, *rev)).collect();
+    let entries_for_notice: Vec<(String, String)> = group
+        .rows
+        .iter()
+        .map(|(_, _, entity)| (account_id.to_string(), entity.clone()))
+        .collect();
+    match client.markers_entries(action, &entry_ids).await {
+        Ok(()) => {}
+        Err(pf::FeedlyError::Api {
+            status: 404,
+            message,
+            ..
+        }) => {
+            let total = sent.len();
+            let _ = db(worker, {
+                let sent = sent.clone();
+                move |db2| {
+                    let affected = sr(db2.outbox_fail_permanent(&sent))?;
+                    if affected > 0 {
+                        sr(db2.mark_unsynced(&entries_for_notice))?;
+                    }
+                    Ok::<_, SyncFailure>(affected)
+                }
+            })
+            .await;
+            return Err(SyncFailure::new(
+                format!("404 für {total} Änderungen: {message} — bleiben lokal erhalten"),
+                Some("degraded"),
+                None,
+            ));
+        }
+        Err(pf::FeedlyError::Api {
+            status: 429,
+            retry_after_ms,
+            ..
+        }) => {
+            let next = retry_after_ms.unwrap_or_else(|| storage::now_ms() + 5 * 60_000);
+            let _ = db(worker, {
+                let sent = sent.clone();
+                move |db2| {
+                    sr(db2.outbox_fail(&sent, next, false))?;
+                    Ok::<_, SyncFailure>(())
+                }
+            })
+            .await;
+            return Err(SyncFailure::new(
+                format!(
+                    "Drosselung durch Feedly — neuer Versuch ab {}",
+                    fmt_ms(next)
+                ),
+                Some("rate_limited"),
+                Some(next),
+            ));
+        }
+        Err(pf::FeedlyError::Api {
+            status, message, ..
+        }) if status == 401 || status == 403 => {
+            let next = storage::now_ms() + 30 * 60_000;
+            let _ = db(worker, {
+                let sent = sent.clone();
+                move |db2| {
+                    sr(db2.outbox_fail(&sent, next, false))?;
+                    Ok::<_, SyncFailure>(())
+                }
+            })
+            .await;
+            return Err(SyncFailure::new(
+                format!("Auth/Rechte ({status}): {message} — bitte neu verbinden"),
+                Some("auth_required"),
+                Some(next),
+            ));
+        }
+        Err(e) => {
+            let next = storage::now_ms() + 60_000;
+            let _ = db(worker, {
+                let sent = sent.clone();
+                move |db2| {
+                    sr(db2.outbox_fail(&sent, next, false))?;
+                    Ok::<_, SyncFailure>(())
+                }
+            })
+            .await;
+            return Err(SyncFailure::new(e.to_string(), None, Some(next)));
+        }
+    }
+
+    let _ = db(worker, {
+        let sent = sent.clone();
+        move |db2| {
+            sr(db2.outbox_ack(&sent))?;
+            Ok::<_, SyncFailure>(())
+        }
+    })
+    .await;
+
+    // Nachbestätigung: fehlende IDs gelten als unbestätigt; ein Fehler hier ist
+    // typisiert und beendet den Versand bei Auth-/Quotenproblemen.
+    let remote = match client.entries_mget(&entry_ids).await {
+        Ok(remote) => remote,
+        Err(e) => {
+            let failure = io_err(e);
+            if matches!(
+                failure.status.as_deref(),
+                Some("auth_required") | Some("rate_limited")
+            ) {
+                return Err(failure);
+            }
+            return Err(SyncFailure::new(
+                format!(
+                    "Bestätigung nach dem Upload fehlgeschlagen: {}",
+                    failure.message
+                ),
+                Some("degraded"),
+                failure.retry_after_ms,
+            ));
+        }
+    };
+    let by_id: std::collections::HashMap<&str, &pf::Entry> =
+        remote.iter().map(|e| (e.id.as_str(), e)).collect();
+    let unconfirmed: Vec<String> = group
+        .rows
+        .iter()
+        .filter(|(_, _, entity)| match by_id.get(entity.as_str()) {
+            Some(e) => !confirmed(e, field, desired),
+            None => true,
+        })
+        .map(|(_, _, entity)| entity.clone())
+        .collect();
+    if unconfirmed.is_empty() {
+        return Ok(());
+    }
+    let count = unconfirmed.len();
+    let account_for_db = account_id.to_string();
+    let field_for_db = group.field.clone();
+    let sent_for_db: Vec<(i64, i64, String)> = group.rows.clone();
+    let requeued = db(worker, move |db2| {
+        let mut requeued = 0usize;
+        for (_, revision, entity) in &sent_for_db {
+            if sr(db2.outbox_requeue_if_unchanged(
+                &account_for_db,
+                entity,
+                &field_for_db,
+                desired,
+                *revision,
+            ))? {
+                requeued += 1;
+            }
+        }
+        let notices: Vec<(String, String)> = unconfirmed
+            .iter()
+            .map(|e| (account_for_db.clone(), e.clone()))
+            .collect();
+        sr(db2.mark_unsynced(&notices))?;
+        Ok::<_, SyncFailure>(requeued)
+    })
+    .await?;
+    dbg_log(&format!(
+        "Nachbestätigung: {} von {} erneut vorgemerkt",
+        requeued, count
+    ));
+    // Der Lauf endet als genau ein Ereignis: unbestätigte Änderungen bleiben offen
+    // und werden sichtbar gemeldet, weitere Gruppen laufen trotzdem.
+    let _ = ctx;
+    Err(SyncFailure::new(
+        format!("Feedly hat {count} von {} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt", group.rows.len()),
+        Some("degraded"),
+        None,
+    ))
+}
 fn fmt_ms(ms: i64) -> String {
     let minutes = (ms - storage::now_ms()).max(0) / 60_000 + 1;
     format!("in ca. {minutes} min")
@@ -2646,5 +2757,187 @@ mod delta_e2e_tests {
         assert_eq!(unread, 1, "remote ungelesen wurde lokal übernommen");
         assert_eq!(has_content, 1, "der fehlende Inhalt wurde nachgeladen");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod outbox_single_end_tests {
+    use super::*;
+    use crate::feedly_sync::app_mock_server::mock;
+
+    fn worker(tag: &str) -> (DbWorker, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("lesefluss-outboxend-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let worker = DbWorker::start(path.clone());
+        let entry = "https://feedly.com/i/entry/x";
+        db_blocking(&worker, move |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+            let feed = db
+                .add_feed("feedly-1", "u1", "Feed", None, "#111111")
+                .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(feed, entry, "Titel", None, None, now, "e", None, now)
+                .unwrap();
+        });
+        (worker, path)
+    }
+
+    fn enqueue(worker: &DbWorker, read: Option<bool>, saved: Option<bool>) {
+        db_blocking(worker, move |db| {
+            let feed = db
+                .raw()
+                .query_row(
+                    "SELECT id FROM feeds WHERE account_id='feedly-1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            db.apply_status_with_outbox(feed, "https://feedly.com/i/entry/x", read, saved)
+                .unwrap();
+        });
+    }
+
+    fn events_until_done(net: &Net, run_id: u64) -> Vec<crate::net::NetEvent> {
+        let mut seen = Vec::new();
+        for _ in 0..150 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(ev) => {
+                    let matches = matches!(
+                        &ev,
+                        crate::net::NetEvent::FeedlySyncDone { run_id: r, .. }
+                            | crate::net::NetEvent::FeedlySyncFailed { run_id: r, .. } if *r == run_id
+                    );
+                    seen.push(ev);
+                    if matches {
+                        return seen;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        seen
+    }
+
+    /// B1: Ein leerer Claim endet trotzdem mit genau einem Abschluss.
+    #[test]
+    fn leerer_claim_meldet_einen_abschluss() {
+        let (worker, path) = worker("leer");
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1);
+        process_outbox(worker.clone(), &net, "tok".to_string(), ctx);
+        let seen = events_until_done(&net, 1);
+        assert_eq!(
+            seen.len(),
+            1,
+            "genau ein Ereignis, kein Hängenbleiben: {seen:?}"
+        );
+        assert!(matches!(
+            seen[0],
+            crate::net::NetEvent::FeedlySyncDone { .. }
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// B1: Vollständig bestätigter Versand endet mit Erfolg und leeren Claims.
+    #[test]
+    fn bestaetigter_versand_meldet_erfolg_und_leere_claims() {
+        let (worker, path) = worker("ok");
+        enqueue(&worker, Some(true), None);
+        let (base, hits) = mock(|req| {
+            if req.contains("entries/.mget") {
+                (
+                    200,
+                    serde_json::json!([{
+                        "id": "https://feedly.com/i/entry/x",
+                        "unread": false,
+                        "origin": {"streamId": "feed/https://example.org/f.xml"}
+                    }])
+                    .to_string(),
+                )
+            } else {
+                (200, "{}".to_string())
+            }
+        });
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        process_outbox(worker.clone(), &net, "tok".to_string(), ctx);
+        let seen = events_until_done(&net, 1);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            matches!(seen[0], crate::net::NetEvent::FeedlySyncDone { .. }),
+            "bestätigter Versand ist ein Erfolg"
+        );
+        let inflight = db_blocking(&worker, |db| {
+            db.raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE status='inflight'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        });
+        assert_eq!(inflight, 0, "keine verwaisten Claims");
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// B1: 429 in der ersten Gruppe beendet den Versand; nicht versandte Claims
+    /// werden wieder frei und genau ein Fehlerereignis geht heraus.
+    #[test]
+    fn drosselung_beendet_den_versand_und_gibt_claims_zurueck() {
+        let (worker, path) = worker("429");
+        enqueue(&worker, Some(true), None);
+        enqueue(&worker, None, Some(true));
+        let marker_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = marker_calls.clone();
+        let (base, _hits) = mock(move |req| {
+            if req.contains("entries/.mget") {
+                return (200, "[]".to_string());
+            }
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                (429, "{}".to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        });
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        process_outbox(worker.clone(), &net, "tok".to_string(), ctx);
+        let seen = events_until_done(&net, 1);
+        assert_eq!(seen.len(), 1, "genau ein Abschluss trotz mehrerer Gruppen");
+        match &seen[0] {
+            crate::net::NetEvent::FeedlySyncFailed { status, .. } => {
+                assert_eq!(status.as_deref(), Some("rate_limited"));
+            }
+            other => panic!("erwartet Drosselung, bekam {other:?}"),
+        }
+        let pending = db_blocking(&worker, |db| {
+            db.raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE status='pending'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        });
+        assert!(pending >= 1, "nicht versandte Änderungen bleiben offen");
+        let inflight = db_blocking(&worker, |db| {
+            db.raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE status='inflight'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        });
+        assert_eq!(inflight, 0, "keine Zeile bleibt als inflight hängen");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
