@@ -309,3 +309,144 @@ mod tests {
         assert!(r2.is_err());
     }
 }
+
+#[cfg(test)]
+mod db_roundtrip_tests {
+    use super::*;
+
+    /// L7/Q2: vollständiger Weg **Parser → Datenbank → Export → Parser** mit
+    /// Hierarchie, gleicher Gruppen unter anderem Elternteil, Mehrfachmitgliedschaft,
+    /// Kontoisolation, Website und Sonderzeichen.
+    #[test]
+    fn roundtrip_durch_die_datenbank_erhaelt_alle_beziehungen() {
+        let xml = r#"<?xml version="1.0"?>
+        <opml version="2.0"><head><title>Export</title></head><body>
+            <outline text="Technik">
+                <outline text="Rust">
+                    <outline type="rss" text="Release Notes" xmlUrl="https://a.example/rss?x=1&amp;y=2" htmlUrl="https://a.example/"/>
+                </outline>
+                <outline type="rss" text="Blog &amp; Mehr" xmlUrl="https://b.example/rss"/>
+                <outline type="rss" text="Doppelt" xmlUrl="https://c.example/rss"/>
+            </outline>
+            <outline text="Technik">
+                <outline text="Rust">
+                    <outline type="rss" text="Kein zweiter" xmlUrl="https://d.example/rss"/>
+                </outline>
+            </outline>
+            <outline text="Technik">
+                <outline type="rss" text="Doppelt" xmlUrl="https://c.example/rss"/>
+            </outline>
+        </body></opml>"#;
+        let draft = parse_opml(xml).expect("parse");
+        assert_eq!(
+            draft.feeds.len(),
+            5,
+            "fünf Outlines, davon eine doppelte URL"
+        );
+
+        let db = storage::Database::open_in_memory().unwrap();
+        let acc = db.ensure_local_account().unwrap();
+        db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+        let entries: Vec<(String, String, Option<String>, Vec<String>)> = draft
+            .feeds
+            .iter()
+            .map(|f| {
+                (
+                    f.title.clone(),
+                    f.xml_url.clone(),
+                    f.html_url.clone(),
+                    f.groups.clone(),
+                )
+            })
+            .collect();
+        let (new_feeds, merged) = db.import_opml_entries(&acc, &entries).expect("import");
+        assert_eq!(new_feeds, 4, "vier verschiedene URLs werden angelegt");
+        assert_eq!(merged, 1, "das doppelt genannte Feed wird zusammengeführt");
+        assert_eq!(
+            db.list_feeds().unwrap().len(),
+            4,
+            "Mehrfachmitgliedschaft erzeugt keine zweite Zeile"
+        );
+
+        // Export aus der Datenbank
+        let feeds = db.list_feeds().unwrap();
+        let groups = db.list_groups().unwrap();
+        let export: Vec<OpmlFeed> = feeds
+            .iter()
+            .map(|f| {
+                let names: Vec<String> = f
+                    .groups
+                    .iter()
+                    .filter_map(|gid| groups.iter().find(|g| g.id == *gid))
+                    .map(|g| g.name.clone())
+                    .collect();
+                OpmlFeed {
+                    title: f.title.clone(),
+                    xml_url: f.feed_url.clone(),
+                    html_url: f.website.clone(),
+                    groups: names,
+                }
+            })
+            .collect();
+        let roundtrip = parse_opml(&build_opml(&export)).expect("parse export");
+
+        let by_url = |d: &OpmlDraft, url: &str| {
+            d.feeds
+                .iter()
+                .find(|f| f.xml_url == url)
+                .unwrap_or_else(|| panic!("{url} fehlt"))
+                .clone()
+        };
+        let a = by_url(&roundtrip, "https://a.example/rss?x=1&y=2");
+        assert_eq!(
+            a.groups,
+            vec!["Technik", "Rust"],
+            "Hierarchie bleibt erhalten"
+        );
+        assert_eq!(a.html_url.as_deref(), Some("https://a.example/"));
+        let b = by_url(&roundtrip, "https://b.example/rss");
+        assert_eq!(b.title, "Blog & Mehr", "Sonderzeichen überstehen den Weg");
+        assert_eq!(b.groups, vec!["Technik"], "Flacher Pfad bleibt flach");
+        let d_entry = by_url(&roundtrip, "https://d.example/rss");
+        assert_eq!(
+            d_entry.groups,
+            vec!["Technik", "Rust"],
+            "zweimal notierte gleichnamige Hierarchie wird derselbe Knoten"
+        );
+        let groups = db.list_groups().unwrap();
+        assert_eq!(
+            groups.iter().filter(|g| g.name == "Rust").count(),
+            1,
+            "keine doppelten Gruppen durch wiederholte Hierarchie"
+        );
+        let c = by_url(&roundtrip, "https://c.example/rss");
+        assert_eq!(
+            c.groups,
+            vec!["Technik"],
+            "Mehrfachmitgliedschaft bleibt eine Zeile"
+        );
+
+        // Kontoisolation: derselbe Import in ein anderes Konto erzeugt dort eigene
+        // Zeilen und verändert das lokale Konto nicht.
+        let local_before = db
+            .list_feeds()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.account_id == "local")
+            .count();
+        let (feedly_new, _) = db
+            .import_opml_entries("feedly-1", &entries)
+            .expect("import zweites Konto");
+        assert_eq!(feedly_new, 4);
+        let local_after = db
+            .list_feeds()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.account_id == "local")
+            .count();
+        assert_eq!(
+            local_after, local_before,
+            "Feeds des lokalen Kontos bleiben unberührt"
+        );
+    }
+}

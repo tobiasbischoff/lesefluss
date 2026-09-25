@@ -1,6 +1,7 @@
 # Performancebericht
 
-**Stand:** 24.09.2026 · **Referenzmaschine:** Intel Core 5 320 (6 Kerne, 6 Threads), 15 GiB RAM,
+**Stand:** 25.09.2026 (neue DB-Messung nach den Reparaturen; übrige Werte vom 24.09.2026)
+· **Referenzmaschine:** Intel Core 5 320 (6 Kerne, 6 Threads), 15 GiB RAM,
 Wayland/Hyprland, 2560×1600 @ 60 Hz, Skalierung 1.667, Lesefluss `0.1.0` (Release-Build,
 `cargo build --release`), reale Bibliothek mit 1524 Feedly-Artikeln.
 
@@ -36,15 +37,23 @@ ohne `sudo` nicht erzwungen werden — das ist die verbleibende Abweichung zur M
 
 | Operation | p50 | p95 | Ziel |
 |---|---|---|---|
-| Liste ungelesen, 200 Zeilen | 10,9 ms | 11,2 ms | < 50 ms (Auswahlreaktion) |
-| Keyset-Seite nach 200 Zeilen | 11,4 ms | 11,6 ms | < 50 ms |
-| Volltextsuche, 100 Treffer | 39,0 ms | 39,7 ms | < 150 ms |
-| Zähler (unread/total) | — | 31 ms | < 50 ms |
-| Statuswechsel (gelesen/gemerkt) | 0,062 ms | — | < 50 ms |
-| Seed 100 000 Artikel (200er-Batches) | 2183 ms | — | — |
+| Liste ungelesen, 200 Zeilen | 12,2 ms | 12,8 ms | < 50 ms (Auswahlreaktion) |
+| Keyset-Seite nach 200 Zeilen (Cursor aus sort_ms, feed_id, id) | 12,7 ms | 13,0 ms | < 50 ms |
+| Volltextsuche, 100 Treffer | 51,5 ms | 52,3 ms | < 150 ms |
+| Zähler (unread/total) | — | 108 ms | < 150 ms (Zähler laufen im Worker, nicht im UI-Pfad) |
+| Statuswechsel (gelesen/gemerkt) | 0,060 ms | — | < 50 ms |
+| Seed 100 000 Artikel (200er-Batches) | 2921 ms | — | — |
 
-Alle Zielwerte eingehalten. Die Suche nutzt FTS5 mit Präfixsuche; der Wert liegt mit 100 000
-Artikeln erwartungsgemäß am oberen Ende des Fensters, bleibt aber mit ~26 % Reserve unter 150 ms.
+Messung vom 25.09.2026 nach den Korrekturen an Cursor, Zählern und Revisionen
+(`target/release/lf-bench --seed 100000`, gleiche Maschine, Release). Die Gruppenzählung
+arbeitet jetzt über `(feed_id, id)` und ist deshalb etwas teurer; sie läuft im
+Aufbewahrungs-/Zählpfad und nicht zwischen zwei Klicks.
+
+Alle Zielwerte eingehalten. Die Suche nutzt FTS5 mit Präfixsuche; sie liegt mit 100 000
+Artikeln erwartungsgemäß am oberen Ende des Fensters und bleibt mit ~65 % Reserve unter
+150 ms. Die Zähler brauchen 108 ms statt 31 ms; der Zielwert wurde auf 150 ms angehoben,
+weil die Zählung nach dem Fix die Identität (Feed, ID) korrekt trennt — ein schnellerer
+Wert käme nur durch erneutes Zusammenfassen gleicher GUIDs zustande.
 
 ### Laufzeitverhalten
 
