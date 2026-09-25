@@ -504,12 +504,8 @@ mod router_tests {
         ));
     }
 
-    /// B2 über den echten Zustand: A starten, B vormerken, A beenden (Erfolg),
-    /// B starten, B abbrechen, C starten.
-    #[test]
-    /// B2: Ein Ereignis gehört zum aktuellen Lauf; danach ist der Platz frei für
-    /// den nächsten (vom Coordinator reservierten) Lauf.
-    #[test]
+    /// A1: Der Konto-Lookup darf keinen Borrow halten, während der Aufrufer den
+    /// State verändert. Mit echter `RefCell` nachgewiesen.
     #[test]
     fn konto_lookup_haelt_keinen_borrow() {
         let accounts = vec![
