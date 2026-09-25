@@ -842,6 +842,7 @@ pub enum TokenAction {
     /// Vom Coordinator bereits reservierter Folgelauf (nicht erneut anmelden).
     ReservedRun,
     MarkScopeServer,
+    Outbox,
     CheckConnect,
 }
 
@@ -1444,6 +1445,7 @@ impl App {
                 self.refresh_feedly_status();
                 let reserved = {
                     let mut st = self.state.borrow_mut();
+                    st.active_feedly_account = Some(account_id.clone());
                     finish_run(&mut st, &account_id, run_id, None)
                 };
                 match reserved {
@@ -3506,29 +3508,51 @@ impl App {
     /// ein weiterer Wunsch wird für den nächsten Zyklus vermerkt.
     /// Schlüsselbundzugriff gehört in einen Worker; die Aktion selbst läuft
     /// danach wieder im Hauptthread.
+    /// Aktives Feedly-Konto: bevorzugt das zuletzt validierte Profil, sonst das
+    /// einzige Feedly-Konto der Bibliothek.
+    fn active_feedly_account(&self) -> Option<String> {
+        let st = self.state.borrow();
+        if let Some(active) = st.active_feedly_account.clone() {
+            return Some(active);
+        }
+        first_account_of_kind(&st.accounts, "feedly")
+    }
+
+    /// Lädt das Credential und prüft es gegen das aktive Konto. Schlüsselbund-
+    /// und Datenbankzugriffe laufen im Worker; nur die Entscheidung im Hauptthread.
     fn with_token(&self, action: TokenAction) {
         let tx = self.bg_jobs_tx.clone();
-        let expected = self.account_id_of_kind("feedly");
+        let expected = self.active_feedly_account();
+        let has_account = self.account_id_of_kind("feedly").is_some();
         std::thread::Builder::new()
             .name("lf-keyring".into())
             .spawn(move || {
-                let token = feedly_sync::token_from_disk();
-                let bound = feedly_sync::keyring_account();
+                let credential = feedly_sync::load_credential();
                 let _ = tx.send(Box::new(move |app: &Rc<App>| {
-                    // Ein Token eines anderen Profils darf nicht mit der Outbox des
-                    // aktiven Kontos kombiniert werden.
-                    if let (Some(_), Some(account)) = (&token, expected.clone()) {
-                        if !feedly_sync::token_matches_account(bound.as_deref(), &account) {
-                            app.show_toast(
-                                "Feedly: gespeichertes Token gehört zu einem anderen Konto — bitte neu verbinden",
-                            );
-                            return;
+                    let Some(credential) = credential else {
+                        app.run_token_action_without_token(action);
+                        return;
+                    };
+                    match &expected {
+                        Some(account) => {
+                            let bound = credential.account_id.as_deref();
+                            if !feedly_sync::token_matches_account(bound, account) {
+                                app.show_toast(
+                                    "Feedly: gespeichertes Token gehört zu einem anderen Konto — bitte neu verbinden",
+                                );
+                                return;
+                            }
+                        }
+                        None => {
+                            if !feedly_sync::unbound_allowed(has_account) {
+                                app.show_toast(
+                                    "Feedly: Token ist keinem Konto zugeordnet — bitte neu verbinden",
+                                );
+                                return;
+                            }
                         }
                     }
-                    match token {
-                        Some(token) => app.run_token_action(action, token),
-                        None => app.run_token_action_without_token(action),
-                    }
+                    app.run_token_action(action, credential.token);
                 }) as Box<dyn FnOnce(&Rc<App>) + Send>);
             })
             .ok();
@@ -3567,6 +3591,17 @@ impl App {
                 }
             }
             TokenAction::MarkScopeServer => self.mark_scope_server_with(token),
+            TokenAction::Outbox => {
+                // Der Outbox-Versand nutzt dasselbe geprüfte Credential.
+                if let Some(account) = self.active_feedly_account() {
+                    self.request_feedly_job(
+                        sync_engine::Job::Outbox,
+                        account,
+                        token,
+                        FeedlyParams::default(),
+                    );
+                }
+            }
             TokenAction::ReservedRun => {
                 // Der Coordinator hat diesen Lauf bereits reserviert. Er wird direkt
                 // gestartet; eine erneute Anmeldung würde ihn nur wieder vormerken.
@@ -3949,7 +3984,6 @@ impl App {
                     std::thread::Builder::new()
                         .name("lf-outbox-check".into())
                         .spawn(move || {
-                            let token = feedly_sync::token_from_disk();
                             let acc = account_id.clone();
                             let has = worker
                                 .send(move |db| {
@@ -3965,17 +3999,10 @@ impl App {
                             if !has {
                                 return;
                             }
-                            let token = match token {
-                                Some(t) => t,
-                                None => return,
-                            };
-                            let _ = tx.send(Box::new(move |app: &Rc<App>| {
-                                app.request_feedly_job(
-                                    sync_engine::Job::Outbox,
-                                    account_id.clone(),
-                                    token,
-                                    FeedlyParams::default(),
-                                );
+                            // Der Versand läuft über denselben Credential-Weg wie
+                            // alle anderen Startpfade.
+                            let _ = tx.send(Box::new(|app: &Rc<App>| {
+                                app.with_token(TokenAction::Outbox);
                             })
                                 as Box<dyn FnOnce(&Rc<App>) + Send>);
                         })

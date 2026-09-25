@@ -80,6 +80,11 @@ impl std::fmt::Display for SyncFailure {
 
 pub type SyncResult<T> = Result<T, SyncFailure>;
 
+/// Kombinierte Datei für Token und Kontobindung im Dateifallback.
+pub fn credential_path() -> std::path::PathBuf {
+    token_path().with_file_name("feedly-credential")
+}
+
 pub fn token_path() -> std::path::PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -194,6 +199,13 @@ pub fn forget_token_at(path: &std::path::Path) -> bool {
 /// Wie `forget_token_at`, aber mit wählbarem Keyring-Programm (Tests).
 pub fn forget_token_at_with(path: &std::path::Path, program: &std::path::Path) -> bool {
     let mut removed = false;
+    let combined = path.with_file_name("feedly-credential");
+    if combined.exists() {
+        match std::fs::remove_file(&combined) {
+            Ok(()) => removed = true,
+            Err(e) => eprintln!("[lf] Credential-Datei konnte nicht entfernt werden: {e}"),
+        }
+    }
     for key in ["feedly-token", "feedly-account"] {
         if let Some(out) = secret_tool_with(program, &["clear", "lesefluss", key], None) {
             removed |= out.status.success();
@@ -244,28 +256,107 @@ fn keyring_store_with(program: &std::path::Path, token: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Passt das Token zum gewünschten Konto? Ohne gespeicherte Bindung (z. B. Datei-
-/// fallback) gilt das Token als ungebunden und wird beim ersten Sync gebunden.
+/// Token und Kontobindung gehören zusammen: ein Credential ist nur gültig, wenn
+/// beides zum aktiven Konto passt. Ohne Bindung wird nur beim ersten Verbinden
+/// (noch ohne Feedly-Konto) zugelassen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credential {
+    pub token: String,
+    pub account_id: Option<String>,
+}
+
+/// Prüft ein Credential gegen das aktive Konto.
 pub fn token_matches_account(bound: Option<&str>, account_id: &str) -> bool {
     match bound {
         Some(bound) => bound == account_id,
-        None => true,
+        None => false,
     }
 }
 
-pub fn token_from_disk() -> Option<String> {
-    if let Some(t) = keyring_lookup() {
-        return Some(t);
+/// Darf ohne Bindung gestartet werden? Nur wenn es das erste Verbinden ist.
+pub fn unbound_allowed(existing_feedly_account: bool) -> bool {
+    !existing_feedly_account
+}
+
+/// Lädt das gespeicherte Credential (Schlüsselbund, sonst Datei mit 0600).
+pub fn load_credential() -> Option<Credential> {
+    if let Some(token) = keyring_lookup() {
+        return Some(Credential {
+            token,
+            account_id: keyring_account(),
+        });
     }
-    let t = std::fs::read_to_string(token_path()).ok()?;
-    let t = t.trim().to_string();
-    if t.is_empty() {
+    // Datei-Fallback: bevorzugt die kombinierte Datei, sonst das alte Format.
+    let combined = credential_path();
+    if let Ok(text) = std::fs::read_to_string(&combined) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            let token = value
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !token.is_empty() {
+                return Some(Credential {
+                    token,
+                    account_id: value
+                        .get("account")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                });
+            }
+        }
+    }
+    let token = std::fs::read_to_string(token_path()).ok()?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
         return None;
     }
-    if keyring_store(&t) {
+    Some(Credential {
+        token,
+        account_id: None,
+    })
+}
+
+/// Speichert ein Credential; die Kontobindung wird auch im Dateifallback
+/// dauerhaft abgelegt, damit ein Kontowechsel erkannt bleibt.
+pub fn save_credential(token: &str, account_id: Option<&str>) -> std::io::Result<()> {
+    save_token(token, account_id)?;
+    if keyring_store(token) {
+        if let Some(account) = account_id {
+            let _ = bind_account(account);
+        }
+        let _ = std::fs::remove_file(credential_path());
         let _ = std::fs::remove_file(token_path());
+        return Ok(());
     }
-    Some(t)
+    let path = credential_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let value = serde_json::json!({
+        "token": token.trim(),
+        "account": account_id,
+    })
+    .to_string();
+    write_private(&path, value.as_bytes())
+}
+
+/// Übernimmt eine nach der Profilprüfung validierte Konto-ID in das Credential.
+pub fn bind_credential_account(account_id: &str) {
+    let Some(mut credential) = load_credential() else {
+        return;
+    };
+    credential.account_id = Some(account_id.to_string());
+    let _ = bind_account(account_id);
+    if keyring_lookup().is_none() {
+        let _ = save_credential(&credential.token, credential.account_id.as_deref());
+    }
 }
 
 /// Wie `save_token`, aber mit wählbarem Keyring-Programm (Tests).
@@ -985,7 +1076,9 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     let sync_started_ms = storage::now_ms();
     net.spawn(async move {
         let client = pf::FeedlyClient::with_base(token, ctx.base());
-        let res: SyncResult<usize> = async {
+        // Rückgabe enthält die **validierte** Profilkonto-ID: Status, Watermark und
+        // Ereignis müssen darauf landen, nicht auf dem Dispatcher-Anker.
+        let res: SyncResult<(usize, String)> = async {
             if ctx.is_cancelled() {
                 return Err(cancelled());
             }
@@ -1010,8 +1103,10 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             if ctx.is_cancelled() {
                 return Err(SyncFailure::new("Lauf abgebrochen", None, None));
             }
-            // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und Ereignisse.
+            // Die Konto-ID aus dem Profil gilt für alle Statusmeldungen und Ereignisse
+            // und wird jetzt verbindlich im Credential festgehalten.
             let account_id = profile.id.clone();
+            bind_credential_account(&account_id);
             sync_subscriptions(&worker, &client, &account_id).await?;
             if ctx.is_cancelled() {
                 return Err(cancelled());
@@ -1039,10 +1134,12 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             let added = summary.items;
             let saved =
                 fetch_id_inventory(&client, &pf::saved_stream(&profile.id), MAX_ID_PAGES).await?;
-            reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
+            let saved_phase = reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
             let unread =
                 fetch_id_inventory(&client, &pf::unread_stream(&account_id), MAX_ID_PAGES).await?;
-            reconcile_unread(&worker, &account_id, &unread, pull_gen).await?;
+            let unread_phase = reconcile_unread(&worker, &account_id, &unread, pull_gen).await?;
+            // Identisch zum Delta: unvollständige Pflichtphasen sind ein Fehler.
+            require_complete(&[saved_phase, unread_phase])?;
             let ids = inventory_ids(&saved, &unread);
             load_contents(&worker, &client, &account_id, pull_gen, &ids, 200, &ctx).await?;
             dbg_log(&format!(
@@ -1062,23 +1159,29 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
             dbg_log(&format!(
                 "Watermark auf {checkpoint} (Start {sync_started_ms})"
             ));
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
+            let account_for_db = account_id.clone();
             db(&worker, move |db2| {
-                sr(db2.set_last_sync(&account_id, checkpoint))
+                sr(db2.set_last_sync(&account_for_db, checkpoint))
             })
             .await?;
-            Ok(added)
+            Ok((added, account_id))
         }
         .await;
         match res {
-            Ok(added) => {
-                set_status(&worker, "ready", Some(&ctx.account_id));
+            Ok((added, account_id)) => {
+                set_status(&worker, "ready", Some(&account_id));
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncDone {
-                    account_id: ctx.account_id.clone(),
+                    account_id,
                     run_id: ctx.run_id,
                     added,
                 });
             }
             Err(e) => {
+                // Fehler vor der Profilvalidierung kennen die Konto-ID nicht; dann
+                // trägt das Ereignis den Anker, danach die gemeldete Zuordnung.
                 let status = e.status.clone().unwrap_or_else(|| "degraded".to_string());
                 set_status(&worker, &status, Some(&ctx.account_id));
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
@@ -1554,6 +1657,9 @@ pub fn delta_sync(
                     }
                 }
             }
+            // Metadatenabgleich gehört in jeden Zyklus: neue Quellen werden aktiv,
+            // entfernte erst nach vollständiger Liste deaktiviert.
+            sync_subscriptions(&worker, &client, &account_id).await?;
             if ctx.is_cancelled() {
                 return Err(cancelled());
             }
@@ -1602,6 +1708,9 @@ pub fn delta_sync(
             dbg_log(&format!(
                 "Watermark auf {checkpoint} (Start {sync_started_ms})"
             ));
+            if ctx.is_cancelled() {
+                return Err(cancelled());
+            }
             db(&worker, move |db2| {
                 sr(db2.set_last_sync(&account_id, checkpoint))
             })
@@ -2140,6 +2249,7 @@ mod r6_token_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "tok");
     }
 
+    /// B4: Ohne Bindung wird nur das erste Verbinden zugelassen.
     #[test]
     fn tokenbindung_werden_geprueft() {
         assert!(token_matches_account(Some("feedly-1"), "feedly-1"));
@@ -2148,9 +2258,44 @@ mod r6_token_tests {
             "Token eines anderen Profils wird abgewiesen"
         );
         assert!(
-            token_matches_account(None, "feedly-1"),
-            "ohne Bindung (Dateifallback) wird beim Sync gebunden"
+            !token_matches_account(None, "feedly-1"),
+            "eine fehlende Bindung ist kein gültiges Credential"
         );
+        assert!(
+            unbound_allowed(false),
+            "erstes Verbinden ohne Konto ist erlaubt"
+        );
+        assert!(
+            !unbound_allowed(true),
+            "mit vorhandenem Konto muss neu verbunden werden"
+        );
+    }
+
+    /// B4: Der Dateifallback legt Token **und** Kontobindung dauerhaft ab.
+    #[test]
+    fn dateifallback_haelt_die_kontobindung_fest() {
+        let dir = tempdir("credential");
+        let path = dir.join("feedly-credential");
+        let token = "tok-123".to_string();
+        write_private(
+            &path,
+            serde_json::json!({"token": token, "account": "feedly-1"})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        let stored = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value.get("token").unwrap().as_str().unwrap(), "tok-123");
+        assert_eq!(value.get("account").unwrap().as_str().unwrap(), "feedly-1");
+        // Ein Kontowechsel ist am gespeicherten Konto erkennbar.
+        assert!(!token_matches_account(
+            value.get("account").and_then(|v| v.as_str()),
+            "feedly-2"
+        ));
+        // Entfernen des Tokens entfernt auch die Bindung.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(token_path());
     }
 
     #[test]
@@ -2635,6 +2780,8 @@ mod delta_e2e_tests {
         let (base, _hits) = mock(|req| {
             if req.contains("markers/reads") {
                 (200, r#"{"entries":[]}"#.to_string())
+            } else if req.contains("subscriptions") || req.contains("categories") {
+                (200, "[]".to_string())
             } else if req.contains("global.all") {
                 (200, r#"{"items":[],"updated":1700000000}"#.to_string())
             } else if req.contains("global.saved") || req.contains("global.unread") {
@@ -2681,6 +2828,249 @@ mod delta_e2e_tests {
             watermark.is_none(),
             "ohne vollständige Phase wird kein Watermark geschrieben"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B5: Ein zyklisches Inventar lässt auch den **Erst-Sync** scheitern; es
+    /// entsteht weder Watermark noch Erfolgsmeldung.
+    #[test]
+    fn unvollstaendige_statusphase_beendet_auch_den_erstsync() {
+        let dir = std::env::temp_dir().join(format!("lesefluss-b5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = DbWorker::start(dir.join("library.db"));
+        let (base, _hits) = mock(|req| {
+            if req.contains("/profile") {
+                (200, r#"{"id":"feedly-7"}"#.to_string())
+            } else if req.contains("subscriptions") || req.contains("categories") {
+                (200, "[]".to_string())
+            } else if req.contains("global.all") {
+                (200, r#"{"items":[],"updated":1700000000}"#.to_string())
+            } else if req.contains("global.saved") || req.contains("global.unread") {
+                (200, r#"{"ids":[],"continuation":"c1"}"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-7", 1).with_base(&base);
+        initial_sync(worker.clone(), &net, "tok".to_string(), ctx);
+        let mut failed = None;
+        for _ in 0..120 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncFailed { message, .. }) => {
+                    failed = Some(message);
+                    break;
+                }
+                Ok(crate::net::NetEvent::FeedlySyncDone { .. }) => {
+                    panic!("ein unvollständiger Erst-Sync darf keinen Erfolg melden")
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        let message = failed.expect("der Erst-Sync meldet einen Fehler");
+        assert!(message.contains("unvollständig"), "{message}");
+        let watermark = db_blocking(&worker, |db| db.last_sync("feedly-7").unwrap());
+        assert!(
+            watermark.is_none(),
+            "kein Watermark nach unvollständigem Erst-Sync"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B6: Der Delta-Zyklus gleicht Abos und Gruppen ab: eine neue Quelle wird
+    /// angelegt und aktiv, eine entfernte deaktiviert (gespeicherte Artikel bleiben).
+    #[test]
+    fn delta_gleicht_abos_und_gruppen_ab() {
+        let dir = std::env::temp_dir().join(format!("lesefluss-b6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = DbWorker::start(dir.join("library.db"));
+        db_blocking(&worker, |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+            let gone = db
+                .add_feed(
+                    "feedly-1",
+                    "https://weg.example/rss",
+                    "Weg",
+                    None,
+                    "#111111",
+                )
+                .unwrap();
+            db.upsert_feed_remote(
+                "feedly-1",
+                "feed/weg",
+                "https://weg.example/rss",
+                "Weg",
+                None,
+            )
+            .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(gone, "w1", "Weg", None, None, now, "e", None, now)
+                .unwrap();
+            db.set_saved_by_article_id("w1", true).unwrap();
+        });
+        let (base, hits) = mock(|req| {
+            if req.contains("subscriptions") {
+                (
+                    200,
+                    r#"[{"id":"feed/neu","title":"Neu","website":"https://neu.example/",
+                        "categories":[{"id":"cat-1"}]}]"#
+                        .to_string(),
+                )
+            } else if req.contains("categories") {
+                (200, r#"[{"id":"cat-1","label":"Technik"}]"#.to_string())
+            } else if req.contains("markers/reads") {
+                (200, r#"{"entries":[]}"#.to_string())
+            } else if req.contains("global.all") {
+                (200, r#"{"items":[],"updated":1700000000}"#.to_string())
+            } else if req.contains("global.saved") {
+                // Der gespeicherte Artikel bleibt auch serverseitig gespeichert.
+                (200, r#"{"ids":["w1"]}"#.to_string())
+            } else if req.contains("global.unread") {
+                (200, r#"{"ids":[]}"#.to_string())
+            } else if req.contains("entries/.mget") {
+                (
+                    200,
+                    serde_json::json!([{
+                        "id": "w1",
+                        "content": {"content": "<p>Inhalt</p>"},
+                        "origin": {"streamId": "feed/weg", "title": "Weg"}
+                    }])
+                    .to_string(),
+                )
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        let last = storage::now_ms() - 60_000;
+        delta_sync(
+            worker.clone(),
+            &net,
+            "tok".to_string(),
+            "feedly-1".to_string(),
+            last,
+            ctx,
+        );
+        let mut done = false;
+        let mut failure = None;
+        for _ in 0..120 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncDone { .. }) => {
+                    done = true;
+                    break;
+                }
+                Ok(crate::net::NetEvent::FeedlySyncFailed { message, .. }) => {
+                    failure = Some(message);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(done, "der Delta-Lauf meldet Erfolg, Fehler: {failure:?}");
+        let requests = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(requests >= 4, "der Lauf fragt Metadaten und Ströme ab");
+        let (neu, gruppe, alt_aktiv, alt_saved) = db_blocking(&worker, |db| {
+            let neu = db
+                .raw()
+                .query_row(
+                    "SELECT active FROM feeds WHERE remote_id='feed/neu'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            let gruppe = db
+                .raw()
+                .query_row(
+                    "SELECT COUNT(*) FROM groups WHERE name='Technik'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            let alt_aktiv = db
+                .raw()
+                .query_row(
+                    "SELECT active FROM feeds WHERE remote_id='feed/weg'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            let alt_saved = db
+                .raw()
+                .query_row("SELECT saved FROM articles WHERE id='w1'", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            (neu, gruppe, alt_aktiv, alt_saved)
+        });
+        assert_eq!(neu, 1, "neue Quelle ist aktiv");
+        assert_eq!(gruppe, 1, "Gruppe wurde angelegt");
+        assert_eq!(alt_aktiv, 0, "entfernte Quelle ist deaktiviert");
+        assert_eq!(alt_saved, 1, "gespeicherte Artikel bleiben erhalten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B4: Der Erst-Sync bindet das validierte Profilkonto; danach ist das
+    /// Credential dieses Kontos und ein Wechsel wird abgewiesen.
+    #[test]
+    fn initial_sync_bindet_das_validierte_profilkonto() {
+        let dir = std::env::temp_dir().join(format!("lesefluss-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = DbWorker::start(dir.join("library.db"));
+        let (base, _hits) = mock(|req| {
+            if req.contains("/profile") {
+                (200, r#"{"id":"feedly-9","fullName":"Profil"}"#.to_string())
+            } else if req.contains("subscriptions") || req.contains("categories") {
+                (200, "[]".to_string())
+            } else if req.contains("global.all") {
+                (200, r#"{"items":[],"updated":1700000000}"#.to_string())
+            } else if req.contains("global.saved") || req.contains("global.unread") {
+                (200, r#"{"ids":[]}"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-anchor", 1).with_base(&base);
+        // Der Dispatcher-Anker (hier "feedly-anchor") ist bewusst nicht die Profil-ID.
+        initial_sync(worker.clone(), &net, "tok".to_string(), ctx);
+        let mut done = false;
+        for _ in 0..120 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncDone { account_id, .. }) => {
+                    assert_eq!(
+                        account_id, "feedly-9",
+                        "das Ereignis trägt die validierte Profilkonto-ID"
+                    );
+                    done = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(done, "der Erst-Sync meldet Erfolg");
+        let watermark = db_blocking(&worker, |db| db.last_sync("feedly-9").unwrap());
+        assert!(
+            watermark.is_some(),
+            "der Watermark landet auf dem Profilkonto"
+        );
+        let anchor = db_blocking(&worker, |db| db.last_sync("feedly-anchor").unwrap());
+        assert!(anchor.is_none(), "nicht auf dem Ankerkonto");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
