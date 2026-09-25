@@ -118,6 +118,55 @@ fn self_newest_first(db: &storage::Database) -> bool {
         .unwrap_or(true)
 }
 
+/// Was ein manueller Refresh im aktuellen Bereich tatsächlich aktualisieren muss.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RefreshPlan {
+    pub local_feeds: Vec<(i64, String)>,
+    pub feedly_account: Option<String>,
+    pub skipped: bool,
+}
+
+/// Ermittelt den Provider aus den Feeds, die im Bereich tatsächlich liegen.
+/// Global aktualisiert beides, ein Feed/Gruppe nur seinen Anbieter.
+pub fn refresh_plan(
+    scope: &storage::Scope,
+    feeds: &[storage::FeedRow],
+    accounts: &[(String, String, String)],
+) -> RefreshPlan {
+    let ids: Vec<i64> = match scope {
+        storage::Scope::Feed(f) => vec![*f],
+        storage::Scope::Group(g) => feeds
+            .iter()
+            .filter(|f| f.groups.contains(g))
+            .map(|f| f.id)
+            .collect(),
+        storage::Scope::Account(a) => feeds
+            .iter()
+            .filter(|f| &f.account_id == a)
+            .map(|f| f.id)
+            .collect(),
+        storage::Scope::Global => feeds.iter().map(|f| f.id).collect(),
+    };
+    let in_scope: Vec<&storage::FeedRow> = feeds.iter().filter(|f| ids.contains(&f.id)).collect();
+    let local_feeds: Vec<(i64, String)> = in_scope
+        .iter()
+        .filter(|f| f.account_id == "local")
+        .map(|f| (f.id, f.feed_url.clone()))
+        .collect();
+    let has_feedly_feed = in_scope.iter().any(|f| f.account_id != "local");
+    let feedly_account = if has_feedly_feed {
+        first_account_of_kind(accounts, "feedly")
+    } else {
+        None
+    };
+    let skipped = local_feeds.is_empty() && feedly_account.is_none();
+    RefreshPlan {
+        local_feeds,
+        feedly_account,
+        skipped,
+    }
+}
+
 /// Erstes Konto einer Art. Nimmt die Liste als Wert, damit der Aufrufer seinen
 /// `RefCell`-Borrow beenden kann, bevor er den State verändert.
 pub fn first_account_of_kind(accounts: &[(String, String, String)], kind: &str) -> Option<String> {
@@ -331,6 +380,73 @@ mod router_tests {
         let entry = (7i64, "x".to_string(), true, true);
         let (feed, id, unread, saved) = restored_state(&entry);
         assert_eq!((feed, id, unread, saved), (7, "x".to_string(), false, true));
+    }
+
+    /// A8: Der Provider ergibt sich aus den Feeds im Bereich. Ein lokaler Feed
+    /// bleibt lokal, Global aktualisiert beides.
+    #[test]
+    fn refresh_richtet_sich_nach_den_feeds_im_bereich() {
+        let accounts = vec![
+            (
+                "local".to_string(),
+                "local".to_string(),
+                "Lokal".to_string(),
+            ),
+            (
+                "feedly-1".to_string(),
+                "feedly".to_string(),
+                "Feedly".to_string(),
+            ),
+        ];
+        let feeds = vec![
+            FeedRow {
+                id: 1,
+                account_id: "local".into(),
+                remote_id: None,
+                feed_url: "https://lokal.example/f".into(),
+                title: "Lokal".into(),
+                website: None,
+                accent: "#111111".into(),
+                groups: vec![10],
+            },
+            FeedRow {
+                id: 2,
+                account_id: "feedly-1".into(),
+                remote_id: Some("feed/x".into()),
+                feed_url: "https://remote.example/f".into(),
+                title: "Remote".into(),
+                website: None,
+                accent: "#222222".into(),
+                groups: vec![20],
+            },
+        ];
+        let lokal_feed = refresh_plan(&Scope::Feed(1), &feeds, &accounts);
+        assert_eq!(lokal_feed.local_feeds.len(), 1, "lokaler Feed bleibt lokal");
+        assert!(
+            lokal_feed.feedly_account.is_none(),
+            "kein Feedly für einen lokalen Feed"
+        );
+
+        let remote_feed = refresh_plan(&Scope::Feed(2), &feeds, &accounts);
+        assert!(remote_feed.local_feeds.is_empty());
+        assert_eq!(remote_feed.feedly_account.as_deref(), Some("feedly-1"));
+
+        let lokal_gruppe = refresh_plan(&Scope::Group(10), &feeds, &accounts);
+        assert_eq!(lokal_gruppe.local_feeds.len(), 1);
+
+        let remote_gruppe = refresh_plan(&Scope::Group(20), &feeds, &accounts);
+        assert_eq!(remote_gruppe.feedly_account.as_deref(), Some("feedly-1"));
+
+        let global = refresh_plan(&Scope::Global, &feeds, &accounts);
+        assert_eq!(global.local_feeds.len(), 1, "Global aktualisiert lokal");
+        assert_eq!(
+            global.feedly_account.as_deref(),
+            Some("feedly-1"),
+            "Global aktualisiert auch Feedly"
+        );
+
+        let leer = refresh_plan(&Scope::Account("unbekannt".into()), &feeds, &accounts);
+        assert!(leer.skipped, "leerer Bereich wird gemeldet");
     }
 
     /// A1: Der Konto-Lookup darf keinen Borrow halten, während der Aufrufer den
@@ -3355,59 +3471,25 @@ impl App {
     // ── Konto ──
 
     fn do_refresh(&self) {
-        let (feeds, feedly_account, scope) = {
+        let plan = {
             let st = self.state.borrow();
-            let ids: Vec<i64> = match &st.scope {
-                Scope::Feed(f) => vec![*f],
-                Scope::Group(g) => st
-                    .feeds
-                    .iter()
-                    .filter(|f| f.groups.contains(g))
-                    .map(|f| f.id)
-                    .collect(),
-                Scope::Account(a) => st
-                    .feeds
-                    .iter()
-                    .filter(|f| &f.account_id == a)
-                    .map(|f| f.id)
-                    .collect(),
-                Scope::Global => st.feeds.iter().map(|f| f.id).collect(),
-            };
-            let urls: Vec<(i64, String)> = st
-                .feeds
-                .iter()
-                .filter(|f| f.account_id == "local" && ids.contains(&f.id))
-                .map(|f| (f.id, f.feed_url.clone()))
-                .collect();
-            let feedly = st
-                .accounts
-                .iter()
-                .find(|(_, k, _)| k == "feedly")
-                .map(|(id, _, _)| id.clone());
-            (urls, feedly, st.scope.clone())
+            refresh_plan(&st.scope, &st.feeds, &st.accounts)
         };
-        if let Some(account_id) = feedly_account {
-            let scope_is_feedly = match &scope {
-                Scope::Account(a) => *a == account_id,
-                _ => true,
-            };
-            if scope_is_feedly {
-                let _ = account_id;
-                self.with_token(TokenAction::Refresh);
-                return;
-            }
-        }
-        if feeds.is_empty() {
-            self.show_toast("Keine lokalen Feeds im aktuellen Bereich (Strg+N)");
-            return;
-        }
-        for (feed_id, url) in feeds {
+        // Lokale Feeds und Feedly werden getrennt angestoßen; ein Bereich mit
+        // lokalen Feeds wird nicht von einem Feedly-Konto verdrängt.
+        let local_count = plan.local_feeds.len();
+        for (feed_id, url) in plan.local_feeds {
             self.net.fetch_feed(self.worker.clone(), feed_id, url, true);
         }
-        self.show_toast(&format!(
-            "Aktualisiere {} Feeds…",
-            self.state.borrow().feeds.len()
-        ));
+        if local_count > 0 {
+            self.show_toast(&format!("Aktualisiere {local_count} Feeds…"));
+        }
+        if plan.feedly_account.is_some() {
+            self.with_token(TokenAction::Refresh);
+        }
+        if local_count == 0 && plan.feedly_account.is_none() {
+            self.show_toast("Keine Feeds im aktuellen Bereich (Strg+N)");
+        }
     }
 
     /// Startet höchstens einen Feedly-Zyklus; ein laufender wird nicht verdoppelt,

@@ -600,19 +600,33 @@ pub struct StreamSummary {
 /// Gleicht lokale Merkungen mit einem **vollständigen** Remote-Inventar ab.
 /// Bei unvollständigem Inventar wird nichts geändert — insbesondere kein
 /// stilles Entspeichern und kein Fortschreiben des Watermarks.
+/// Ergebnis einer Statusphase: `complete` ist nur true, wenn das Inventar
+/// vollständig war. Ein unvollständiger Lauf darf weder Watermark noch
+/// Erfolgsmeldung auslösen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseResult {
+    pub complete: bool,
+    pub applied: usize,
+    pub reason: Option<String>,
+}
+
 pub async fn reconcile_saved(
     worker: &DbWorker,
     account_id: &str,
     saved: &pf::Inventory,
     pull_generation: i64,
-) -> SyncResult<()> {
+) -> SyncResult<PhaseResult> {
     let remote = match saved {
         pf::Inventory::Complete(ids) => ids.clone(),
         pf::Inventory::Incomplete(reason) => {
             dbg_log(&format!(
                 "Saved-Reconciliation übersprungen (Inventar unvollständig: {reason})"
             ));
-            return Ok(());
+            return Ok(PhaseResult {
+                complete: false,
+                applied: 0,
+                reason: Some(reason.clone()),
+            });
         }
     };
     let local_saved: Vec<String> = db(worker, {
@@ -663,7 +677,11 @@ pub async fn reconcile_saved(
         to_unsave.len(),
         to_save.len()
     ));
-    Ok(())
+    Ok(PhaseResult {
+        complete: true,
+        applied: to_unsave.len() + to_save.len(),
+        reason: None,
+    })
 }
 
 /// Gleicht die lokalen Ungelesen-Markierungen mit einem **vollständigen**
@@ -674,14 +692,18 @@ pub async fn reconcile_unread(
     account_id: &str,
     unread: &pf::Inventory,
     pull_generation: i64,
-) -> SyncResult<usize> {
+) -> SyncResult<PhaseResult> {
     let remote = match unread {
         pf::Inventory::Complete(ids) => ids.clone(),
         pf::Inventory::Incomplete(reason) => {
             dbg_log(&format!(
                 "Unread-Reconciliation übersprungen (Inventar unvollständig: {reason})"
             ));
-            return Ok(0);
+            return Ok(PhaseResult {
+                complete: false,
+                applied: 0,
+                reason: Some(reason.clone()),
+            });
         }
     };
     let remote_set: std::collections::HashSet<&str> = remote.iter().map(String::as_str).collect();
@@ -751,7 +773,28 @@ pub async fn reconcile_unread(
         applied,
         newly_unread
     ));
-    Ok(applied + newly_unread)
+    Ok(PhaseResult {
+        complete: true,
+        applied: applied + newly_unread,
+        reason: None,
+    })
+}
+
+/// Pflichtphasen müssen vollständig sein; sonst kein Erfolg und kein Watermark.
+pub fn require_complete(phases: &[PhaseResult]) -> SyncResult<()> {
+    for phase in phases {
+        if !phase.complete {
+            return Err(SyncFailure::new(
+                format!(
+                    "Statusabgleich unvollständig: {}",
+                    phase.reason.clone().unwrap_or_else(|| "unbekannt".into())
+                ),
+                Some("degraded"),
+                None,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Prüft, ob der Server die gerade gesendete Absicht tatsächlich übernommen hat.
@@ -1394,11 +1437,13 @@ pub fn delta_sync(
                     pf::Inventory::Incomplete(r) => format!("unvollständig: {r}"),
                 }
             ));
-            reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
+            let saved_phase = reconcile_saved(&worker, &account_id, &saved, pull_gen).await?;
             // Vollständiger Leseabgleich: Unread-Inventar und fehlende Inhalte.
             let unread =
                 fetch_id_inventory(&client, &pf::unread_stream(&account_id), MAX_ID_PAGES).await?;
-            reconcile_unread(&worker, &account_id, &unread, pull_gen).await?;
+            let unread_phase = reconcile_unread(&worker, &account_id, &unread, pull_gen).await?;
+            // Eine unvollständige Pflichtphase beendet den Lauf ohne Watermark.
+            require_complete(&[saved_phase, unread_phase])?;
             let ids = inventory_ids(&saved, &unread);
             load_contents(&worker, &client, &account_id, pull_gen, &ids, 200, &ctx).await?;
             // Sicherer Checkpoint: der früheste Stand, den diese Phase
@@ -1701,7 +1746,8 @@ mod r1_regression {
         let applied = reconcile_unread(&worker, "feedly-1", &inventory, i64::MAX)
             .await
             .unwrap();
-        assert_eq!(applied, 1);
+        assert!(applied.complete);
+        assert_eq!(applied.applied, 1);
         let unread: Vec<String> =
             db(&worker, |db| db.unread_ids_for_account("feedly-1").unwrap()).await;
         assert_eq!(unread, vec!["bleibt".to_string()]);
@@ -1715,7 +1761,11 @@ mod r1_regression {
         let applied = reconcile_unread(&worker, "feedly-1", &inventory, i64::MAX)
             .await
             .unwrap();
-        assert_eq!(applied, 0);
+        assert!(
+            !applied.complete,
+            "ein unvollständiges Inventar ist kein Erfolg"
+        );
+        assert_eq!(applied.applied, 0);
         let unread: Vec<String> =
             db(&worker, |db| db.unread_ids_for_account("feedly-1").unwrap()).await;
         assert_eq!(
@@ -2206,10 +2256,47 @@ mod outbox_e2e_tests {
     }
 }
 
+/// Kleiner HTTP-Mockserver für die App-Tests: zählt Anfragen und antwortet nach
+/// einem Skript. Ohne echten Netzwerkzugriff und ohne Umgebungsveränderung.
+/// Kleiner HTTP-Mockserver für die App-Tests: zählt Anfragen und antwortet nach
+/// einem Skript. Ohne echten Netzwerkzugriff und ohne Umgebungsveränderung.
+#[cfg(test)]
+pub mod app_mock_server {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    pub fn mock(
+        responder: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (code, body) = responder(&req);
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/v3/"), hits)
+    }
+}
+
 #[cfg(test)]
 mod read_sync_tests {
     use super::*;
-
     async fn worker_with_feedly(tag: &str) -> (DbWorker, std::path::PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("lesefluss-readsync-{tag}-{}", std::process::id()));
@@ -2247,7 +2334,8 @@ mod read_sync_tests {
         let changed = reconcile_unread(&worker, "feedly-1", &inventory, i64::MAX)
             .await
             .unwrap();
-        assert_eq!(changed, 1);
+        assert!(changed.complete);
+        assert_eq!(changed.applied, 1);
         let unread: i64 = db(&worker, |db| {
             db.raw()
                 .query_row("SELECT unread FROM articles WHERE id='a'", [], |r| r.get(0))
@@ -2421,35 +2509,71 @@ mod read_sync_tests {
 #[cfg(test)]
 mod delta_e2e_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use crate::feedly_sync::app_mock_server::mock;
 
-    fn mock(
-        responder: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
-    ) -> (String, Arc<AtomicUsize>) {
-        use std::io::{Read as _, Write as _};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut s) = stream else { continue };
-                let mut buf = [0u8; 16384];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                counter.fetch_add(1, Ordering::SeqCst);
-                let (code, body) = responder(&req);
-                let resp = format!(
-                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = s.write_all(resp.as_bytes());
+    /// A6: Ein unvollständiges Inventar darf weder Erfolg melden noch den
+    /// Watermark fortschreiben.
+    #[test]
+    fn unvollstaendige_statusphase_beendet_den_lauf_ohne_watermark() {
+        use crate::feedly_sync::app_mock_server::mock;
+        let dir = std::env::temp_dir().join(format!("lesefluss-a6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = DbWorker::start(dir.join("library.db"));
+        db_blocking(&worker, |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+        });
+        // Cursorzyklus: derselbe Cursor kommt immer wieder.
+        let (base, _hits) = mock(|req| {
+            if req.contains("markers/reads") {
+                (200, r#"{"entries":[]}"#.to_string())
+            } else if req.contains("global.all") {
+                (200, r#"{"items":[],"updated":1700000000}"#.to_string())
+            } else if req.contains("global.saved") || req.contains("global.unread") {
+                (200, r#"{"ids":[],"continuation":"c1"}"#.to_string())
+            } else {
+                (404, "{}".to_string())
             }
         });
-        (format!("http://{addr}/v3/"), hits)
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        let last = storage::now_ms() - 60_000;
+        delta_sync(
+            worker.clone(),
+            &net,
+            "tok".to_string(),
+            "feedly-1".to_string(),
+            last,
+            ctx,
+        );
+        let mut failed = None;
+        for _ in 0..120 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncFailed { message, .. }) => {
+                    failed = Some(message);
+                    break;
+                }
+                Ok(crate::net::NetEvent::FeedlySyncDone { .. }) => {
+                    panic!("ein unvollständiger Abgleich darf keinen Erfolg melden")
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        let message = failed.expect("der Lauf meldet einen Fehler");
+        assert!(
+            message.contains("unvollständig") || message.contains("Abgleich"),
+            "{message}"
+        );
+        let watermark = db_blocking(&worker, |db| db.last_sync("feedly-1").unwrap());
+        assert!(
+            watermark.is_none(),
+            "ohne vollständige Phase wird kein Watermark geschrieben"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A4 über den echten Delta-Einstieg: vollständige Unread-/Saved-Inventare,
