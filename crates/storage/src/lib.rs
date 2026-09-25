@@ -1898,6 +1898,47 @@ impl Database {
         Ok(())
     }
 
+    /// Reißt eine Bestätigung nur dann erneut ein, wenn seit dem Senden **keine**
+    /// neuere lokale Absicht entstanden ist. Arbeitet auch, wenn die ursprüngliche
+    /// Outbox-Zeile nach dem ACK bereits gelöscht ist.
+    pub fn outbox_requeue_if_unchanged(
+        &self,
+        account_id: &str,
+        entity_id: &str,
+        field: &str,
+        desired: bool,
+        sent_revision: i64,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let current: i64 = tx
+            .query_row(
+                "SELECT revision FROM field_revisions
+                 WHERE account_id=?1 AND entity_id=?2 AND field=?3",
+                params![account_id, entity_id, field],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if current > sent_revision {
+            // Seit dem Senden wurde lokal etwas anderes entschieden.
+            tx.commit()?;
+            return Ok(false);
+        }
+        let pending: bool = tx.query_row(
+            "SELECT COUNT(*) FROM outbox WHERE account_id=?1 AND entity_id=?2 AND field=?3
+               AND status IN ('pending','inflight')",
+            params![account_id, entity_id, field],
+            |r| Ok(r.get::<_, i64>(0)? > 0),
+        )?;
+        if pending {
+            tx.commit()?;
+            return Ok(false);
+        }
+        bump_outbox(&tx, account_id, entity_id, field, desired)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn account_id_for_feed(&self, feed_id: i64) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -3288,6 +3329,59 @@ mod tests {
             2,
             "Revision bleibt dauerhaft monoton"
         );
+    }
+
+    /// A5: Eine verspätete Bestätigung darf eine neuere Benutzerabsicht nicht
+    /// überschreiben, auch wenn die Outbox-Zeile schon gelöscht wurde.
+    #[test]
+    fn verpaetete_bestaetigung_ueberschreibt_keine_neue_absicht() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None)
+            .unwrap();
+        let claimed = db.outbox_claim(&remote, now, 10).unwrap();
+        let sent = claimed.first().expect("Zeile").revision;
+        db.outbox_ack(&[(claimed[0].id, sent)]).unwrap();
+        // Der Nutzer entscheidet sich inzwischen anders.
+        db.apply_status_with_outbox(feed, "e1", Some(false), None)
+            .unwrap();
+        let requeued = db
+            .outbox_requeue_if_unchanged(&remote, "e1", "read", true, sent)
+            .unwrap();
+        assert!(!requeued, "die neuere Absicht bleibt maßgeblich");
+        let pending = db.outbox_pending(&remote, now, 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].desired, " unread, nicht die alte read-Absicht");
+    }
+
+    #[test]
+    fn unveraenderte_absicht_wird_nach_unbestaetigter_uebernahme_wieder_eingereiht() {
+        let db = Database::open_in_memory().unwrap();
+        let remote = remote_account(&db);
+        let feed = db
+            .add_feed(&remote, "u1", "Feedly", None, "#111111")
+            .unwrap();
+        let now = now_ms();
+        db.upsert_article(feed, "e1", "Titel", None, None, now, "e", None, now)
+            .unwrap();
+        db.apply_status_with_outbox(feed, "e1", Some(true), None)
+            .unwrap();
+        let claimed = db.outbox_claim(&remote, now, 10).unwrap();
+        let sent = claimed.first().expect("Zeile").revision;
+        db.outbox_ack(&[(claimed[0].id, sent)]).unwrap();
+        let requeued = db
+            .outbox_requeue_if_unchanged(&remote, "e1", "read", true, sent)
+            .unwrap();
+        assert!(requeued, "ohne neuere Absicht wird erneut gesendet");
+        let pending = db.outbox_pending(&remote, now, 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].desired);
     }
 
     #[test]

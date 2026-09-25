@@ -11,6 +11,8 @@ pub struct RunCtx {
     pub account_id: String,
     pub run_id: u64,
     pub cancel: Arc<AtomicBool>,
+    /// Überschreibt die Basis-URL; nur Tests nutzen das (sonst `pf::base_url()`).
+    pub base: Option<String>,
 }
 
 impl RunCtx {
@@ -19,7 +21,18 @@ impl RunCtx {
             account_id: account_id.to_string(),
             run_id,
             cancel: Arc::new(AtomicBool::new(false)),
+            base: None,
         }
+    }
+
+    pub fn with_base(mut self, base: &str) -> Self {
+        self.base = Some(base.to_string());
+        self
+    }
+
+    /// Basis-URL dieses Laufs.
+    pub fn base(&self) -> String {
+        self.base.clone().unwrap_or_else(pf::base_url)
     }
 
     /// Nach Logout, Auth- oder Quotenstopp: keine weiteren Requests, keine
@@ -349,6 +362,21 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
+}
+
+/// Blockierender DB-Zugriff (Tests, die kein Laufzeitkontext brauchen).
+fn db_blocking<T, F>(worker: &DbWorker, f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&storage::Database) -> T + Send + 'static,
+{
+    worker
+        .send(f)
+        .recv()
+        .ok()
+        .and_then(|b| b.downcast::<T>().ok())
+        .map(|b| *b)
+        .unwrap_or_else(|| panic!("db worker unavailable"))
 }
 
 async fn db<T, F>(worker: &DbWorker, f: F) -> T
@@ -732,7 +760,7 @@ pub fn initial_sync(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     set_status(&worker, "initial_sync", None);
     let sync_started_ms = storage::now_ms();
     net.spawn(async move {
-        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        let client = pf::FeedlyClient::with_base(token, ctx.base());
         let res: SyncResult<usize> = async {
             let profile = client.profile().await.map_err(io_err)?;
             db(&worker, {
@@ -887,7 +915,7 @@ pub fn mark_feeds_server_side(
         if ctx.is_cancelled() {
             return;
         }
-        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        let client = pf::FeedlyClient::with_base(token, ctx.base());
         match client.markers_feeds("markAsRead", &remote_feed_ids).await {
             Ok(()) => {
                 db(&worker, move |db2| {
@@ -922,7 +950,7 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     let account_id = ctx.account_id.clone();
     let tx = net.event_sender();
     net.spawn(async move {
-        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        let client = pf::FeedlyClient::with_base(token, ctx.base());
         let now = storage::now_ms();
         // Claim und Requestrevision werden gemeinsam erfasst: ein zweiter
         // Prozessor kann dieselbe Zeile nicht parallel senden.
@@ -965,41 +993,75 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
                     let total = sent.len();
                     let _ = db(&worker, move |db2| db2.outbox_ack(&sent)).await;
                     // Bestätigung durch einen **danach** begonnenen Statusabruf.
-                    // Serverkonsistenz kann verzögert sein; eine Abweichung erzeugt
-                    // eine neue, revisionsfeste Absicht statt eines stillen Erfolgs.
-                    if let Ok(remote) = client.entries_mget(&entry_ids).await {
-                        let mismatched: Vec<String> = remote
-                            .iter()
-                            .filter(|e| !confirmed(e, &field, desired))
-                            .map(|e| e.id.clone())
-                            .collect();
-                        if !mismatched.is_empty() {
-                            let count = mismatched.len();
-                            let account_for_db = account_id.clone();
-                            let field_for_db = field.clone();
-                            let _ = db(&worker, move |db2| {
-                                for entity in &mismatched {
-                                    db2.enqueue_outbox(
-                                        &account_for_db,
-                                        entity,
-                                        &field_for_db,
-                                        desired,
-                                    )?;
-                                }
-                                let notices: Vec<(String, String)> = mismatched
+                    // Die Nachbestätigung ist an die gesendete Revision gebunden:
+                    // eine inzwischen neuere Benutzerabsicht wird nicht überschrieben.
+                    match client.entries_mget(&entry_ids).await {
+                        Ok(remote) => {
+                            let by_id: std::collections::HashMap<&str, &pf::Entry> =
+                                remote.iter().map(|e| (e.id.as_str(), e)).collect();
+                            // Fehlende Antworten gelten ausdrücklich als unbestätigt.
+                            let unconfirmed: Vec<String> = entries
+                                .iter()
+                                .filter(|(_, _, entity)| {
+                                    match by_id.get(entity.as_str()) {
+                                        Some(e) => !confirmed(e, &field, desired),
+                                        None => true,
+                                    }
+                                })
+                                .map(|(_, _, entity)| entity.clone())
+                                .collect();
+                            if !unconfirmed.is_empty() {
+                                let count = unconfirmed.len();
+                                let account_for_db = account_id.clone();
+                                let field_for_db = field.clone();
+                                let sent_for_db: Vec<(i64, i64, String)> = entries
                                     .iter()
-                                    .map(|e| (account_for_db.clone(), e.clone()))
+                                    .map(|(id, rev, entity)| (*id, *rev, entity.clone()))
                                     .collect();
-                                db2.mark_unsynced(&notices)?;
-                                Ok::<_, storage::StorageError>(())
-                            })
-                            .await;
+                                let requeued = db(&worker, move |db2| {
+                                    let mut requeued = 0usize;
+                                    for (_, revision, entity) in &sent_for_db {
+                                        if db2.outbox_requeue_if_unchanged(
+                                            &account_for_db,
+                                            entity,
+                                            &field_for_db,
+                                            desired,
+                                            *revision,
+                                        )? {
+                                            requeued += 1;
+                                        }
+                                    }
+                                    let notices: Vec<(String, String)> = unconfirmed
+                                        .iter()
+                                        .map(|e| (account_for_db.clone(), e.clone()))
+                                        .collect();
+                                    db2.mark_unsynced(&notices)?;
+                                    Ok::<_, storage::StorageError>(requeued)
+                                })
+                                .await;
+                                dbg_log(&format!(
+                                    "Nachbestätigung: {} von {} erneut vorgemerkt",
+                                    id_count_guard(requeued).unwrap_or(0),
+                                    count
+                                ));
+                                let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
+                                    account_id: ctx.account_id.clone(),
+                                    run_id: ctx.run_id,
+                                    message: format!(
+                                        "Feedly hat {count} von {total} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt"
+                                    ),
+                                    status: Some("degraded".into()),
+                                    retry_after_ms: None,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            // Eine fehlgeschlagene Bestätigungsabfrage ist selbst eine
+                            // offene Frage und wird sichtbar, nicht still übergangen.
                             let _ = tx.send(crate::net::NetEvent::FeedlySyncFailed {
                                 account_id: ctx.account_id.clone(),
                                 run_id: ctx.run_id,
-                                message: format!(
-                                    "Feedly hat {count} von {total} Änderungen noch nicht bestätigt — erneuter Versuch vorgemerkt"
-                                ),
+                                message: format!("Bestätigung nach dem Upload fehlgeschlagen: {e}"),
                                 status: Some("degraded".into()),
                                 retry_after_ms: None,
                             });
@@ -1084,6 +1146,17 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     });
 }
 
+/// Der Rückgabewert der Nachbestätigung ist nur für Diagnosezwecke bestimmt.
+fn id_count_guard(count: Result<usize, storage::StorageError>) -> Option<usize> {
+    match count {
+        Ok(n) => Some(n),
+        Err(e) => {
+            eprintln!("[lf] Nachbestätigung nicht verarbeitet: {e}");
+            None
+        }
+    }
+}
+
 fn fmt_ms(ms: i64) -> String {
     let minutes = (ms - storage::now_ms()).max(0) / 60_000 + 1;
     format!("in ca. {minutes} min")
@@ -1115,7 +1188,7 @@ pub fn delta_sync(
     set_status(&worker, "syncing", Some(&account_id));
     let sync_started_ms = storage::now_ms();
     net.spawn(async move {
-        let client = pf::FeedlyClient::with_base(token, pf::base_url());
+        let client = pf::FeedlyClient::with_base(token, ctx.base());
         let res: SyncResult<usize> = async {
             let overlap = last_sync_ms - 5 * 60_000;
             let pull_gen = db(&worker, {
@@ -1830,5 +1903,167 @@ mod confirm_tests {
             !confirmed(&unknown, "read", true),
             "fehlende Serverangabe gilt nicht als Bestätigung"
         );
+    }
+}
+
+#[cfg(test)]
+mod outbox_e2e_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn mock_with_script(
+        responder: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (code, body) = responder(&req);
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/v3/"), hits)
+    }
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lesefluss-outbox-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A5 über den echten Outbox-Pfad: Der Server bestätigt verzögert und meldet
+    /// weiterhin „unread“. Zwischen Upload und Antwort entscheidet sich die Person
+    /// um. Die neuere Absicht muss erhalten bleiben.
+    #[test]
+    fn verzoegerte_bestaetigung_ueberschreibt_keine_neue_absicht() {
+        let dir = tempdir("a5");
+        let worker = DbWorker::start(dir.join("library.db"));
+        let entry_id = "https://feedly.com/i/entry/a5".to_string();
+        let id_for_db = entry_id.clone();
+        db_blocking(&worker, move |db| {
+            db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
+            let feed = db
+                .add_feed("feedly-1", "u1", "Feed", None, "#111111")
+                .unwrap();
+            let now = storage::now_ms();
+            db.upsert_article(feed, &id_for_db, "Titel", None, None, now, "e", None, now)
+                .unwrap();
+        });
+
+        let entry_for_server = entry_id.clone();
+        let (base, _hits) = mock_with_script(move |req| {
+            if req.starts_with("POST") && req.contains("/markers") {
+                (200, "{}".to_string())
+            } else if req.contains("entries/.mget") {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                (
+                    200,
+                    serde_json::json!([{
+                        "id": entry_for_server,
+                        "unread": true,
+                        "origin": {"streamId": "feed/https://example.org/f.xml"}
+                    }])
+                    .to_string(),
+                )
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+
+        // Erste Absicht: als gelesen markieren.
+        let id = entry_id.clone();
+        db_blocking(&worker, move |db| {
+            let feed = db
+                .raw()
+                .query_row(
+                    "SELECT id FROM feeds WHERE account_id='feedly-1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            db.apply_status_with_outbox(feed, &id, Some(true), None)
+                .unwrap();
+        });
+
+        let net = Net::start();
+        let ctx = RunCtx::new("feedly-1", 1).with_base(&base);
+        process_outbox(worker.clone(), &net, "tok".to_string(), ctx);
+
+        // Während die Bestätigung läuft, entscheidet die Person anders.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let id = entry_id.clone();
+        db_blocking(&worker, move |db| {
+            let feed = db
+                .raw()
+                .query_row(
+                    "SELECT id FROM feeds WHERE account_id='feedly-1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            db.apply_status_with_outbox(feed, &id, Some(false), None)
+                .unwrap();
+        });
+
+        // Auf das Abschlussereignis warten.
+        let mut failed = false;
+        for _ in 0..100 {
+            match net
+                .events
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(crate::net::NetEvent::FeedlySyncFailed { .. }) => {
+                    failed = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(failed, "die fehlende Bestätigung wird gemeldet");
+
+        let pending: Vec<(String, bool, i64)> = db_blocking(&worker, |db| {
+            let mut rows = db
+                .raw()
+                .prepare(
+                    "SELECT entity_id, desired, revision FROM outbox WHERE account_id='feedly-1'",
+                )
+                .unwrap();
+            let out: Vec<(String, bool, i64)> = rows
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? == 1,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            out
+        });
+        assert_eq!(pending.len(), 1, "genau eine Absicht wartet: {pending:?}");
+        assert!(
+            !pending[0].1,
+            "die neuere Absicht (unread) ist maßgeblich, nicht das alte read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3611,6 +3611,7 @@ impl App {
                     account_id: run.account_id.clone(),
                     run_id,
                     cancel: std::sync::Arc::clone(&run.cancel),
+                    base: None,
                 },
                 _ => feedly_sync::RunCtx::new(&account_id, run_id),
             }
