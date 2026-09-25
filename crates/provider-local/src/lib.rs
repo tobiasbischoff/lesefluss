@@ -471,22 +471,6 @@ fn extract_alternate_links(html: &str) -> Vec<(String, String)> {
     out
 }
 
-fn attr(tag: &str, name: &str) -> Option<String> {
-    let pat1 = format!("{name}=\"");
-    let pat2 = format!("{name}='");
-    for pat in [pat1, pat2] {
-        let lower_tag = tag.to_lowercase();
-        if let Some(i) = lower_tag.find(&pat) {
-            let start = i + pat.len();
-            let quote = pat.chars().last().unwrap();
-            if let Some(e) = tag[start..].find(quote) {
-                return Some(tag[start..start + e].to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

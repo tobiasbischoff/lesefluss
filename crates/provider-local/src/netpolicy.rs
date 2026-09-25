@@ -91,7 +91,7 @@ pub fn check_url(raw: &str, trusted_origins: &[String]) -> Result<Url, PolicyErr
         return Err(PolicyError::Scheme(url.scheme().to_string()));
     }
     let origin = origin_of(&url);
-    if trusted_origins.iter().any(|o| *o == origin) {
+    if trusted_origins.contains(&origin) {
         return Ok(url);
     }
     if host_literal_blocked(&url) {

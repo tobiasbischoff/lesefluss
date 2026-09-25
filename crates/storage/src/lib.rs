@@ -689,10 +689,7 @@ impl Database {
     pub fn known_article_ids(&self, account_id: &str, ids: &[String]) -> Result<Vec<String>> {
         let mut found: Vec<String> = Vec::new();
         for chunk in ids.chunks(200) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT DISTINCT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
                  WHERE f.account_id=? AND a.id IN ({placeholders})"
@@ -833,10 +830,7 @@ impl Database {
     pub fn read_ids_within(&self, account_id: &str, ids: &[String]) -> Result<Vec<String>> {
         let mut found: Vec<String> = Vec::new();
         for chunk in ids.chunks(200) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT a.id FROM articles a JOIN feeds f ON f.id=a.feed_id
                  WHERE f.account_id=? AND a.unread=0 AND a.id IN ({placeholders})"
@@ -1558,10 +1552,12 @@ impl Database {
     }
 
     pub fn counts(&self) -> Result<Counts> {
-        let mut c = Counts::default();
-        c.unread = self.distinct_count("WHERE a.unread=1")?;
-        c.saved = self.distinct_count("WHERE a.saved=1")?;
-        c.total = self.distinct_count("")?;
+        let mut c = Counts {
+            unread: self.distinct_count("WHERE a.unread=1")?,
+            saved: self.distinct_count("WHERE a.saved=1")?,
+            total: self.distinct_count("")?,
+            ..Default::default()
+        };
         let mut stmt = self.conn.prepare(
             "SELECT feed_id, COUNT(DISTINCT id) FROM articles WHERE unread=1 GROUP BY feed_id",
         )?;
@@ -1876,7 +1872,7 @@ impl Database {
             .query_row(
                 "SELECT COALESCE(MAX(version),0) FROM schema_version",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
             .map_err(|e| StorageError::Schema(e.to_string()))?;
         let max_known = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
@@ -2823,7 +2819,7 @@ mod tests {
         assert_eq!(after[0].revision, 3);
         db.outbox_ack(&[(after[0].id, 3)]).unwrap();
         assert!(db.outbox_pending("acc", 10, 10).unwrap().is_empty());
-        assert!(db.outbox_has_pending("acc", "e1", "read").unwrap() == false);
+        assert!(!db.outbox_has_pending("acc", "e1", "read").unwrap());
     }
 
     #[test]
@@ -3096,7 +3092,6 @@ mod tests {
     #[test]
     fn alter_pull_ueberschreibt_keine_juengere_aenderung_eines_anderen_artikels() {
         let db = Database::open_in_memory().unwrap();
-        let acc = db.ensure_local_account().unwrap();
         db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
         let feed = db
             .add_feed("feedly-1", "u1", "Feed", None, "#111111")
@@ -3600,7 +3595,7 @@ mod tests {
             1,
             "bleibt sichtbar erhalten"
         );
-        assert_eq!(db.article_unsynced(feed, "e1").unwrap(), true);
+        assert!(db.article_unsynced(feed, "e1").unwrap());
     }
 
     #[test]
@@ -3722,7 +3717,6 @@ mod tests {
         .unwrap();
 
         let pull_gen = db.pull_generation(&remote).unwrap();
-        let pending = db.outbox_pending(&remote, now, 10).unwrap();
 
         db.apply_status_with_outbox(feed, "e1", Some(false), None)
             .unwrap();
@@ -4042,13 +4036,13 @@ mod tests {
             "vor der Migration existiert eine Sicherung: {backups:?}"
         );
         let conn =
-            Connection::open_with_flags(&dir.join(&backups[0]), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            Connection::open_with_flags(dir.join(&backups[0]), OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version),0) FROM schema_version",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
             .unwrap();
         assert_eq!(

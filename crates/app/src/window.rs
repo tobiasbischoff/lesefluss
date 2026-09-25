@@ -21,10 +21,6 @@ use std::time::Duration;
 use storage::{ArticleRow, Counts, FeedRow, Filter, GroupRow, Scope};
 use webkit6::prelude::*;
 
-fn now_ms_stub() -> i64 {
-    storage::now_ms()
-}
-
 pub fn dbg_log(msg: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var("LF_DEBUG").is_ok()) {
@@ -311,8 +307,7 @@ mod router_tests {
     /// Benutzeraktion → Undo → Redo.
     fn toggle(h: &mut StatusHistory, state: &mut bool) {
         let before = *state;
-        let mut batch: UndoBatch = Vec::new();
-        batch.push((1, "a".to_string(), before, false));
+        let batch: UndoBatch = vec![(1, "a".to_string(), before, false)];
         *state = !before;
         h.record_user(batch);
     }
@@ -323,7 +318,7 @@ mod router_tests {
         for (feed_id, id, unread, saved) in &batch {
             // Der Gegen-Batch nennt den Zustand **vor** der Aufhebung, also den,
             // den Redo später wiederherstellen soll.
-            redo.push((feed_id.clone(), id.clone(), *state, *saved));
+            redo.push((*feed_id, id.clone(), *state, *saved));
             *state = *unread;
         }
         h.push_redo(redo);
@@ -333,7 +328,7 @@ mod router_tests {
         let Some(batch) = h.pop_redo() else { return };
         let mut undo: UndoBatch = Vec::new();
         for (feed_id, id, unread, saved) in &batch {
-            undo.push((feed_id.clone(), id.clone(), *state, *saved));
+            undo.push((*feed_id, id.clone(), *state, *saved));
             *state = *unread;
         }
         h.push_undo(undo);
@@ -714,6 +709,34 @@ pub fn data_dir() -> std::path::PathBuf {
 
 const JS_CAPTURE_POS: &str = "(()=>{const g=document.querySelector('meta[name=lf-doc]');const gen=g?g.content:'-1';const els=document.querySelectorAll('article.lf-body > *');if(!els.length)return gen+':-1:0';const y=window.scrollY;let idx=0;for(let i=0;i<els.length;i++){const top=els[i].getBoundingClientRect().top+window.scrollY;if(top>y){idx=Math.max(0,i-1);break;}idx=i;}const el=els[idx];if(!el)return gen+':'+idx+':0';const off=y-(el.getBoundingClientRect().top+window.scrollY);return gen+':'+idx+':'+Math.round(off);})()";
 
+/// Fertige Medienergebnisse: Artikel (Feed, ID), Dokumentgeneration, Ersetzungen.
+pub type PendingMedia = ((i64, String), u64, Vec<(String, String)>);
+
+/// Arbeit, die aus einem Worker-Hintergrundthread im Hauptthread ausgeführt wird.
+pub type Job = Box<dyn FnOnce(&Rc<App>) + Send>;
+
+/// Ergebnis des Startabgleichs: Feeds, Gruppen, Zähler, lokaler und Feedly-Zeitpunkt.
+pub type BootstrapData = (
+    Vec<FeedRow>,
+    Vec<GroupRow>,
+    Counts,
+    Option<i64>,
+    Vec<(String, String, String)>,
+    i64,
+);
+pub type JobSender = std::sync::mpsc::Sender<Job>;
+/// Feeds, Gruppen, Zähler und Konten für die Sidebar.
+pub type AccountSnapshot = (
+    Vec<storage::FeedRow>,
+    Vec<storage::GroupRow>,
+    storage::Counts,
+    Vec<(String, String, String)>,
+);
+
+/// Leseposition samt Inhaltshash.
+pub type ReadPositionResult = (Option<(Option<String>, i64, i64)>, Option<String>);
+pub type JobReceiver = std::sync::mpsc::Receiver<Job>;
+
 /// Zusatzdaten eines Netzauftrags (z. B. Ziel-Feeds einer Serveraktion).
 #[derive(Clone, Default)]
 pub struct FeedlyParams {
@@ -735,7 +758,6 @@ pub enum TokenAction {
     /// Vom Coordinator bereits reservierter Folgelauf (nicht erneut anmelden).
     ReservedRun,
     MarkScopeServer,
-    Outbox,
     CheckConnect,
 }
 
@@ -783,12 +805,6 @@ impl StatusHistory {
         }
     }
 
-    pub fn record_counterpart(&mut self, batch: UndoBatch) {
-        if !batch.is_empty() {
-            self.undo.push(batch);
-        }
-    }
-
     pub fn pop_undo(&mut self) -> Option<UndoBatch> {
         self.undo.pop()
     }
@@ -809,10 +825,7 @@ impl StatusHistory {
         }
     }
 
-    pub fn undo_len(&self) -> usize {
-        self.undo.len()
-    }
-
+    #[cfg(test)]
     pub fn redo_len(&self) -> usize {
         self.redo.len()
     }
@@ -840,7 +853,6 @@ pub struct App {
     pub list_selection: gtk::SingleSelection,
     pub list_view: gtk::ListView,
     pub list_scroll: gtk::ScrolledWindow,
-    pub list_empty: adw::StatusPage,
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
     pub filter_saved: gtk::ToggleButton,
@@ -853,13 +865,12 @@ pub struct App {
     pub media: std::sync::Arc<provider_local::media::MediaCache>,
     pub prefs: RefCell<Prefs>,
     pub pending_db: RefCell<Vec<(Receiver<JobOut>, PendingCb)>>,
-    pub pending_media:
-        std::sync::Arc<std::sync::Mutex<Vec<((i64, String), u64, Vec<(String, String)>)>>>,
+    /// Fertige Medienergebnisse: Artikel (Feed, ID), Dokumentgeneration, Ersetzungen.
+    pub pending_media: std::sync::Arc<std::sync::Mutex<Vec<PendingMedia>>>,
     pub strings: crate::strings::Strings,
     pub focus_mode: Cell<bool>,
-    pub bg_jobs_tx: std::sync::mpsc::Sender<Box<dyn FnOnce(&Rc<App>) + Send>>,
-    pub bg_jobs_rx: std::sync::mpsc::Receiver<Box<dyn FnOnce(&Rc<App>) + Send>>,
-    pub drain_active: Cell<bool>,
+    pub bg_jobs_tx: JobSender,
+    pub bg_jobs_rx: JobReceiver,
     pub preview_timer: RefCell<Option<glib::SourceId>>,
     pub search_timer: RefCell<Option<glib::SourceId>>,
     pub read_gen: Cell<u64>,
@@ -918,18 +929,18 @@ impl App {
         primary_menu.append_section(None, &settings_section);
         let btn_hamburger = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
-            .tooltip_text(&st.get("Menü", "Menu"))
+            .tooltip_text(st.get("Menü", "Menu"))
             .menu_model(&primary_menu)
             .primary(true)
             .build();
         let btn_refresh = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text(&st.get("Aktualisieren (Strg+R)", "Refresh (Ctrl+R)"))
+            .tooltip_text(st.get("Aktualisieren (Strg+R)", "Refresh (Ctrl+R)"))
             .action_name("win.refresh")
             .build();
         let btn_add = gtk::Button::builder()
             .icon_name("list-add-symbolic")
-            .tooltip_text(&st.get("Feed hinzufügen (Strg+N)", "Add feed (Ctrl+N)"))
+            .tooltip_text(st.get("Feed hinzufügen (Strg+N)", "Add feed (Ctrl+N)"))
             .action_name("win.add-feed")
             .build();
         let sidebar_title =
@@ -969,8 +980,8 @@ impl App {
             .build();
         let list_empty = adw::StatusPage::builder()
             .icon_name("mailbox-symbolic")
-            .title(&st.get("Keine Artikel", "No articles"))
-            .description(&st.get(
+            .title(st.get("Keine Artikel", "No articles"))
+            .description(st.get(
                 "In dieser Ansicht ist gerade nichts los.",
                 "There is nothing in this view right now.",
             ))
@@ -1004,7 +1015,7 @@ impl App {
         let list_header = adw::HeaderBar::builder().title_widget(&list_title).build();
         let sort_button = gtk::Button::builder()
             .icon_name("view-sort-descending-symbolic")
-            .tooltip_text(&st.get(
+            .tooltip_text(st.get(
                 "Reihenfolge umkehren (Strg+Shift+P)",
                 "Reverse order (Ctrl+Shift+P)",
             ))
@@ -1139,7 +1150,6 @@ impl App {
             list_selection,
             list_view,
             list_scroll,
-            list_empty,
             search_bar,
             search_entry,
             filter_saved,
@@ -1163,7 +1173,6 @@ impl App {
             focus_mode: Cell::new(false),
             bg_jobs_tx: bg_jobs_tx.clone(),
             bg_jobs_rx,
-            drain_active: Cell::new(false),
             preview_timer: RefCell::new(None),
             search_timer: RefCell::new(None),
             read_gen: Cell::new(0),
@@ -1194,7 +1203,7 @@ impl App {
         app.install_sidebar_context_menu();
         {
             let w = app.weak();
-            app.window.connect_close_request(move |window| {
+            app.window.connect_close_request(move |_window| {
                 if let Some(app) = w.upgrade() {
                     app.save_layout();
                 }
@@ -1308,13 +1317,12 @@ impl App {
 
     fn handle_net_event(&self, ev: NetEvent) {
         match ev {
-            NetEvent::FetchStarted(_) => {}
-            NetEvent::FetchNotModified(_) => self.touch_last_sync(),
+            NetEvent::FetchStarted => {}
+            NetEvent::FetchNotModified => self.touch_last_sync(),
             NetEvent::FetchDone {
                 feed_id,
                 added,
                 title,
-                ..
             } => {
                 self.touch_last_sync();
                 let label = title.unwrap_or_else(|| format!("Feed {feed_id}"));
@@ -1329,12 +1337,12 @@ impl App {
                     self.reload_counts();
                 }
             }
-            NetEvent::FetchFailed { message, .. } => {
+            NetEvent::FetchFailed { message } => {
                 self.touch_last_sync();
                 self.show_toast(&format!("Abruf fehlgeschlagen: {message}"));
             }
-            NetEvent::DiscoveryDone { candidates, .. } => self.show_discovery_dialog(candidates),
-            NetEvent::DiscoveryFailed { message, .. } => {
+            NetEvent::DiscoveryDone { candidates } => self.show_discovery_dialog(candidates),
+            NetEvent::DiscoveryFailed { message } => {
                 self.show_toast(&format!("Kein Feed gefunden: {message}"));
             }
             NetEvent::FeedlySyncDone {
@@ -1529,15 +1537,7 @@ impl App {
                 };
                 Ok::<_, storage::StorageError>((feeds, groups, counts, last, accounts, feedly_last))
             },
-            move |app,
-                  res: storage::Result<(
-                Vec<FeedRow>,
-                Vec<GroupRow>,
-                Counts,
-                Option<i64>,
-                Vec<(String, String, String)>,
-                i64,
-            )>| {
+            move |app, res: storage::Result<BootstrapData>| {
                 let Ok((feeds, groups, counts, last, accounts, feedly_last)) = res else {
                     return;
                 };
@@ -1731,12 +1731,11 @@ impl App {
     pub fn sync_store(&self, append: bool) {
         let rows = self.state.borrow().rows.clone();
         self.suppress.set(true);
-        let mut existing = self.list_store.n_items() as usize;
+        let existing = self.list_store.n_items() as usize;
         if append {
             for r in rows.iter().skip(existing) {
                 self.list_store
                     .append(&glib::BoxedAnyObject::new(r.clone()));
-                existing += 1;
             }
         } else {
             while self.list_store.n_items() as usize > rows.len() {
@@ -1960,62 +1959,6 @@ impl App {
             .set_visible_child_name(if has { "list" } else { "empty" });
     }
 
-    fn rebind_row(&self, feed_id: i64, id: &str) {
-        let Some(pos) = self.state.borrow().row_pos(feed_id, id) else {
-            return;
-        };
-        let Some(obj) = self.list_store.item(pos as u32) else {
-            return;
-        };
-        self.suppress.set(true);
-        self.list_store.remove(pos as u32);
-        self.list_store.insert(pos as u32, &obj);
-        self.suppress.set(false);
-    }
-
-    fn remove_row(&self, feed_id: i64, id: &str) {
-        let Some(pos) = self.state.borrow().row_pos(feed_id, id) else {
-            return;
-        };
-        {
-            let mut st = self.state.borrow_mut();
-            st.rows.remove(pos);
-        }
-        self.suppress.set(true);
-        if self.selected_id().as_deref() == Some(id) {
-            let next = self
-                .state
-                .borrow()
-                .rows
-                .iter()
-                .enumerate()
-                .skip(pos)
-                .find_map(|(i, r)| match r {
-                    ListRow::Item(_) => Some(i),
-                    _ => None,
-                })
-                .or_else(|| {
-                    self.state
-                        .borrow()
-                        .rows
-                        .iter()
-                        .enumerate()
-                        .take(pos)
-                        .rev()
-                        .find_map(|(i, r)| match r {
-                            ListRow::Item(_) => Some(i),
-                            _ => None,
-                        })
-                });
-            if let Some(p) = next {
-                self.list_selection.set_selected(p as u32);
-            }
-        }
-        self.list_store.remove(pos as u32);
-        self.suppress.set(false);
-        self.update_list_empty_state();
-    }
-
     fn selected_id(&self) -> Option<String> {
         self.state.borrow().selected.clone().map(|(_, id)| id)
     }
@@ -2063,7 +2006,7 @@ impl App {
     fn source_context_menu(&self, source: Scope, anchor: &gtk::Widget) {
         let menu = gio::Menu::new();
         match source {
-            Scope::Feed(feed_id) => {
+            Scope::Feed(_) => {
                 menu.append(Some("Umbenennen …"), Some("win.rename-feed"));
                 menu.append(Some("Gruppen …"), Some("win.edit-feed-groups"));
                 menu.append(Some("Als gelesen markieren"), Some("win.mark-source-read"));
@@ -2093,7 +2036,7 @@ impl App {
         popover.set_has_arrow(false);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(0, 0, 0, 0)));
         self.state.borrow_mut().menu_source = Some(source);
-        popover.show();
+        popover.popup();
     }
 
     /// Rechtsklick, Menütaste und `Shift+F10` öffnen dasselbe Menü (§5.1).
@@ -2766,9 +2709,6 @@ impl App {
                         })
                             as Box<dyn FnOnce(&Rc<App>) + Send>);
                     }
-                    Err(_) => {
-                        eprintln!("[lf] Datenbank-Worker antwortet nicht");
-                    }
                 }
             }
         });
@@ -3356,7 +3296,7 @@ impl App {
                 let hash = db.content_hash(row.feed_id, &row.id)?;
                 Ok::<_, storage::StorageError>((pos, hash))
             },
-            move |app, res: storage::Result<(Option<(Option<String>, i64, i64)>, Option<String>)>| {
+            move |app, res: storage::Result<ReadPositionResult>| {
                 let Ok((pos, hash)) = res else { return };
                 let Some((saved_hash, idx, off)) = pos else { return };
                 if saved_hash.is_some() && saved_hash != hash {
@@ -3498,13 +3438,27 @@ impl App {
     /// danach wieder im Hauptthread.
     fn with_token(&self, action: TokenAction) {
         let tx = self.bg_jobs_tx.clone();
+        let expected = self.account_id_of_kind("feedly");
         std::thread::Builder::new()
             .name("lf-keyring".into())
             .spawn(move || {
                 let token = feedly_sync::token_from_disk();
-                let _ = tx.send(Box::new(move |app: &Rc<App>| match token {
-                    Some(token) => app.run_token_action(action, token),
-                    None => app.run_token_action_without_token(action),
+                let bound = feedly_sync::keyring_account();
+                let _ = tx.send(Box::new(move |app: &Rc<App>| {
+                    // Ein Token eines anderen Profils darf nicht mit der Outbox des
+                    // aktiven Kontos kombiniert werden.
+                    if let (Some(_), Some(account)) = (&token, expected.clone()) {
+                        if !feedly_sync::token_matches_account(bound.as_deref(), &account) {
+                            app.show_toast(
+                                "Feedly: gespeichertes Token gehört zu einem anderen Konto — bitte neu verbinden",
+                            );
+                            return;
+                        }
+                    }
+                    match token {
+                        Some(token) => app.run_token_action(action, token),
+                        None => app.run_token_action_without_token(action),
+                    }
                 }) as Box<dyn FnOnce(&Rc<App>) + Send>);
             })
             .ok();
@@ -3543,16 +3497,6 @@ impl App {
                 }
             }
             TokenAction::MarkScopeServer => self.mark_scope_server_with(token),
-            TokenAction::Outbox => {
-                if let Some(id) = self.account_id_of_kind("feedly") {
-                    self.request_feedly_job(
-                        sync_engine::Job::Outbox,
-                        id,
-                        token,
-                        FeedlyParams::default(),
-                    );
-                }
-            }
             TokenAction::ReservedRun => {
                 // Der Coordinator hat diesen Lauf bereits reserviert. Er wird direkt
                 // gestartet; eine erneute Anmeldung würde ihn nur wieder vormerken.
@@ -3597,19 +3541,6 @@ impl App {
             Some(run) => run.account_id == account_id && run.run_id == run_id,
             None => false,
         }
-    }
-
-    /// Bricht laufende Arbeit ab (Logout, Auth- oder Quotenstopp).
-    pub fn cancel_feedly_run(&self, account_id: &str) {
-        let mut st = self.state.borrow_mut();
-        if let Some(run) = &st.active_feedly_run {
-            if run.account_id == account_id {
-                run.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        st.active_feedly_run = None;
-        st.coordinator.set_now(now_ms());
-        st.coordinator.stop_running(account_id);
     }
 
     fn request_feedly_job(
@@ -4011,7 +3942,7 @@ impl App {
             },
             move |app, res| {
                 let Ok((status, stuck)) = res else { return };
-                let mut entry = status.map(|(s, d)| (s, d));
+                let mut entry = status;
                 if let Some((s, d)) = entry.as_mut() {
                     if stuck > 0 && *s == "ready" {
                         *s = "degraded".to_string();
@@ -4040,13 +3971,7 @@ impl App {
                     db.list_accounts()?,
                 ))
             },
-            move |app,
-                  res: storage::Result<(
-                Vec<storage::FeedRow>,
-                Vec<storage::GroupRow>,
-                storage::Counts,
-                Vec<(String, String, String)>,
-            )>| {
+            move |app, res: storage::Result<AccountSnapshot>| {
                 let Ok((feeds, groups, counts, accounts)) = res else {
                     return;
                 };
@@ -4173,7 +4098,7 @@ impl App {
             let row = gtk::ListBoxRow::builder()
                 .child(
                     &gtk::Label::builder()
-                        .label(&format!("{} — {}", c.title, c.url))
+                        .label(format!("{} — {}", c.title, c.url))
                         .xalign(0.0)
                         .margin_start(8)
                         .margin_end(8)

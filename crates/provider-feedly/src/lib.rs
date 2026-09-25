@@ -504,7 +504,7 @@ fn storage_now_ms() -> i64 {
 pub fn parse_retry_after(value: Option<&str>, now_ms: i64) -> Option<i64> {
     let raw = value?.trim();
     if let Ok(seconds) = raw.parse::<i64>() {
-        return Some((now_ms + seconds.clamp(1, 86_400) * 1000).min(i64::MAX));
+        return Some(now_ms + seconds.clamp(1, 86_400) * 1000);
     }
     None
 }
@@ -613,6 +613,7 @@ mod tests {
         assert!(p.into_result().is_ok());
     }
 
+    #[test]
     fn pager_stops_on_cursor_cycles() {
         let mut p = Pager::new();
         assert_eq!(p.after_page(Some("a"), 10, 50), PageAction::Continue);
@@ -622,6 +623,7 @@ mod tests {
         assert!(err.to_string().contains("Zyklus"), "{err}");
     }
 
+    #[test]
     fn pager_reports_safety_limit_as_incomplete() {
         let mut p = Pager::new();
         assert_eq!(p.after_page(Some("c0"), 10, 3), PageAction::Continue);
@@ -631,6 +633,7 @@ mod tests {
         assert!(err.to_string().contains("Sicherheitslimit"), "{err}");
     }
 
+    #[test]
     fn pager_without_any_page_is_not_success() {
         let p = Pager::new();
         assert!(!p.started());
@@ -638,6 +641,7 @@ mod tests {
         assert!(err.to_string().contains("unvollständig"), "{err}");
     }
 
+    #[test]
     fn empty_json_is_not_a_valid_inventory() {
         assert!(serde_json::from_str::<IdsPage>("{}").is_err(), "ids fehlen");
         assert!(serde_json::from_str::<IdsPage>(r#"{"ids":[]}"#).is_ok());

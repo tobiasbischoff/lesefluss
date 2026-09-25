@@ -338,7 +338,6 @@ impl App {
             }
         });
         let w = self.weak();
-        let w = self.weak();
         block_images.connect_active_notify(move |row| {
             if let Some(app) = w.upgrade() {
                 app.prefs.borrow_mut().block_images = row.is_active();

@@ -27,7 +27,8 @@ jobs:
         run: |
           pkg-config --exists gtk4 && echo "gtk4 ok"
           pkg-config --exists libadwaita-1 && echo "libadwaita ok"
-          pkg-config --exists webkit6gtk-4.1 && echo "webkitgtk-6.0 ok"
+          # Das Paket webkitgtk-6.0 liefert genau diese .pc-Datei.
+          pkg-config --exists webkitgtk-6.0 && echo "webkitgtk-6.0 ok"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
@@ -36,12 +37,21 @@ jobs:
         run: cargo build --workspace --locked
       - name: Tests
         run: cargo test --workspace --locked
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked
+      - name: Clippy (streng)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Formatierung
         run: cargo fmt --all -- --check
+      # makepkg darf nicht als root laufen: eigener Benutzer, eigener Cache,
+      # Ausgabe in einem beschreibbaren Verzeichnis.
       - name: Installationspaket
         run: |
-          cd packaging
-          makepkg -f --noconfirm --nodeps
-          ls -l ./*.pkg.tar.zst
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c '
+            export CARGO_HOME=$HOME/.cargo
+            export XDG_CACHE_HOME=$HOME/.cache
+            mkdir -p "$XDG_CACHE_HOME" packaging/out
+            cd packaging
+            makepkg -f --noconfirm --nodeps --logdir="$HOME/makepkg-logs"
+            ls -l ./*.pkg.tar.zst
+          '

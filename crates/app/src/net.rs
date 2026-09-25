@@ -6,7 +6,6 @@ use std::time::Duration;
 use storage::{FetchState, NewArticle};
 use tokio::sync::Semaphore;
 
-pub const BASE_INTERVAL_MS: i64 = 30 * 60 * 1000;
 pub const MIN_INTERVAL_MS: i64 = 5 * 60 * 1000;
 pub const MAX_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -17,25 +16,20 @@ pub fn interval_from_minutes(minutes: i64) -> i64 {
 
 #[derive(Clone, Debug)]
 pub enum NetEvent {
-    FetchStarted(i64),
+    FetchStarted,
     FetchDone {
         feed_id: i64,
         added: usize,
-        updated: usize,
         title: Option<String>,
-        website: Option<String>,
     },
-    FetchNotModified(i64),
+    FetchNotModified,
     FetchFailed {
-        feed_id: i64,
         message: String,
     },
     DiscoveryDone {
-        input: String,
         candidates: Vec<DiscoverCandidate>,
     },
     DiscoveryFailed {
-        input: String,
         message: String,
     },
     /// Ein Lauf meldet genau einen Abschluss. Konto und Laufkennung erlauben es,
@@ -160,10 +154,6 @@ impl Net {
         });
     }
 
-    pub fn event(&self, ev: NetEvent) {
-        let _ = self.tx.send(ev);
-    }
-
     pub fn event_sender(&self) -> std::sync::mpsc::Sender<NetEvent> {
         self.tx.clone()
     }
@@ -193,11 +183,10 @@ impl Net {
         handle.spawn(async move {
             match provider_local::discover(&http, &input).await {
                 Ok(candidates) => {
-                    let _ = tx.send(NetEvent::DiscoveryDone { input, candidates });
+                    let _ = tx.send(NetEvent::DiscoveryDone { candidates });
                 }
                 Err(e) => {
                     let _ = tx.send(NetEvent::DiscoveryFailed {
-                        input,
                         message: e.to_string(),
                     });
                 }
@@ -250,7 +239,7 @@ async fn fetch_and_store(
     force: bool,
     base_interval_ms: i64,
 ) {
-    let _ = tx.send(NetEvent::FetchStarted(feed_id));
+    let _ = tx.send(NetEvent::FetchStarted);
     let host = url::Url::parse(&url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
@@ -306,7 +295,7 @@ async fn fetch_and_store(
                 )
             })
             .await;
-            let _ = tx.send(NetEvent::FetchNotModified(feed_id));
+            let _ = tx.send(NetEvent::FetchNotModified);
         }
         Ok(FetchOutcome::Fetched {
             bytes,
@@ -353,7 +342,6 @@ async fn fetch_and_store(
                         })
                         .collect();
                     let title = pf.title.clone();
-                    let website = pf.website.clone();
                     let final_url2 = final_url.clone();
                     let res = db_call(&worker, move |db| {
                         let up = db.upsert_articles(feed_id, &items, now)?;
@@ -379,24 +367,20 @@ async fn fetch_and_store(
                     })
                     .await;
                     match res {
-                        Some(Ok((added, updated))) => {
+                        Some(Ok((added, _updated))) => {
                             let _ = tx.send(NetEvent::FetchDone {
                                 feed_id,
                                 added,
-                                updated,
                                 title,
-                                website,
                             });
                         }
                         Some(Err(e)) => {
                             let _ = tx.send(NetEvent::FetchFailed {
-                                feed_id,
                                 message: e.to_string(),
                             });
                         }
                         None => {
                             let _ = tx.send(NetEvent::FetchFailed {
-                                feed_id,
                                 message: "db".into(),
                             });
                         }
@@ -425,5 +409,5 @@ async fn fail(
         db.update_fetch_error(feed_id, errors, &msg2, next, now)
     })
     .await;
-    let _ = tx.send(NetEvent::FetchFailed { feed_id, message });
+    let _ = tx.send(NetEvent::FetchFailed { message });
 }

@@ -143,7 +143,7 @@ fn initial_thumb(initial: &str, accent: &str) -> gtk::Widget {
         .build();
     let label = gtk::Label::builder()
         .use_markup(true)
-        .label(&format!(
+        .label(format!(
             "<span size=\"18000\" weight=\"bold\" foreground=\"{accent}\">{}</span>",
             glib::markup_escape_text(initial)
         ))
@@ -168,7 +168,7 @@ fn article_row(a: &ArticleRow, thumbs: bool) -> (gtk::Box, RowHandles) {
     let meta_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let meta = gtk::Label::builder()
         .use_markup(true)
-        .label(&meta_markup(a))
+        .label(meta_markup(a))
         .css_classes(vec![if a.unread {
             "lf-article-meta".to_string()
         } else {

@@ -187,6 +187,66 @@ pub fn apply_pending_restore(dir: &std::path::Path) -> Result<Option<String>, St
     ))
 }
 
+fn main() -> gtk::glib::ExitCode {
+    let t0 = std::time::Instant::now();
+    let dir = window::data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let app = adw::Application::builder()
+        .application_id("io.github.PROJEKTINHABER.Lesefluss")
+        .build();
+    // Erst die Einzelinstanz behaupten: ein Zweitstart darf die Datenbank einer
+    // laufenden Instanz weder lesen noch ersetzen.
+    if let Err(_already_running) = app.register(gio::Cancellable::NONE) {
+        app.activate();
+        return gtk::glib::ExitCode::SUCCESS;
+    }
+    let _library_lock = match LibraryLock::acquire(&dir) {
+        Ok(lock) => lock,
+        Err(msg) => {
+            eprintln!("[lf] {msg}");
+            return gtk::glib::ExitCode::FAILURE;
+        }
+    };
+    let db_path = dir.join("library.db");
+    let restore_notice: Option<String> = match apply_pending_restore(&dir) {
+        Ok(Some(msg)) => Some(msg),
+        Ok(None) => None,
+        Err(msg) => {
+            eprintln!("[lf] {msg}");
+            Some(msg)
+        }
+    };
+    let worker = dbworker::DbWorker::start(db_path);
+    let net = Rc::new(net::Net::start());
+    net.spawn_scheduler(worker.clone());
+
+    let worker2 = worker.clone();
+    let net2 = Rc::clone(&net);
+    app.connect_activate(move |a| {
+        let t0 = t0;
+        let restore_notice = restore_notice.clone();
+        INSTANCE.with(|slot| {
+            if slot.borrow().is_none() {
+                let instance = window::App::new(a, worker2.clone(), Rc::clone(&net2));
+                if let Some(msg) = restore_notice.clone() {
+                    instance.show_toast(&msg);
+                }
+                if let Some(err) = worker2.failure.lock().ok().and_then(|f| f.clone()) {
+                    instance.show_toast(&format!("Datenbank nicht geöffnet: {err}"));
+                }
+                glib::idle_add_local(move || {
+                    window::dbg_log(&format!("startup-ready {} ms", t0.elapsed().as_millis()));
+                    glib::ControlFlow::Break
+                });
+                *slot.borrow_mut() = Some(instance);
+            } else if let Some(existing) = slot.borrow().as_ref() {
+                existing.window.present();
+            }
+        });
+    });
+    app.run()
+}
+
 #[cfg(test)]
 mod restore_tests {
     use super::*;
@@ -501,64 +561,4 @@ mod restore_tests {
         drop(_lock);
         assert!(apply_pending_restore(&dir).unwrap().is_some());
     }
-}
-
-fn main() -> gtk::glib::ExitCode {
-    let t0 = std::time::Instant::now();
-    let dir = window::data_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let app = adw::Application::builder()
-        .application_id("io.github.PROJEKTINHABER.Lesefluss")
-        .build();
-    // Erst die Einzelinstanz behaupten: ein Zweitstart darf die Datenbank einer
-    // laufenden Instanz weder lesen noch ersetzen.
-    if let Err(_already_running) = app.register(gio::Cancellable::NONE) {
-        app.activate();
-        return gtk::glib::ExitCode::SUCCESS;
-    }
-    let _library_lock = match LibraryLock::acquire(&dir) {
-        Ok(lock) => lock,
-        Err(msg) => {
-            eprintln!("[lf] {msg}");
-            return gtk::glib::ExitCode::FAILURE;
-        }
-    };
-    let db_path = dir.join("library.db");
-    let restore_notice: Option<String> = match apply_pending_restore(&dir) {
-        Ok(Some(msg)) => Some(msg),
-        Ok(None) => None,
-        Err(msg) => {
-            eprintln!("[lf] {msg}");
-            Some(msg)
-        }
-    };
-    let worker = dbworker::DbWorker::start(db_path);
-    let net = Rc::new(net::Net::start());
-    net.spawn_scheduler(worker.clone());
-
-    let worker2 = worker.clone();
-    let net2 = Rc::clone(&net);
-    app.connect_activate(move |a| {
-        let t0 = t0;
-        let restore_notice = restore_notice.clone();
-        INSTANCE.with(|slot| {
-            if slot.borrow().is_none() {
-                let instance = window::App::new(a, worker2.clone(), Rc::clone(&net2));
-                if let Some(msg) = restore_notice.clone() {
-                    instance.show_toast(&msg);
-                }
-                if let Some(err) = worker2.failure.lock().ok().and_then(|f| f.clone()) {
-                    instance.show_toast(&format!("Datenbank nicht geöffnet: {err}"));
-                }
-                glib::idle_add_local(move || {
-                    window::dbg_log(&format!("startup-ready {} ms", t0.elapsed().as_millis()));
-                    glib::ControlFlow::Break
-                });
-                *slot.borrow_mut() = Some(instance);
-            } else if let Some(existing) = slot.borrow().as_ref() {
-                existing.window.present();
-            }
-        });
-    });
-    app.run()
 }

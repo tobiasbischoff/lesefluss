@@ -105,23 +105,4 @@ impl Prefs {
         }
         p
     }
-
-    pub fn store(&self, set: &dyn Fn(&str, &str)) {
-        set("auto_read", if self.auto_read { "1" } else { "0" });
-        set("compact", if self.compact { "1" } else { "0" });
-        set("thumbs", if self.thumbs { "1" } else { "0" });
-        set("reader_font", &self.reader_font.to_string());
-        set("reader_measure", &self.reader_measure.to_string());
-        set("reader_line_height", &self.reader_line_height.to_string());
-        set("theme", &self.theme);
-        set("newest_first", if self.newest_first { "1" } else { "0" });
-        set(
-            "letter_shortcuts",
-            if self.letter_shortcuts { "1" } else { "0" },
-        );
-        set("refresh_min", &self.refresh_min.to_string());
-        set("retention_days", &self.retention_days.to_string());
-        set("media_mb", &self.media_mb.to_string());
-        set("block_images", if self.block_images { "1" } else { "0" });
-    }
 }

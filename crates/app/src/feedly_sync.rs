@@ -25,6 +25,7 @@ impl RunCtx {
         }
     }
 
+    #[cfg(test)]
     pub fn with_base(mut self, base: &str) -> Self {
         self.base = Some(base.to_string());
         self
@@ -145,9 +146,6 @@ fn secret_tool_lookup(args: &[&str], stdin_data: Option<&[u8]>) -> Option<String
     }
 }
 
-/// **Schreiben/Löschen**: hier zählt nur der Exit-Status. `secret-tool store`
-/// gibt absichtlich nichts auf stdout aus; ein leerer Text wäre kein Fehlschlag.
-
 /// Der Schlüsselbund-Eintrag ist an das bestätigte Profil gebunden, damit ein
 /// Token nicht versehentlich mit der Outbox eines anderen Kontos gekoppelt wird.
 pub fn keyring_account() -> Option<String> {
@@ -191,7 +189,7 @@ pub fn forget_token_at_with(path: &std::path::Path, program: &std::path::Path) -
         }
     }
     if path.exists() {
-        match std::fs::remove_file(&path) {
+        match std::fs::remove_file(path) {
             Ok(()) => removed = true,
             Err(e) => eprintln!("[lf] Token-Datei konnte nicht entfernt werden: {e}"),
         }
@@ -244,15 +242,6 @@ pub fn token_matches_account(bound: Option<&str>, account_id: &str) -> bool {
     }
 }
 
-/// Liest das Token ohne den GTK-Thread zu blockieren:
-/// Datei- und Schlüsselbundzugriff laufen in einem Worker.
-pub async fn token_from_disk_async() -> Option<String> {
-    tokio::task::spawn_blocking(token_from_disk)
-        .await
-        .ok()
-        .flatten()
-}
-
 pub fn token_from_disk() -> Option<String> {
     if let Some(t) = keyring_lookup() {
         return Some(t);
@@ -269,6 +258,7 @@ pub fn token_from_disk() -> Option<String> {
 }
 
 /// Wie `save_token`, aber mit wählbarem Keyring-Programm (Tests).
+#[cfg(test)]
 pub fn save_token_at(
     path: &std::path::Path,
     token: &str,
@@ -365,6 +355,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Blockierender DB-Zugriff (Tests, die kein Laufzeitkontext brauchen).
+#[cfg(test)]
 fn db_blocking<T, F>(worker: &DbWorker, f: F) -> T
 where
     T: Send + 'static,
@@ -420,15 +411,19 @@ fn entry_to_new_article(e: &pf::Entry) -> storage::NewArticle {
     }
 }
 
+/// Pro Feed zusammengefasste Artikel einer Inhaltsseite.
+type FeedBatch = std::collections::HashMap<i64, Vec<storage::NewArticle>>;
+/// Pro Feed: Artikel-ID und ihre Bildquellen.
+type MediaBatch = Vec<(i64, Vec<(String, Vec<String>)>)>;
+
 async fn ingest_entries(
     worker: &DbWorker,
     account_id: &str,
     generation: i64,
     entries: Vec<pf::Entry>,
 ) -> Result<usize, String> {
-    let mut per_feed: std::collections::HashMap<i64, Vec<storage::NewArticle>> =
-        std::collections::HashMap::new();
-    let mut per_feed_media: Vec<(i64, Vec<(String, Vec<String>)>)> = Vec::new();
+    let mut per_feed: FeedBatch = std::collections::HashMap::new();
+    let mut per_feed_media: MediaBatch = Vec::new();
     let mut statuses: Vec<(String, bool, bool)> = Vec::new();
     for e in &entries {
         let Some(stream) = e.feed_stream_id() else {
@@ -554,13 +549,16 @@ where
 {
     let mut pager = pf::Pager::new();
     let mut continuation: Option<String> = None;
+    // Der Serverstand der **ersten** Seite ist der Checkpoint der Phase.
     let mut checkpoint: Option<i64> = None;
     loop {
         let page = client
             .stream_contents(stream, 100, continuation.as_deref(), newer_than, false)
             .await
             .map_err(io_err)?;
-        checkpoint = page.updated;
+        if checkpoint.is_none() {
+            checkpoint = page.updated;
+        }
         on_page(page.items.clone()).await.map_err(string_err)?;
         match pager.after_page(page.continuation.as_deref(), page.items.len(), max_pages) {
             pf::PageAction::Continue => {
@@ -880,6 +878,7 @@ pub async fn load_contents(
 }
 
 /// Lädt fehlende Inhalte gespeicherter oder ungelesener Artikel per `.mget` nach.
+#[cfg(test)]
 pub async fn load_missing_contents(
     worker: &DbWorker,
     client: &pf::FeedlyClient,
@@ -1093,10 +1092,10 @@ pub fn mark_feeds_server_side(
         let client = pf::FeedlyClient::with_base(token, ctx.base());
         match client.markers_feeds("markAsRead", &remote_feed_ids).await {
             Ok(()) => {
-                db(&worker, move |db2| {
-                    db2.mark_feeds_read(&local_feed_ids);
-                })
-                .await;
+                let marked = db(&worker, move |db2| sr(db2.mark_feeds_read(&local_feed_ids))).await;
+                if let Err(e) = marked {
+                    eprintln!("[lf] lokale Zähler konnten nicht nachgezogen werden: {e}");
+                }
                 let _ = tx.send(crate::net::NetEvent::FeedlySyncDone {
                     account_id: ctx.account_id.clone(),
                     run_id: ctx.run_id,
@@ -1121,6 +1120,9 @@ pub fn mark_feeds_server_side(
     });
 }
 
+/// Nach Feld und Sollzustand gruppierte Outbox-Zeilen: (Zeilen-ID, Revision, Artikel).
+type OutboxGroups = std::collections::HashMap<(String, bool), Vec<(i64, i64, String)>>;
+
 pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
     let account_id = ctx.account_id.clone();
     let tx = net.event_sender();
@@ -1138,7 +1140,7 @@ pub fn process_outbox(worker: DbWorker, net: &Net, token: String, ctx: RunCtx) {
         if rows.is_empty() {
             return;
         }
-        let mut groups: std::collections::HashMap<(String, bool), Vec<(i64, i64, String)>> = std::collections::HashMap::new();
+        let mut groups: OutboxGroups = std::collections::HashMap::new();
         for r in &rows {
             groups
                 .entry((r.field.clone(), r.desired))
@@ -1486,45 +1488,6 @@ pub fn delta_sync(
     });
 }
 
-pub fn classify_storage(error: &storage::StorageError) -> (&'static str, Option<String>) {
-    match error {
-        storage::StorageError::Schema(msg) if msg.contains("429") => ("rate_limited", None),
-        storage::StorageError::Schema(msg)
-            if msg.contains("api 401") || msg.contains("api 403") =>
-        {
-            (
-                "auth_required",
-                Some("Anmeldung erforderlich — bitte neu verbinden".into()),
-            )
-        }
-        storage::StorageError::Io(_) => ("offline", None),
-        _ => ("degraded", None),
-    }
-}
-
-pub fn classify(error: &pf::FeedlyError) -> (&'static str, Option<String>) {
-    match error {
-        pf::FeedlyError::Api { status: 401, .. } | pf::FeedlyError::Api { status: 403, .. } => (
-            "auth_required",
-            Some("Anmeldung erforderlich — bitte neu verbinden".into()),
-        ),
-        pf::FeedlyError::Api {
-            status: 429,
-            message,
-            ..
-        } => (
-            "rate_limited",
-            Some(format!("Drosselung durch Feedly: {message}")),
-        ),
-        pf::FeedlyError::Api { status: 404, .. } => (
-            "degraded",
-            Some("Einige Objekte sind nicht mehr verfügbar".into()),
-        ),
-        pf::FeedlyError::Http(_) => ("offline", None),
-        _ => ("degraded", None),
-    }
-}
-
 fn string_err(e: String) -> SyncFailure {
     SyncFailure::new(e, None, None)
 }
@@ -1710,7 +1673,7 @@ mod r1_regression {
         // Pull beginnt: Generation 0, weil noch keine Outbox-Mutation existiert.
         let pull_gen = 0i64;
         // Danach ändert die Person den Artikel lokal.
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             db.apply_status_with_outbox(1, "neu", Some(true), Some(true))
                 .unwrap();
         })
@@ -1800,7 +1763,7 @@ mod r1_regression {
                 (404, "{}".to_string())
             }
         });
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             db.raw()
                 .execute(
                     "UPDATE feeds SET remote_id='feed/https://example.org/feed.xml' WHERE account_id='feedly-1'",
@@ -2304,7 +2267,7 @@ mod read_sync_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("library.db");
         let worker = DbWorker::start(path.clone());
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             db.upsert_account("feedly-1", "feedly", "Feedly").unwrap();
             Ok::<_, storage::StorageError>(())
         })
@@ -2317,7 +2280,7 @@ mod read_sync_tests {
     #[tokio::test]
     async fn remote_wieder_ungelesen_wird_lokal_ungelesen() {
         let (worker, path) = worker_with_feedly("neu-unread").await;
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             let feed = db
                 .add_feed("feedly-1", "u1", "Feed", None, "#111111")
                 .unwrap();
@@ -2343,14 +2306,14 @@ mod read_sync_tests {
         })
         .await;
         assert_eq!(unread, 1, "remote ungelesen wird lokal wieder ungelesen");
-        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Eine neuere lokale Änderung bleibt auch in der zweiten Richtung erhalten.
     #[tokio::test]
     async fn neuere_lokale_aenderung_gewinnt_gegen_die_zweite_richtung() {
         let (worker, path) = worker_with_feedly("neu-unread-guard").await;
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             let feed = db
                 .add_feed("feedly-1", "u1", "Feed", None, "#111111")
                 .unwrap();
@@ -2365,7 +2328,7 @@ mod read_sync_tests {
         .await;
         // Generation 0: danach wird lokal eine neue Absicht erzeugt.
         let pull_gen = db(&worker, |db| db.pull_generation("feedly-1").unwrap()).await;
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             let feed = db
                 .raw()
                 .query_row(
@@ -2383,7 +2346,7 @@ mod read_sync_tests {
         let _ = reconcile_unread(&worker, "feedly-1", &inventory, pull_gen)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A4: Unbekannte IDs aus dem Saved-Inventar werden per `.mget` nachgeladen,
@@ -2443,7 +2406,7 @@ mod read_sync_tests {
         .await;
         assert_eq!(count, 1, "der Artikel wurde angelegt");
         assert_eq!(active, 0, "die nicht abonnierte Quelle bleibt inaktiv");
-        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Abo-Abgleich: entfernte Quellen werden deaktiviert, gespeicherte Artikel
@@ -2451,7 +2414,7 @@ mod read_sync_tests {
     #[tokio::test]
     async fn abgleich_deaktiviert_entfernte_quellen_nicht_gespeichertes() {
         let (worker, path) = worker_with_feedly("abos").await;
-        db(&worker, |db| {
+        let _ = db(&worker, |db| {
             let feed = db
                 .add_feed("feedly-1", "u1", "Bleibt", None, "#111111")
                 .unwrap();
@@ -2502,7 +2465,7 @@ mod read_sync_tests {
         .await;
         assert_eq!(active, 0, "entfernte Quelle ist inaktiv");
         assert_eq!(saved, 1, "gespeicherte Artikel bleiben erhalten");
-        let _ = std::fs::remove_dir_all(&path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
 
@@ -2623,9 +2586,7 @@ mod delta_e2e_tests {
                     }])
                     .to_string(),
                 )
-            } else if req.contains("subscriptions") {
-                (200, "[]".to_string())
-            } else if req.contains("categories") {
+            } else if req.contains("subscriptions") || req.contains("categories") {
                 (200, "[]".to_string())
             } else {
                 (404, "{}".to_string())

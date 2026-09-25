@@ -30,7 +30,6 @@ pub struct UiState {
     pub loading_more: bool,
     pub unread_guard: HashSet<String>,
     pub last_opened: HashMap<(Scope, Filter), (i64, String)>,
-    pub fetching: HashSet<i64>,
     pub menu_source: Option<storage::Scope>,
     pub pending_new_articles: usize,
     pub feedly_status: Option<(String, Option<String>)>,
@@ -61,7 +60,6 @@ impl Default for UiState {
             loading_more: false,
             unread_guard: HashSet::new(),
             last_opened: HashMap::new(),
-            fetching: HashSet::new(),
             menu_source: None,
             pending_new_articles: 0,
             feedly_status: None,
@@ -71,22 +69,11 @@ impl Default for UiState {
     }
 }
 
-/// Logischer Schlüssel eines Artikels: Feed plus ID, nicht die ID allein.
-pub type ArticleKey = (i64, String);
-
 pub fn cursor_of(a: ArticleRow) -> (i64, i64, String) {
     (a.sort_ms, a.feed_id, a.id)
 }
 
 impl UiState {
-    pub fn effective_scope(&self) -> Option<Scope> {
-        if self.search.is_some() {
-            None
-        } else {
-            Some(self.scope.clone())
-        }
-    }
-
     fn push_rows(&mut self, articles: Vec<ArticleRow>) {
         let mut last_day = self.rows.iter().rev().find_map(|r| match r {
             ListRow::Header { key, .. } => Some(key.clone()),
@@ -182,11 +169,6 @@ impl UiState {
                 }
             }
         }
-    }
-
-    pub fn last_sync_for_feedly(&self) -> i64 {
-        self.last_sync
-            .unwrap_or(storage::now_ms() - 30 * 86_400_000)
     }
 
     pub fn feed_unread(&self, feed_id: i64) -> i64 {

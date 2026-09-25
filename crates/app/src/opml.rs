@@ -234,7 +234,7 @@ mod tests {
                 <outline type="rss" text="Feed in Gruppe" xmlUrl="https://b.example/feed.xml"></outline>
             </outline>
         </body></opml>"#;
-        let draft = parse_opml(&xml).expect("parse");
+        let draft = parse_opml(xml).expect("parse");
         assert_eq!(draft.feeds.len(), 2);
         assert!(
             draft.feeds[0].groups.is_empty(),
@@ -252,7 +252,7 @@ mod tests {
                 <outline type="rss" text="Zweiter" xmlUrl="https://b.example/feed.xml"/>
             </outline>
         </body></opml>"#;
-        let draft = parse_opml(&xml).expect("parse");
+        let draft = parse_opml(xml).expect("parse");
         assert_eq!(draft.feeds.len(), 2);
         assert!(
             draft.feeds[0].groups.is_empty(),
@@ -266,7 +266,7 @@ mod tests {
         let deep: String = (0..40)
             .map(|i| format!("<outline text=\"E{i}\">"))
             .collect::<String>()
-            + &"<outline type=\"rss\" text=\"F\" xmlUrl=\"https://x.example/f.xml\"/>".to_string()
+            + "<outline type=\"rss\" text=\"F\" xmlUrl=\"https://x.example/f.xml\"/>"
             + &"</outline>".repeat(40);
         let xml = format!("<opml version=\"2.0\"><body>{deep}</body></opml>");
         let err = parse_opml(&xml).unwrap_err();
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn feed_without_name_falls_back_to_host_and_unnamed_group_is_reported() {
         let xml = r#"<opml version="2.0"><body><outline xmlUrl="https://a.example/feed.xml"/></body></opml>"#;
-        let draft = parse_opml(&xml).expect("parse");
+        let draft = parse_opml(xml).expect("parse");
         assert_eq!(draft.feeds.len(), 1);
         assert_eq!(draft.feeds[0].title, "a.example");
         assert!(
@@ -293,7 +293,7 @@ mod tests {
         );
 
         let xml = r#"<opml version="2.0"><body><outline><outline type="rss" text="F" xmlUrl="https://a.example/f.xml"/></outline></body></opml>"#;
-        let draft = parse_opml(&xml).expect("parse");
+        let draft = parse_opml(xml).expect("parse");
         assert!(
             draft.errors.iter().any(|e| e.contains("ohne Namen")),
             "{:?}",

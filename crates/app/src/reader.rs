@@ -18,7 +18,6 @@ document.addEventListener('lf-media', function (event) {
 "#;
 
 pub struct ReaderPane {
-    pub loading: adw::StatusPage,
     pub toolbar: adw::ToolbarView,
     pub header: adw::HeaderBar,
     pub title: adw::WindowTitle,
@@ -190,7 +189,6 @@ impl ReaderPane {
             title,
             stack,
             webview,
-            loading,
             empty,
             search_bar,
             search_entry,
