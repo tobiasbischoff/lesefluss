@@ -107,7 +107,9 @@ fn secret_tool(args: &[&str], stdin_data: Option<&[u8]>) -> Option<std::process:
     child.wait_with_output().ok()
 }
 
-fn secret_tool_text(args: &[&str], stdin_data: Option<&[u8]>) -> Option<String> {
+/// **Lookup**: Erfolg ist ein nichtleerer Textwert. `secret-tool lookup` liefert
+/// bei fehlendem Eintrag nichts und beendet sich trotzdem mit 0.
+fn secret_tool_lookup(args: &[&str], stdin_data: Option<&[u8]>) -> Option<String> {
     let out = secret_tool(args, stdin_data)?;
     if !out.status.success() {
         return None;
@@ -120,14 +122,22 @@ fn secret_tool_text(args: &[&str], stdin_data: Option<&[u8]>) -> Option<String> 
     }
 }
 
+/// **Schreiben/Löschen**: hier zählt nur der Exit-Status. `secret-tool store`
+/// gibt absichtlich nichts auf stdout aus; ein leerer Text wäre kein Fehlschlag.
+fn secret_tool_ok(args: &[&str], stdin_data: Option<&[u8]>) -> bool {
+    secret_tool(args, stdin_data)
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// Der Schlüsselbund-Eintrag ist an das bestätigte Profil gebunden, damit ein
 /// Token nicht versehentlich mit der Outbox eines anderen Kontos gekoppelt wird.
 pub fn keyring_account() -> Option<String> {
-    secret_tool_text(&["lookup", "lesefluss", "feedly-account"], None)
+    secret_tool_lookup(&["lookup", "lesefluss", "feedly-account"], None)
 }
 
 pub fn bind_account(account_id: &str) -> bool {
-    secret_tool_text(
+    secret_tool_ok(
         &[
             "store",
             "--label=Lesefluss: Feedly-Konto",
@@ -136,7 +146,6 @@ pub fn bind_account(account_id: &str) -> bool {
         ],
         Some(account_id.as_bytes()),
     )
-    .is_some()
 }
 
 /// Löscht Token **und** Kontobindung und meldet zurück, ob etwas entfernt wurde.
@@ -161,11 +170,11 @@ pub fn forget_token_at(path: &std::path::Path) -> bool {
 }
 
 fn keyring_lookup() -> Option<String> {
-    secret_tool_text(&["lookup", "lesefluss", "feedly-token"], None)
+    secret_tool_lookup(&["lookup", "lesefluss", "feedly-token"], None)
 }
 
 fn keyring_store(token: &str) -> bool {
-    secret_tool_text(
+    secret_tool_ok(
         &[
             "store",
             "--label=Lesefluss: Feedly-Token",
@@ -174,7 +183,15 @@ fn keyring_store(token: &str) -> bool {
         ],
         Some(token.trim().as_bytes()),
     )
-    .is_some()
+}
+
+/// Passt das Token zum gewünschten Konto? Ohne gespeicherte Bindung (z. B. Datei-
+/// fallback) gilt das Token als ungebunden und wird beim ersten Sync gebunden.
+pub fn token_matches_account(bound: Option<&str>, account_id: &str) -> bool {
+    match bound {
+        Some(bound) => bound == account_id,
+        None => true,
+    }
 }
 
 /// Liest das Token ohne den GTK-Thread zu blockieren:
@@ -1631,6 +1648,82 @@ mod r6_token_tests {
             "die Token-Datei ist jetzt eine reguläre Datei"
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"neuer-token");
+    }
+
+    /// A7: `secret-tool store` liefert absichtlich keinen Text; ein leerer stdout
+    /// darf nicht als Fehlschlag gelten. Der Test benutzt ein Skript, das nur den
+    /// Exit-Status setzt.
+    #[test]
+    fn speichern_gilt_bei_exit_null_als_erfolg() {
+        let dir = tempdir("exit0");
+        let fake = dir.join("secret-tool");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n#liest stdin, gibt nichts aus\ncat >/dev/null\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var("PATH").ok();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", dir.display(), old_path.clone().unwrap_or_default()),
+        );
+        let stored = bind_account("feedly-1");
+        let token_stored = keyring_store("tok");
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(stored, "store mit leerem stdout ist erfolgreich");
+        assert!(token_stored, "auch das Token wird als gespeichert erkannt");
+    }
+
+    /// A7: Ein Lookup ohne Treffer liefert `None`, ein Treffer den Wert.
+    #[test]
+    fn lookup_unterscheidet_treffer_von_leerer_ausgabe() {
+        let dir = tempdir("lookup");
+        let fake = dir.join("secret-tool");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+if [ "$3" = "feedly-token" ]; then echo geheim; fi
+exit 0
+"#,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var("PATH").ok();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", dir.display(), old_path.clone().unwrap_or_default()),
+        );
+        let found = keyring_lookup();
+        let missing = keyring_account();
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(found.as_deref(), Some("geheim"));
+        assert!(missing.is_none(), "leere Ausgabe ist kein Treffer");
+    }
+
+    #[test]
+    fn tokenbindung_werden_geprueft() {
+        assert!(token_matches_account(Some("feedly-1"), "feedly-1"));
+        assert!(
+            !token_matches_account(Some("feedly-1"), "feedly-2"),
+            "Token eines anderen Profils wird abgewiesen"
+        );
+        assert!(
+            token_matches_account(None, "feedly-1"),
+            "ohne Bindung (Dateifallback) wird beim Sync gebunden"
+        );
     }
 
     #[test]
