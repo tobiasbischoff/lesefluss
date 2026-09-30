@@ -1021,38 +1021,42 @@ impl App {
         sidebar_footer.append(&last_sync_label);
 
         let primary_menu = gio::Menu::new();
-        primary_menu.append(
+        let feedly_section = gio::Menu::new();
+        feedly_section.append(
             Some(crate::tr!("Feedly verbinden …", "Connect to Feedly…")),
             Some("win.connect-feedly"),
         );
-        primary_menu.append(
+        feedly_section.append(
             Some(crate::tr!("Feedly trennen", "Disconnect Feedly")),
             Some("win.disconnect-feedly"),
         );
-        primary_menu.append(
+        primary_menu.append_section(None, &feedly_section);
+        let data_section = gio::Menu::new();
+        data_section.append(
             Some(crate::tr!("OPML importieren …", "Import OPML…")),
             Some("win.import-opml"),
         );
-        primary_menu.append(
+        data_section.append(
             Some(crate::tr!("OPML exportieren …", "Export OPML…")),
             Some("win.export-opml"),
         );
-        primary_menu.append(
+        data_section.append(
             Some(crate::tr!("Backup erstellen …", "Create backup…")),
             Some("win.backup"),
         );
-        primary_menu.append(
-            Some(crate::tr!("Nur-Lesen-Ansicht (F9)", "Reading view (F9)")),
-            Some("win.focus-mode"),
-        );
-        primary_menu.append(
+        data_section.append(
             Some(crate::tr!(
                 "Aus Backup wiederherstellen …",
                 "Restore from backup…"
             )),
             Some("win.restore"),
         );
+        primary_menu.append_section(None, &data_section);
         let settings_section = gio::Menu::new();
+        settings_section.append(
+            Some(crate::tr!("Nur-Lesen-Ansicht (F9)", "Reading view (F9)")),
+            Some("win.focus-mode"),
+        );
         settings_section.append(
             Some(crate::tr!("Einstellungen", "Settings")),
             Some("win.settings"),
@@ -1103,7 +1107,8 @@ impl App {
         let list_view = gtk::ListView::builder()
             .model(&list_selection)
             .factory(&factory)
-            .single_click_activate(true)
+            // Kein `single_click_activate`: das wählt in GTK4 schon beim
+            // Überfahren mit der Maus aus. Geöffnet wird über die Auswahl.
             .css_classes(vec!["lf-articles".to_string(), "lf-list".to_string()])
             .build();
         let list_scroll = gtk::ScrolledWindow::builder()
@@ -1113,7 +1118,7 @@ impl App {
             .vexpand(true)
             .build();
         let list_empty = adw::StatusPage::builder()
-            .icon_name("mailbox-symbolic")
+            .icon_name("mail-read-symbolic")
             .title(crate::tr!("Keine Artikel", "No articles"))
             .description(crate::tr!(
                 "In dieser Ansicht ist gerade nichts los.",
@@ -1210,16 +1215,6 @@ impl App {
         list_toolbar.add_bottom_bar(&filter_wrap);
         let list_page = adw::NavigationPage::new(&list_toolbar, crate::tr!("Artikel", "Articles"));
 
-        let btn_back = gtk::Button::builder()
-            .icon_name("go-previous-symbolic")
-            .tooltip_text(crate::tr!(
-                "Zurück zur Artikelliste",
-                "Back to article list"
-            ))
-            .action_name("win.reader-back")
-            .build();
-        reader.header.pack_start(&btn_back);
-
         // Zugängliche Namen für reine Icon-Schaltflächen (§16)
         fn label(btn: &gtk::Widget, text: &str) {
             btn.update_property(&[gtk::accessible::Property::Label(text)]);
@@ -1259,11 +1254,6 @@ impl App {
                 &inner,
                 crate::tr!("Artikel", "Articles"),
             ))
-            .build();
-
-        btn_back
-            .bind_property("visible", &inner, "collapsed")
-            .sync_create()
             .build();
 
         let toast = adw::ToastOverlay::new();
@@ -1491,11 +1481,8 @@ impl App {
                         "{label}: {added} new article",
                         "{label}: {added} new articles"
                     ));
-                    let at_top = self.list_scroll.vadjustment().value() < 80.0;
                     self.reload_counts();
-                    if at_top {
-                        self.load_page(false);
-                    }
+                    self.new_articles_arrived(feed_id, added);
                 } else {
                     self.reload_counts();
                 }
@@ -1553,7 +1540,7 @@ impl App {
                         let _ = w;
                     },
                 );
-                self.reload_meta_keep();
+                self.reload_meta_after_sync(added);
                 if added > 0 {
                     self.show_toast(&crate::tr_plural!(
                         added,
@@ -1825,7 +1812,15 @@ impl App {
                     dbg_log(&format!("load_page: stale gen {gen} verworfen"));
                     return;
                 }
-                let Ok(rows) = res else { return };
+                let rows = match res {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        // Ohne Rücksetzen bliebe das Nachladen für immer gesperrt.
+                        app.state.borrow_mut().loading_more = false;
+                        dbg_log(&redact(&format!("load_page gen={gen}: {e}")));
+                        return;
+                    }
+                };
                 if let Some(first) = rows.first() {
                     dbg_log(&format!(
                         "load_page gen={gen} rows={} first={} unread={}",
@@ -1868,7 +1863,10 @@ impl App {
                 app.sync_store(append);
                 app.request_thumbs();
                 app.update_list_empty_state();
-                app.offer_new_articles();
+                if !append {
+                    app.state.borrow_mut().pending_new_articles = 0;
+                    app.update_new_articles_bar();
+                }
                 app.state.borrow_mut().loading_more = false;
                 if let Some((feed_id, sel)) = app.selected_key() {
                     let current = app.reader.current.borrow().clone();
@@ -1888,7 +1886,11 @@ impl App {
                 let Ok(counts) = res else { return };
                 app.state.borrow_mut().counts = counts;
                 app.refresh_sidebar();
-                app.update_reader_empty();
+                // Nur die Übersicht aktualisieren – ein offener Artikel bleibt
+                // offen, auch wenn nebenbei ein Abruf die Zähler ändert.
+                if app.reader.current.borrow().is_none() {
+                    app.update_reader_empty();
+                }
                 let _ = w;
             },
         );
@@ -1909,18 +1911,58 @@ impl App {
                     .append(&glib::BoxedAnyObject::new(r.clone()));
             }
         } else {
-            while self.list_store.n_items() as usize > rows.len() {
-                let last = self.list_store.n_items().saturating_sub(1);
-                self.list_store.remove(last);
-            }
-            for (pos, r) in rows.iter().enumerate() {
-                let pos = pos as u32;
-                if pos < self.list_store.n_items() {
-                    self.list_store.remove(pos);
+            // Gemeinsamen Anfang und gemeinsames Ende behalten und nur den
+            // Mittelteil in einem einzigen `splice` tauschen. Einzelnes
+            // Entfernen/Einfügen jeder Zeile verlor Scrollanker und Auswahl.
+            let old: Vec<ListRow> = (0..self.list_store.n_items())
+                .filter_map(|i| self.list_store.item(i))
+                .filter_map(|o| o.downcast::<glib::BoxedAnyObject>().ok())
+                .map(|b| b.borrow::<ListRow>().clone())
+                .collect();
+            let prefix = old
+                .iter()
+                .zip(rows.iter())
+                .take_while(|(a, b)| a.same_slot(b))
+                .count();
+            let max_suffix = old.len().min(rows.len()) - prefix;
+            let suffix = old
+                .iter()
+                .rev()
+                .zip(rows.iter().rev())
+                .take(max_suffix)
+                .take_while(|(a, b)| a.same_slot(b))
+                .count();
+            // Behaltene Zeilen: vorhandene Zelle (mit gebundenem Widget) mit
+            // den neuen Daten füttern und in den Zustand zurückschreiben.
+            let kept = (0..prefix).chain(rows.len() - suffix..rows.len());
+            let mut reused: Vec<(usize, ListRow)> = Vec::new();
+            for new_pos in kept {
+                let old_pos = if new_pos < prefix {
+                    new_pos
+                } else {
+                    new_pos + old.len() - rows.len()
+                };
+                if let (ListRow::Item(old_cell), ListRow::Item(new_cell)) =
+                    (&old[old_pos], &rows[new_pos])
+                {
+                    old_cell.update(new_cell.article());
+                    reused.push((new_pos, old[old_pos].clone()));
                 }
-                self.list_store
-                    .insert(pos, &glib::BoxedAnyObject::new(r.clone()));
             }
+            {
+                let mut st = self.state.borrow_mut();
+                for (pos, row) in reused {
+                    if let Some(slot) = st.rows.get_mut(pos) {
+                        *slot = row;
+                    }
+                }
+            }
+            let fresh: Vec<glib::BoxedAnyObject> = rows[prefix..rows.len() - suffix]
+                .iter()
+                .map(|r| glib::BoxedAnyObject::new(r.clone()))
+                .collect();
+            self.list_store
+                .splice(prefix as u32, (old.len() - prefix - suffix) as u32, &fresh);
         }
         if let Some(sel) = self.state.borrow().selected.clone() {
             if let Some(pos) = self.state.borrow().row_pos(sel.0, &sel.1) {
@@ -1939,37 +1981,49 @@ impl App {
     /// bewahrt dabei Auswahl und obersten sichtbaren Artikel.
     fn trim_rows(&self) {
         const MAX_ROWS: usize = 2000;
-        let (over, keep_id) = {
+        let keep_id = {
             let st = self.state.borrow();
             if st.rows.len() <= MAX_ROWS {
                 return;
             }
-            let over = st.rows.len() - MAX_ROWS;
-            let keep = st.selected.clone();
-            (over, keep)
+            st.selected.clone()
         };
-        let anchor = self.top_visible_article_id().or(keep_id);
+        // Direkt nach einer Modelländerung ist die Liste evtl. noch nicht neu
+        // angeordnet und `pick` trifft nichts. Wer dann in der unteren Hälfte
+        // steht, hat nachgeladen: der Anfang fällt weg, nicht die Auswahl.
+        let adj = self.list_scroll.vadjustment();
+        let scrolled_low = adj.value() + adj.page_size() / 2.0 > adj.upper() / 2.0;
+        let anchor = self
+            .top_visible_article_id()
+            .or(if scrolled_low { None } else { keep_id });
         {
             let mut st = self.state.borrow_mut();
-            for _ in 0..over {
-                if st.rows.len() <= MAX_ROWS {
-                    break;
+            let len = st.rows.len();
+            // Das Fenster aus MAX_ROWS Zeilen muss den Anker enthalten. Bevorzugt
+            // fällt der Anfang weg: gekappt wird nach dem Nachladen am Ende.
+            let anchor_pos = anchor
+                .as_ref()
+                .and_then(|(feed_id, id)| st.row_pos(*feed_id, id))
+                .unwrap_or(len - 1);
+            let start = (len - MAX_ROWS).min(anchor_pos.saturating_sub(MAX_ROWS / 4));
+            st.rows.drain(..start);
+            if st.rows.len() > MAX_ROWS {
+                // Unten abgeschnitten: der Cursor muss auf die letzte
+                // verbliebene Zeile zeigen, sonst fehlen die Zeilen dazwischen.
+                st.rows.truncate(MAX_ROWS);
+                if let Some(ListRow::Header { .. }) = st.rows.last() {
+                    st.rows.pop();
                 }
-                // nie die Auswahl oder den Scrollanker entfernen
-                if let Some((keep_feed, keep)) = anchor.as_ref() {
-                    let pos = st.rows.iter().position(|r| {
-                        r.article()
-                            .map(|a| a.feed_id == *keep_feed && &a.id == keep)
-                            .unwrap_or(false)
-                    });
-                    if let Some(pos) = pos {
-                        if pos < st.rows.len() - MAX_ROWS {
-                            st.rows.remove(0);
-                            continue;
-                        }
-                    }
-                }
-                st.rows.pop();
+                st.cursor = st.last_item().map(crate::model::cursor_of);
+            }
+            // Oben abgeschnitten mitten in einem Tag: Überschrift ergänzen.
+            let first_ms = match st.rows.first() {
+                Some(ListRow::Item(cell)) => Some(cell.data.borrow().published_ms),
+                _ => None,
+            };
+            if let Some(ms) = first_ms {
+                let (key, label) = crate::state::day_key_label(ms);
+                st.rows.insert(0, ListRow::Header { key, label });
             }
         }
         self.sync_store(false);
@@ -2080,57 +2134,103 @@ impl App {
         }
     }
 
-    /// Neue Artikel, die oberhalb des sichtbaren Bereichs liegen, werden
-    /// angeboten statt automatisch eingefügt (§5.2).
-    fn offer_new_articles(&self) {
-        let (new_count, top) = {
+    /// Neue Artikel werden nur dann direkt eingefügt, wenn die Liste oben
+    /// steht. Wer weiter unten liest, bekommt stattdessen die Leiste angeboten,
+    /// damit sich unter ihm nichts verschiebt (§5.2).
+    fn new_articles_arrived(&self, feed_id: i64, added: usize) {
+        let in_view = {
             let st = self.state.borrow();
-            let top = self.top_visible_article_id();
-            let pos = top
-                .as_ref()
-                .and_then(|(feed_id, id)| st.row_pos(*feed_id, id))
-                .unwrap_or(0);
-            let count = st
-                .rows
-                .iter()
-                .take(pos)
-                .filter(|r| matches!(r, ListRow::Item(_)))
-                .count();
-            (count, top)
+            st.filter != Filter::Saved
+                && match &st.scope {
+                    Scope::Global => true,
+                    Scope::Feed(f) => *f == feed_id,
+                    Scope::Account(a) => st
+                        .feeds
+                        .iter()
+                        .any(|f| f.id == feed_id && &f.account_id == a),
+                    Scope::Group(g) => st
+                        .feeds
+                        .iter()
+                        .any(|f| f.id == feed_id && f.groups.contains(g)),
+                }
         };
-        let _ = top;
-        {
-            let mut st = self.state.borrow_mut();
-            st.pending_new_articles = new_count;
+        if !in_view {
+            return;
         }
+        if self.list_at_top() {
+            self.load_page(false);
+        } else {
+            self.state.borrow_mut().pending_new_articles += added;
+            self.update_new_articles_bar();
+        }
+    }
+
+    fn list_at_top(&self) -> bool {
+        self.list_scroll.vadjustment().value() < 80.0
+    }
+
+    /// Leiste zurücknehmen und die Liste mit den neuen Artikeln neu laden.
+    fn take_new_articles(&self) {
+        self.state.borrow_mut().pending_new_articles = 0;
         self.update_new_articles_bar();
+        self.list_scroll.vadjustment().set_value(0.0);
+        self.load_page(false);
     }
 
     fn update_new_articles_bar(&self) {
         let count = self.state.borrow().pending_new_articles;
         if count == 0 {
-            self.new_articles_bar.set_visible(false);
+            self.new_articles_bar.set_reveal_child(false);
             return;
         }
-        self.new_articles_bar.set_visible(true);
         self.new_articles_label.set_label(&crate::tr_plural!(
             count,
-            "{count} neuer Artikel",
-            "{count} neue Artikel",
-            "{count} new article",
-            "{count} new articles"
+            "↑ {count} neuer Artikel",
+            "↑ {count} neue Artikel",
+            "↑ {count} new article",
+            "↑ {count} new articles"
         ));
+        self.new_articles_bar.set_reveal_child(true);
     }
 
-    /// Aktuell sichtbarer oberster Artikel als logischer Schlüssel (Feed + ID).
+    /// Oberster sichtbarer Artikel als logischer Schlüssel (Feed + ID). Die
+    /// Zeile wird über das Widget an der Oberkante des Viewports ermittelt;
+    /// die `ListView` scrollt selbst, ihre Koordinaten sind die sichtbaren.
     fn top_visible_article_id(&self) -> Option<(i64, String)> {
-        let pos = self.list_scroll.vadjustment().value().round().max(0.0);
-        let st = self.state.borrow();
-        st.rows
-            .iter()
-            .filter_map(|r| r.article())
-            .min_by_key(|a| (a.sort_ms.abs_diff(pos as i64), a.id.clone()))
-            .map(|a| (a.feed_id, a.id))
+        let x = f64::from(self.list_view.width()) / 2.0;
+        let height = f64::from(self.list_view.height());
+        let mut y = 1.0;
+        while y < height {
+            if let Some(hit) = self.list_view.pick(x, y, gtk::PickFlags::DEFAULT) {
+                if let Some(key) = self.article_key_of_widget(&hit) {
+                    return Some(key);
+                }
+            }
+            y += 16.0;
+        }
+        None
+    }
+
+    fn article_key_of_widget(&self, hit: &gtk::Widget) -> Option<(i64, String)> {
+        let list: &gtk::Widget = self.list_view.upcast_ref();
+        let mut cur = Some(hit.clone());
+        while let Some(w) = cur {
+            if &w == list {
+                return None;
+            }
+            if w.has_css_class("lf-article-row") {
+                let st = self.state.borrow();
+                return st.rows.iter().find_map(|r| match r {
+                    ListRow::Item(cell) if cell.owns(&w) => {
+                        let a = cell.data.borrow();
+                        Some((a.feed_id, a.id.clone()))
+                    }
+                    _ => None,
+                });
+            }
+            cur = w.parent();
+        }
+        None
     }
 
     pub fn update_list_empty_state(&self) {
@@ -2643,6 +2743,7 @@ impl App {
             st.selected = st.last_opened.get(&(st.scope.clone(), f)).cloned();
         }
         self.sync_filter_buttons();
+        self.list_title.set_title(&self.scope_label_now());
         self.load_page(false);
         if let Some((feed_id, sel)) = self.selected_key() {
             self.open_article_by_id(feed_id, &sel, false, false);
@@ -2666,7 +2767,13 @@ impl App {
             return crate::tr_format!("Suche: {q}", "Search: {q}");
         }
         match &st.scope {
-            Scope::Global => crate::tr!("Ungelesen", "Unread").into(),
+            // Der Sammel-Eintrag heißt „Ungelesen“; mit anderem Filter zeigt
+            // er aber Gespeichertes bzw. alles, und so muss er dann auch heißen.
+            Scope::Global => match st.filter {
+                Filter::Unread => crate::tr!("Ungelesen", "Unread").into(),
+                Filter::Saved => crate::tr!("Gespeichert", "Saved").into(),
+                Filter::All => crate::tr!("Alle Artikel", "All articles").into(),
+            },
             Scope::Account(a) => st
                 .accounts
                 .iter()
@@ -2731,7 +2838,28 @@ impl App {
                 }
                 match res {
                     Ok(Some(html)) => app.load_reader_html(row, html),
-                    _ => app.reader.show_error(),
+                    // Kein Absturz des Web-Prozesses: die Fehlerseite mit
+                    // „Web-Prozess beendet“ wäre hier schlicht falsch.
+                    Ok(None) => app.reader.show_message(
+                        crate::tr!("Kein Inhalt gespeichert", "No content stored"),
+                        crate::tr!(
+                            "Für diesen Artikel liegt kein Text vor. Mit O im Browser öffnen.",
+                            "This article has no stored text. Press O to open it in the browser."
+                        ),
+                    ),
+                    Err(e) => {
+                        dbg_log(&redact(&format!("content_html: {e}")));
+                        app.reader.show_message(
+                            crate::tr!(
+                                "Der Artikel konnte nicht geladen werden",
+                                "The article could not be loaded"
+                            ),
+                            crate::tr!(
+                                "Die Bibliothek hat einen Fehler gemeldet.",
+                                "The library reported an error."
+                            ),
+                        );
+                    }
                 }
                 let _ = w;
             },
@@ -3411,19 +3539,28 @@ impl App {
     fn load_reader_html(&self, row: ArticleRow, html: String) {
         // Sofort rendern: Cache-Bilder einbetten, alle anderen als Platzhalter
         // markieren. Nachgeladen wird asynchron über die Medien-Brücke.
-        let cached: Vec<(String, String)> = reader::sanitize::image_alt_texts(&html)
-            .into_iter()
-            .filter_map(|(url, _)| {
-                self.media
-                    .get_cached(&url)
-                    .map(|(bytes, mime)| (url, provider_local::media::data_uri(&bytes, mime)))
-            })
-            .collect();
         let placeholder = provider_local::media::placeholder_data_uri(
             crate::tr!("Bild", "Image"),
             crate::tr!("Bild nicht verfügbar", "Image unavailable"),
         );
         let mut prepared = reader::sanitize::rewrite_images(&html, &placeholder);
+        // Adressen und Alt-Texte stehen erst nach `rewrite_images` als
+        // `data-lf-src` im HTML. Aus dem rohen Feed-HTML gelesen wäre die Liste
+        // leer und es würde kein einziges Bild nachgeladen.
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for (url, alt) in reader::sanitize::image_alt_texts(&prepared) {
+            if !wanted.iter().any(|(u, _)| *u == url) {
+                wanted.push((url, alt));
+            }
+        }
+        let cached: Vec<(String, String)> = wanted
+            .iter()
+            .filter_map(|(url, _)| {
+                self.media.get_cached(url).map(|(bytes, mime)| {
+                    (url.clone(), provider_local::media::data_uri(&bytes, mime))
+                })
+            })
+            .collect();
         for (url, data) in &cached {
             prepared = reader::sanitize::replace_marker(&prepared, url, data);
         }
@@ -3437,7 +3574,7 @@ impl App {
             // Bilder gesperrt: nichts wird nachgeladen, die Platzhalter bleiben.
             return;
         }
-        let missing: Vec<(String, String)> = reader::sanitize::image_alt_texts(&html)
+        let missing: Vec<(String, String)> = wanted
             .into_iter()
             .filter(|(url, _)| !cached.iter().any(|(u, _)| u == url))
             .collect();
@@ -4333,6 +4470,17 @@ impl App {
     }
 
     pub fn reload_meta_keep(&self) {
+        self.reload_meta(None);
+    }
+
+    /// Wie `reload_meta_keep`, aber nach einem Hintergrund-Sync: Wer in der
+    /// Liste weiter unten liest, wird nicht auf Seite 1 zurückgesetzt, sondern
+    /// bekommt die neuen Artikel über die Leiste angeboten.
+    fn reload_meta_after_sync(&self, added: usize) {
+        self.reload_meta(Some(added));
+    }
+
+    fn reload_meta(&self, background_added: Option<usize>) {
         let w = self.weak();
         self.db_query(
             |db| {
@@ -4355,7 +4503,15 @@ impl App {
                     st.accounts = accounts;
                 }
                 app.refresh_sidebar();
-                app.load_page(false);
+                match background_added {
+                    Some(added) if !app.list_at_top() => {
+                        if added > 0 && app.state.borrow().filter != Filter::Saved {
+                            app.state.borrow_mut().pending_new_articles += added;
+                            app.update_new_articles_bar();
+                        }
+                    }
+                    _ => app.load_page(false),
+                }
                 let _ = w;
             },
         );
@@ -4692,6 +4848,18 @@ impl App {
         self.prefs.borrow().letter_shortcuts
     }
 
+    /// Liegt der Tastaturfokus in `ancestor` oder darunter?
+    fn focus_within(&self, ancestor: &gtk::Widget) -> bool {
+        let mut cur = gtk::prelude::GtkWindowExt::focus(&self.window);
+        while let Some(w) = cur {
+            if &w == ancestor {
+                return true;
+            }
+            cur = w.parent();
+        }
+        false
+    }
+
     fn editing_widget(&self) -> bool {
         let Some(mut w) = self.window.focus_child() else {
             return false;
@@ -4712,10 +4880,27 @@ impl App {
         let w = self.weak();
         let ctrl = gtk::EventControllerKey::new();
         ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-        ctrl.connect_key_pressed(move |_, keyval, _keycode, _state| {
+        ctrl.connect_key_pressed(move |_, keyval, _keycode, state| {
             let Some(app) = w.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            // Leertaste in der Artikelliste blättert im Artikel. Sonst
+            // aktivierte sie die Zeile erneut, der Artikel lud neu und sprang
+            // an den Anfang.
+            if keyval == gtk::gdk::Key::space
+                && (state - gtk::gdk::ModifierType::SHIFT_MASK).is_empty()
+                && app.focus_within(app.list_view.upcast_ref())
+                && app.reader.current.borrow().is_some()
+                && app.reader_loaded_ok()
+            {
+                let dir = if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                    -1
+                } else {
+                    1
+                };
+                app.reader.scroll_page(dir);
+                return glib::Propagation::Stop;
+            }
             let Some(action) = letter_action(keyval) else {
                 return glib::Propagation::Proceed;
             };
@@ -4824,6 +5009,11 @@ impl App {
             };
             let row = boxed.borrow::<ListRow>();
             let thumbs = w.upgrade().map(|a| a.prefs.borrow().thumbs).unwrap_or(true);
+            // Tagesüberschriften sind weder auswählbar noch Tastaturziel.
+            let is_item = matches!(&*row, ListRow::Item(_));
+            li.set_selectable(is_item);
+            li.set_activatable(is_item);
+            li.set_focusable(is_item);
             li.set_child(Some(&list::row_widget(&row, thumbs)));
         });
         factory.connect_unbind(|_, list_item| {
@@ -4856,6 +5046,17 @@ impl App {
             app.set_scope(f, reset);
         });
 
+        // Ein Klick auf die bereits gewählte Quelle löst kein `row-selected`
+        // aus; im schmalen Layout muss er trotzdem zur Artikelliste führen,
+        // sonst kommt man nach dem Start nicht über die Quellen hinaus.
+        let w = self.weak();
+        self.sidebar_list.connect_row_activated(move |_, row| {
+            let Some(app) = w.upgrade() else { return };
+            if row.is_selected() && app.outer.is_collapsed() {
+                app.outer.set_show_content(true);
+            }
+        });
+
         let w = self.weak();
         self.list_selection
             .connect_selected_item_notify(move |sel| {
@@ -4865,40 +5066,29 @@ impl App {
                 }
                 let cause = app.selection_cause.get();
                 app.selection_cause.set(SelectionCause::Unknown);
-                if cause != SelectionCause::Keyboard {
-                    return;
-                }
                 let Some(obj) = sel.selected_item() else {
                     return;
                 };
                 let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>() else {
                     return;
                 };
-                let row = boxed.borrow::<ListRow>();
-                if let Some(a) = row.article() {
-                    app.schedule_preview(a);
+                let Some(a) = boxed.borrow::<ListRow>().article() else {
+                    return;
+                };
+                match cause {
+                    // Tastatur: kurz entprellen, damit schnelles Blättern nicht
+                    // jeden Artikel lädt.
+                    SelectionCause::Keyboard => app.schedule_preview(a),
+                    SelectionCause::Pointer => app.open_article(a, true, true),
+                    SelectionCause::Unknown => {}
                 }
             });
 
         let w = self.weak();
         self.new_articles_label.connect_clicked(move |_| {
-            let Some(app) = w.upgrade() else { return };
-            app.state.borrow_mut().pending_new_articles = 0;
-            app.update_new_articles_bar();
-            if let Some(pos) = app
-                .state
-                .borrow()
-                .rows
-                .iter()
-                .position(|r| matches!(r, ListRow::Item(_)))
-            {
-                app.list_view.scroll_to(
-                    pos as u32,
-                    gtk::ListScrollFlags::NONE,
-                    None::<gtk::ScrollInfo>,
-                );
+            if let Some(app) = w.upgrade() {
+                app.take_new_articles();
             }
-            app.load_page(false);
         });
 
         let w = self.weak();
@@ -4917,9 +5107,23 @@ impl App {
 
         let w = self.weak();
         let click = gtk::GestureClick::new();
-        click.connect_pressed(move |_, _, _, _| {
-            if let Some(app) = w.upgrade() {
-                app.selection_cause.set(SelectionCause::Pointer);
+        // Capture: die Zeilen beanspruchen den Klick selbst, danach käme hier
+        // nichts mehr an.
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(move |_, _, x, y| {
+            let Some(app) = w.upgrade() else { return };
+            app.selection_cause.set(SelectionCause::Pointer);
+            // Klick auf den bereits offenen Artikel ändert die Auswahl nicht;
+            // im schmalen Layout muss er trotzdem wieder zum Reader führen.
+            let hit = app
+                .list_view
+                .pick(x, y, gtk::PickFlags::DEFAULT)
+                .and_then(|w| app.article_key_of_widget(&w));
+            if hit.is_some() && hit == app.selected_key() {
+                app.selection_cause.set(SelectionCause::Unknown);
+                if app.inner.is_collapsed() && !app.inner.shows_content() {
+                    app.inner.set_show_content(true);
+                }
             }
         });
         self.list_view.add_controller(click);
@@ -4964,20 +5168,15 @@ impl App {
             });
         }
 
-        let last_scroll_value = std::cell::Cell::new(0.0);
         let w = self.weak();
         self.list_scroll
             .vadjustment()
             .connect_value_changed(move |adj| {
                 let Some(app) = w.upgrade() else { return };
-                if adj.value() > last_scroll_value.get() + 0.5 {
-                    last_scroll_value.set(adj.value());
-                    let mut st = app.state.borrow_mut();
-                    if st.pending_new_articles > 0 {
-                        st.pending_new_articles = 0;
-                        drop(st);
-                        app.update_new_articles_bar();
-                    }
+                // Ganz nach oben gescrollt: angebotene Artikel direkt übernehmen.
+                if adj.value() < 1.0 && app.state.borrow().pending_new_articles > 0 {
+                    app.take_new_articles();
+                    return;
                 }
                 let near_bottom = adj.value() + adj.page_size() >= adj.upper() - 400.0;
                 if !near_bottom {
@@ -5002,9 +5201,9 @@ impl App {
         self.reader.search_entry.connect_activate(move |_| {
             find_next(&webview2);
         });
-        self.reader
-            .search_bar
-            .set_key_capture_widget(Some(&self.window));
+        // Bewusst kein `set_key_capture_widget`: sonst öffnete jeder Buchstabe,
+        // den der Tastatur-Router nicht behandelt, die Suche im Artikel –
+        // auch aus der Seitenleiste heraus. Gesucht wird mit Strg+F.
 
         let w = self.weak();
         self.search_entry.connect_search_changed(move |entry| {

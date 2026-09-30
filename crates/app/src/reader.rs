@@ -9,7 +9,7 @@ const MEDIA_BRIDGE_JS: &str = r#"
 document.addEventListener('lf-media', function (event) {
   var detail = event.detail;
   if (!detail || !detail.url) return;
-  var images = document.querySelectorAll('img[data-lf-src="' + detail.url + '"]');
+  var images = document.querySelectorAll('img[data-lf-src="' + CSS.escape(detail.url) + '"]');
   for (var i = 0; i < images.length; i++) {
     images[i].src = detail.data;
     images[i].removeAttribute('data-pending');
@@ -19,7 +19,6 @@ document.addEventListener('lf-media', function (event) {
 
 pub struct ReaderPane {
     pub toolbar: adw::ToolbarView,
-    pub header: adw::HeaderBar,
     pub title: adw::WindowTitle,
     pub stack: gtk::Stack,
     pub webview: webkit6::WebView,
@@ -28,6 +27,8 @@ pub struct ReaderPane {
     pub search_entry: gtk::SearchEntry,
     pub btn_read: gtk::Button,
     pub btn_saved: gtk::Button,
+    /// Knöpfe, die nur mit geöffnetem Artikel etwas bewirken.
+    article_buttons: Vec<gtk::Widget>,
     pub current: RefCell<Option<String>>,
     pub pending_scroll: Cell<f64>,
     pub style: RefCell<crate::style::ReaderStyleState>,
@@ -65,7 +66,7 @@ impl ReaderPane {
             .vexpand(true)
             .build();
         let empty = adw::StatusPage::builder()
-            .icon_name("applications-library-symbolic")
+            .icon_name("text-x-generic-symbolic")
             .title(crate::tr!("Kein Artikel geöffnet", "No article open"))
             .description(crate::tr!(
                 "Wähle links einen Artikel aus.",
@@ -120,7 +121,7 @@ impl ReaderPane {
             .action_name("win.toggle-saved")
             .build();
         let btn_external = gtk::Button::builder()
-            .icon_name("external-link-symbolic")
+            .icon_name("adw-external-link-symbolic")
             .tooltip_text(crate::tr!("Im Browser öffnen (O)", "Open in browser (O)"))
             .action_name("win.open-external")
             .build();
@@ -133,7 +134,7 @@ impl ReaderPane {
             Some("win.zoom-reset"),
         );
         let btn_zoom = gtk::MenuButton::builder()
-            .icon_name("font-x-large-symbolic")
+            .icon_name("font-select-symbolic")
             .tooltip_text(crate::tr!("Typografie", "Typography"))
             .menu_model(&zoom_menu)
             .build();
@@ -155,11 +156,18 @@ impl ReaderPane {
 
         let title = adw::WindowTitle::new("Lesefluss", "");
         let header = adw::HeaderBar::builder().title_widget(&title).build();
-        header.pack_start(&btn_read);
-        header.pack_start(&btn_saved);
-        header.pack_end(&btn_external);
-        header.pack_end(&btn_zoom);
-        header.pack_end(&btn_more);
+        // Artikelknöpfe in Boxen: `set_sensitive` am Knopf selbst überschreibt
+        // GtkActionable wieder, am Container greift es. Den Zurück-Knopf im
+        // schmalen Layout setzt libadwaita selbst; ein eigener wäre doppelt.
+        let start_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        start_box.append(&btn_read);
+        start_box.append(&btn_saved);
+        let end_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        end_box.append(&btn_more);
+        end_box.append(&btn_zoom);
+        end_box.append(&btn_external);
+        header.pack_start(&start_box);
+        header.pack_end(&end_box);
 
         let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content_box.append(&search_bar);
@@ -210,9 +218,13 @@ impl ReaderPane {
             false
         });
 
+        let article_buttons: Vec<gtk::Widget> = vec![start_box.upcast(), end_box.upcast()];
+        for b in &article_buttons {
+            b.set_sensitive(false);
+        }
+
         Self {
             toolbar,
-            header,
             title,
             stack,
             webview,
@@ -221,6 +233,7 @@ impl ReaderPane {
             search_entry,
             btn_read,
             btn_saved,
+            article_buttons,
             current: RefCell::new(None),
             pending_scroll: Cell::new(-1.0),
             style: RefCell::new(crate::style::ReaderStyleState::default()),
@@ -229,7 +242,14 @@ impl ReaderPane {
     }
 
     pub fn show_loading(&self) {
+        self.set_article_buttons(true);
         self.stack.set_visible_child_name("loading");
+    }
+
+    fn set_article_buttons(&self, enabled: bool) {
+        for b in &self.article_buttons {
+            b.set_sensitive(enabled);
+        }
     }
 
     /// Reserviert die nächste Dokumentgeneration **bevor** das HTML entsteht.
@@ -248,12 +268,17 @@ impl ReaderPane {
         self.webview.load_html(html, None);
     }
 
-    pub fn show_error(&self) {
-        self.stack.set_visible_child_name("error");
+    /// Hinweisseite für einen geöffneten Artikel. Anders als `show_empty`
+    /// bleibt `current` gesetzt, damit M/S/O weiter auf ihn wirken.
+    pub fn show_message(&self, title: &str, description: &str) {
+        self.empty.set_title(title);
+        self.empty.set_description(Some(description));
+        self.stack.set_visible_child_name("empty");
     }
 
     pub fn show_empty(&self, title: &str, description: &str) {
         *self.current.borrow_mut() = None;
+        self.set_article_buttons(false);
         self.empty.set_title(title);
         self.empty.set_description(Some(description));
         self.stack.set_visible_child_name("empty");
@@ -275,6 +300,19 @@ impl ReaderPane {
                     );
                 }
             });
+    }
+
+    /// Blättert um knapp eine Bildschirmseite (`dir` = 1 vor, -1 zurück).
+    pub fn scroll_page(&self, dir: i32) {
+        self.webview.evaluate_javascript(
+            &format!(
+                "window.scrollBy({{top: {dir} * window.innerHeight * 0.9, behavior: 'smooth'}});"
+            ),
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            |_| {},
+        );
     }
 
     pub fn restore_scroll(&self) {

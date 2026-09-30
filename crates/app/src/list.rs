@@ -29,6 +29,8 @@ fn meta_markup(a: &ArticleRow) -> String {
 
 impl RowHandles {
     fn apply(&self, a: &ArticleRow) {
+        self.title.set_label(&a.title);
+        self.excerpt.set_label(&a.excerpt);
         self.title.set_css_classes(&[if a.unread {
             "lf-article-title-unread"
         } else {
@@ -81,6 +83,14 @@ impl RowCell {
     fn unregister(&self, root: &gtk::Box) {
         self.bound.borrow_mut().retain(|h| &h.root != root);
     }
+
+    /// Gehört das Zeilen-Widget `root` (Klasse `lf-article-row`) zu dieser Zelle?
+    pub fn owns(&self, root: &gtk::Widget) -> bool {
+        self.bound
+            .borrow()
+            .iter()
+            .any(|h| h.root.upcast_ref::<gtk::Widget>() == root)
+    }
 }
 
 #[derive(Clone)]
@@ -94,6 +104,23 @@ impl ListRow {
         match self {
             ListRow::Item(c) => Some(c.article()),
             _ => None,
+        }
+    }
+
+    /// Belegen beide Zeilen denselben Platz, sodass das vorhandene Widget
+    /// weiterverwendet werden kann? Artikel gelten als gleich bei gleichem
+    /// Schlüssel und gleichem Vorschaubild – ein neu erzeugtes Vorschaubild
+    /// braucht ein neues Widget, alles andere aktualisiert `RowCell::update`.
+    pub fn same_slot(&self, other: &ListRow) -> bool {
+        match (self, other) {
+            (ListRow::Header { key: a, label: la }, ListRow::Header { key: b, label: lb }) => {
+                a == b && la == lb
+            }
+            (ListRow::Item(a), ListRow::Item(b)) => {
+                let (a, b) = (a.data.borrow(), b.data.borrow());
+                a.feed_id == b.feed_id && a.id == b.id && a.thumb == b.thumb
+            }
+            _ => false,
         }
     }
 }

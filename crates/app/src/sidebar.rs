@@ -45,7 +45,7 @@ pub fn rebuild(
             .find(|(a, _)| a == id)
             .map(|(_, c)| *c)
             .unwrap_or(0);
-        let w = icon_text_badge(Some("cloud-fill-symbolic"), name, unread, true);
+        let w = icon_text_badge(Some("folder-remote-symbolic"), name, unread, true);
         let row = gtk::ListBoxRow::builder()
             .child(&w)
             .css_classes(vec!["lf-sidebar-row".to_string()])

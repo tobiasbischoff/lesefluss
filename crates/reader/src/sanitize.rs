@@ -296,24 +296,21 @@ pub fn rewrite_images(html: &str, placeholder: &str) -> String {
             }
         };
         let tag = &html[i..tag_end];
-        match attr_value(tag, "src") {
-            Some(src) if !src.starts_with("data:") => {
-                let escaped = escape_attr(&src);
-                let mut replaced = String::with_capacity(tag.len() + escaped.len() + 24);
-                if let Some(pos) = tag_lower_find(&tag.to_ascii_lowercase(), "src") {
-                    replaced.push_str(&tag[..pos]);
-                    replaced.push_str(&format!(
-                        "data-lf-src=\"{escaped}\" src=\"{}\"",
-                        escape_attr(placeholder)
-                    ));
-                    replaced.push_str(&tag[pos + 3..]);
-                } else {
-                    replaced.push_str(&tag[4..]);
-                    replaced.push_str(&format!(
-                        " data-lf-src=\"{escaped}\" src=\"{}\"",
-                        escape_attr(placeholder)
-                    ));
-                }
+        // `span` umfasst das **vollständige** Attribut inklusive `="…"`; bliebe
+        // nur der Name übergangen, stünde hinter dem neuen `src` der Wert des
+        // Originals als unparsbares Attributrest im Tag.
+        match attr_span(tag, "src") {
+            Some((start, end))
+                if !attr_value(tag, "src").is_some_and(|v| v.starts_with("data:")) =>
+            {
+                let value = attr_value(tag, "src").unwrap_or_default();
+                let mut replaced = String::with_capacity(tag.len() + value.len() + 24);
+                replaced.push_str(&tag[..start]);
+                replaced.push_str(&format!(
+                    "data-lf-src=\"{value}\" src=\"{}\"",
+                    escape_attr(placeholder)
+                ));
+                replaced.push_str(&tag[end..]);
                 out.push_str(&replaced);
             }
             _ => out.push_str(tag),
@@ -328,21 +325,42 @@ fn tag_lower_find(tag_lower: &str, attr: &str) -> Option<usize> {
     tag_lower.find(&needle).map(|i| i + 1)
 }
 
-fn attr_value(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let pos = tag_lower_find(&lower, name)?;
-    let rest = &tag[pos + name.len()..];
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let quote = rest.chars().next()?;
-    if quote == '"' || quote == '\'' {
-        let end = rest[1..].find(quote)?;
-        return Some(rest[1..1 + end].to_string());
+/// Byte-Bereich des vollständigen Attributs `name="…"` im Tag: Beginn am
+/// Attributnamen, Ende hinter dem schließenden Anführungszeichen.
+fn attr_span(tag: &str, name: &str) -> Option<(usize, usize)> {
+    let start = tag_lower_find(&tag.to_ascii_lowercase(), name)?;
+    let mut i = start + name.len();
+    i += tag[i..].len() - tag[i..].trim_start().len();
+    if !tag[i..].starts_with('=') {
+        return None;
     }
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '>')
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+    i += 1;
+    i += tag[i..].len() - tag[i..].trim_start().len();
+    let quote = tag[i..].chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let rel = tag[i + 1..].find(quote)?;
+        Some((start, i + 1 + rel + 1))
+    } else {
+        let rel = tag[i..]
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(tag.len() - i);
+        Some((start, i + rel))
+    }
+}
+
+/// Attributwert **so, wie er im HTML steht** – also noch zeichenreferenz-
+/// kodiert. Ein erneutes `escape_attr` würde `&amp;` zu `&amp;amp;` verdoppeln.
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let (start, _) = attr_span(tag, name)?;
+    let after = &tag[start + name.len()..];
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    let quote = after.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let rel = after[1..].find(quote)?;
+        Some(&after[1..1 + rel])
+    } else {
+        Some(after)
+    }
 }
 
 fn escape_attr(value: &str) -> String {
@@ -379,20 +397,19 @@ fn rewrite_images_one(html: &str, url: &str, data_uri: &str) -> String {
             }
         };
         let tag = &html[i..tag_end];
-        if attr_value(tag, "data-lf-src").as_deref() == Some(url) {
-            let lower = tag.to_ascii_lowercase();
-            let src_pos = tag_lower_find(&lower, "src");
-            let mut rebuilt = String::with_capacity(tag.len() + data_uri.len());
-            if let Some(pos) = src_pos {
-                rebuilt.push_str(&tag[..pos]);
+        // `data-lf-src` steht im HTML zeichenreferenz-kodiert, die gesuchte
+        // Adresse kommt aus dem DOM (dekodiert). Der Vergleich muss daher beide
+        // Seiten in dieselbe Form bringen, sonst trifft er URLs mit `&` nie.
+        let hit = attr_value(tag, "data-lf-src") == Some(escape_attr(url).as_str());
+        match (hit, attr_span(tag, "src")) {
+            (true, Some((start, end))) => {
+                let mut rebuilt = String::with_capacity(tag.len() + data_uri.len());
+                rebuilt.push_str(&tag[..start]);
                 rebuilt.push_str(&format!("src=\"{}\"", escape_attr(data_uri)));
-                rebuilt.push_str(&tag[pos + 3..]);
-            } else {
-                rebuilt.push_str(tag);
+                rebuilt.push_str(&tag[end..]);
+                out.push_str(&rebuilt);
             }
-            out.push_str(&rebuilt);
-        } else {
-            out.push_str(tag);
+            _ => out.push_str(tag),
         }
         i = tag_end;
     }
@@ -438,6 +455,43 @@ mod image_tests {
             alts,
             vec![("https://cdn.example/a.png".to_string(), "Bild".to_string())]
         );
+    }
+
+    /// Der Attributwert des Originals darf nicht als Reste-Attribut hinter dem
+    /// neuen `src` stehen bleiben: `src="…"="…"` ist unparsbar und machte das
+    /// Bild unsichtbar, obwohl der Test oben nur das Teil-Substring sah.
+    #[test]
+    fn rewrite_leaves_no_attribute_remains() {
+        let html = r#"<div><img width="720" height="425" src="https://cdn.example/a.png" alt="Bild"></div>"#;
+        let out = rewrite_images(html, "PH");
+        assert!(!out.contains(r#""="https://cdn.example/a.png""#), "{out}");
+        assert!(
+            out.contains(r#"<img width="720" height="425" data-lf-src="https://cdn.example/a.png" src="PH" alt="Bild">"#),
+            "{out}"
+        );
+    }
+
+    /// `data-lf-src` muss genau der Wert sein, den das DOM später liefert,
+    /// sonst findet der Medien-Nachlader das Bild nicht. Das HTML aus dem Feed
+    /// ist bereits zeichenreferenz-kodiert; ein erneutes Kodieren erzeugte
+    /// `&amp;amp;` und damit eine Adresse, die nirgends vorkommt.
+    #[test]
+    fn lf_src_matches_the_dom_value() {
+        let dom = "https://cdn.example/a.png?x=1&y=2";
+        let raw = r#"<img src="https://cdn.example/a.png?x=1&amp;y=2" alt="q">"#;
+        let out = rewrite_images(raw, "PH");
+        assert!(!out.contains("&amp;amp;"), "keine Doppelkodierung: {out}");
+        let alts = image_alt_texts(&out);
+        assert_eq!(alts, vec![(dom.to_string(), "q".to_string())]);
+    }
+
+    #[test]
+    fn replace_marker_matches_ampersand_urls() {
+        let dom = "https://cdn.example/a.png?x=1&y=2";
+        let raw = r#"<img src="https://cdn.example/a.png?x=1&amp;y=2" alt="q">"#;
+        let out = replace_marker(&rewrite_images(raw, "PH"), dom, "data:image/png;base64,AAA");
+        assert!(out.contains(r#"src="data:image/png;base64,AAA""#), "{out}");
+        assert!(!out.contains(r#""="https://cdn.example/a.png"#), "{out}");
     }
 
     #[test]

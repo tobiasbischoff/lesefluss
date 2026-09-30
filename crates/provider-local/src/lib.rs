@@ -267,7 +267,7 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
             identity,
             title: e
                 .title
-                .map(|t| t.content)
+                .map(|t| title_text(&t.content, t.content_type.as_str()))
                 .unwrap_or_else(|| "(untitled)".into()),
             author: e.authors.first().map(|a| a.name.clone()),
             url: link,
@@ -279,18 +279,37 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
     Ok(out)
 }
 
-fn storage_plain(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if in_tag => {}
-            c => out.push(c),
-        }
+/// Klartext eines Titels. Atom erlaubt `type="html"`; dann steht dort noch
+/// kodiertes HTML („Amazon&#8217;s“, „Vite &amp; Co“). Auch reine Texttitel
+/// tragen oft doppelt kodierte Zeichenreferenzen – ein `<` bleibt dort aber Text.
+fn title_text(raw: &str, content_type: &str) -> String {
+    let is_html = content_type == "text/html" || content_type == "application/xhtml+xml";
+    if !is_html && !raw.contains('&') {
+        return raw.trim().to_string();
     }
-    out.split_whitespace()
+    let source = if is_html {
+        raw.to_string()
+    } else {
+        raw.replace('<', "&lt;")
+    };
+    html_text(&source)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Sichtbarer Text eines HTML-Fragments: Tags entfernt, Zeichenreferenzen
+/// dekodiert.
+fn html_text(html: &str) -> String {
+    scraper::Html::parse_fragment(html)
+        .root_element()
+        .text()
+        .collect()
+}
+
+fn storage_plain(html: &str) -> String {
+    html_text(html)
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
@@ -485,6 +504,22 @@ mod tests {
 </item>
 <item><title>Ohne GUID</title><link>https://example.com/2?b=2&amp;a=1#frag</link></item>
 </channel></rss>"#;
+
+    #[test]
+    fn html_titles_and_excerpts_are_decoded() {
+        let atom = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Atomfeed</title>
+<entry><id>urn:1</id><title type="html">Amazon&amp;#8217;s Brille &amp;amp; Co</title>
+<updated>2026-09-20T10:00:00Z</updated>
+<summary type="html">&lt;p&gt;Preis: &amp;#36;79 &amp;amp; mehr&lt;/p&gt;</summary></entry>
+<entry><id>urn:2</id><title>a &lt; b</title><updated>2026-09-20T10:00:00Z</updated></entry>
+</feed>"#;
+        let f = parse_feed(atom.as_bytes()).unwrap();
+        assert_eq!(f.items[0].title, "Amazon’s Brille & Co");
+        assert_eq!(f.items[0].excerpt, "Preis: $79 & mehr");
+        assert_eq!(f.items[1].title, "a < b");
+    }
 
     const ATOM: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">

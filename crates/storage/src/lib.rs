@@ -352,6 +352,17 @@ INSERT INTO account_sequence(account_id, counter)
     SELECT account_id, MAX(revision) FROM field_revisions GROUP BY account_id;
 "#,
     ),
+    // Titel und Auszüge aus Atom-Feeds mit `type="html"` wurden bis hier mit
+    // Zeichenreferenzen gespeichert („Amazon&#8217;s“). Der Abruf dekodiert sie
+    // inzwischen; diese Stufe bereinigt den Bestand um die häufigsten.
+    (
+        14,
+        r#"
+UPDATE articles SET title = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(title, '&amp;', '&'), '&#8217;', '’'), '&#8216;', '‘'), '&#8220;', '“'), '&#8221;', '”'), '&#8211;', '–'), '&#8212;', '—'), '&#8230;', '…'), '&#036;', '$'), '&#36;', '$'), '&#039;', ''''), '&#39;', ''''), '&quot;', '"'), '&lt;', '<'), '&gt;', '>'), '&nbsp;', ' '), '&rsquo;', '’'), '&lsquo;', '‘'), '&ldquo;', '“'), '&rdquo;', '”'), '&ndash;', '–'), '&mdash;', '—'), '&hellip;', '…') WHERE title LIKE '%&%;%';
+UPDATE articles SET excerpt = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(excerpt, '&amp;', '&'), '&#8217;', '’'), '&#8216;', '‘'), '&#8220;', '“'), '&#8221;', '”'), '&#8211;', '–'), '&#8212;', '—'), '&#8230;', '…'), '&#036;', '$'), '&#36;', '$'), '&#039;', ''''), '&#39;', ''''), '&quot;', '"'), '&lt;', '<'), '&gt;', '>'), '&nbsp;', ' '), '&rsquo;', '’'), '&lsquo;', '‘'), '&ldquo;', '“'), '&rdquo;', '”'), '&ndash;', '–'), '&mdash;', '—'), '&hellip;', '…') WHERE excerpt LIKE '%&%;%';
+UPDATE article_fts SET title = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(title, '&amp;', '&'), '&#8217;', '’'), '&#8216;', '‘'), '&#8220;', '“'), '&#8221;', '”'), '&#8211;', '–'), '&#8212;', '—'), '&#8230;', '…'), '&#036;', '$'), '&#36;', '$'), '&#039;', ''''), '&#39;', ''''), '&quot;', '"'), '&lt;', '<'), '&gt;', '>'), '&nbsp;', ' '), '&rsquo;', '’'), '&lsquo;', '‘'), '&ldquo;', '“'), '&rdquo;', '”'), '&ndash;', '–'), '&mdash;', '—'), '&hellip;', '…') WHERE title LIKE '%&%;%';
+"#,
+    ),
 ];
 
 /// Höchste von dieser App verstandene Schemastufe.
