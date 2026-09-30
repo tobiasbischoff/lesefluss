@@ -29,7 +29,7 @@ Use it as an independent local reader, or connect a Feedly account to bring your
 - **Your preferred appearance.** System, dark, light and Omarchy themes, plus English and German interfaces.
 - **Local control.** Database backups and restore, configurable retention, image-cache controls and an option to block external images.
 
-**Status:** early development, version 0.1.0. The local reader is the main entry point. Feedly is currently an experimental token-based integration; there is no built-in public OAuth sign-in flow. Accessibility, mixed-display scaling and live Feedly acceptance checks still have open items.
+**Status:** early development, version 0.1.1. The local reader is the main entry point. Feedly is currently an experimental token-based integration; there is no built-in public OAuth sign-in flow. Accessibility, mixed-display scaling and live Feedly acceptance checks still have open items.
 
 ## Installation
 

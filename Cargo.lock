@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "dtoa"
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "lesefluss"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "domain",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "provider-feedly"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "provider-local"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "domain",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "reader"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ammonia",
  "html5ever 0.35.0",
@@ -2360,7 +2360,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
  "thiserror",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "sync-engine"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sync_wrapper"

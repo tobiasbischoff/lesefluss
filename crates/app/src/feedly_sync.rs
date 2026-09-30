@@ -2455,12 +2455,24 @@ mod outbox_e2e_tests {
                 .unwrap();
         });
 
+        // Der Server meldet, dass die Bestätigung angefragt wurde, und
+        // antwortet erst, wenn der Test die neue Absicht gespeichert hat. Eine
+        // feste Wartezeit war auf langsamen CI-Rechnern ein Wettlauf: kam die
+        // neue Absicht vor dem Upload an, passte die Antwort zu ihr.
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let arrived_tx = std::sync::Mutex::new(arrived_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
         let entry_for_server = entry_id.clone();
         let (base, _hits) = mock_with_script(move |req| {
             if req.starts_with("POST") && req.contains("/markers") {
                 (200, "{}".to_string())
             } else if req.contains("entries/.mget") {
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = arrived_tx.lock().unwrap().send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
                 (
                     200,
                     serde_json::json!([{
@@ -2495,7 +2507,9 @@ mod outbox_e2e_tests {
         process_outbox(worker.clone(), &net, "tok".to_string(), ctx);
 
         // Während die Bestätigung läuft, entscheidet die Person anders.
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("Bestätigung wurde angefragt");
         let id = entry_id.clone();
         db_blocking(&worker, move |db| {
             let feed = db
@@ -2509,6 +2523,7 @@ mod outbox_e2e_tests {
             db.apply_status_with_outbox(feed, &id, Some(false), None)
                 .unwrap();
         });
+        release_tx.send(()).unwrap();
 
         // Auf das Abschlussereignis warten.
         let mut failed = false;
