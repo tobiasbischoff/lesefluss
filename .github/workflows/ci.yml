@@ -41,17 +41,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Formatierung
         run: cargo fmt --all -- --check
-      # makepkg darf nicht als root laufen: eigener Benutzer, eigener Cache,
-      # Ausgabe in einem beschreibbaren Verzeichnis.
+      # makepkg darf nicht als root laufen: eigener Benutzer, eigener Cache.
+      # Die rustup-Toolchain oben liegt in roots Home und ist für den
+      # Bau-Benutzer nicht nutzbar; er baut mit dem `rust`-Paket (makedepends).
+      # makepkg kennt kein `--logdir`, das Protokollziel ist `LOGDEST`.
       - name: Installationspaket
         run: |
+          pacman -S --noconfirm --needed rust
           useradd -m builder
           chown -R builder "$GITHUB_WORKSPACE"
           su builder -c '
+            export PATH=/usr/bin:$PATH
             export CARGO_HOME=$HOME/.cargo
             export XDG_CACHE_HOME=$HOME/.cache
-            mkdir -p "$XDG_CACHE_HOME" packaging/out
+            export LOGDEST=$HOME/makepkg-logs
+            mkdir -p "$XDG_CACHE_HOME" "$LOGDEST"
             cd packaging
-            makepkg -f --noconfirm --nodeps --logdir="$HOME/makepkg-logs"
+            makepkg -f --noconfirm --nodeps
             ls -l ./*.pkg.tar.zst
           '
